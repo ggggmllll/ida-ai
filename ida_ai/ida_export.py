@@ -34,7 +34,7 @@ try:
 except ImportError:
     ida_hexrays = None
 
-from .db import connect, reset_analysis, set_metadata, utc_now
+from .db import connect, reset_analysis, set_metadata, sqlite_ea, utc_now
 from .selection import BytePattern, parse_pattern
 
 
@@ -75,7 +75,7 @@ def add_segments(connection) -> None:
         if seg is None:
             continue
         perm = int(getattr(seg, "perm", 0))
-        rows.append((int(seg.start_ea), int(seg.end_ea), ida_segment.get_segm_name(seg) or "",
+        rows.append((sqlite_ea(seg.start_ea), sqlite_ea(seg.end_ea), ida_segment.get_segm_name(seg) or "",
                      _text(_safe(lambda: ida_segment.get_segm_class(seg))), perm,
                      segment_permissions(perm), int(getattr(seg, "bitness", 0)),
                      int(getattr(seg, "sel", 0)), int(getattr(seg, "flags", 0))))
@@ -93,7 +93,7 @@ def add_functions(connection) -> list[int]:
         signature = _safe(lambda: idc.get_type(ea))
         demangled = _safe(lambda: idc.demangle_name(name, idc.get_inf_attr(idc.INF_LONG_DN)))
         seg = find_segment(ea)
-        rows.append((int(func.start_ea), int(func.end_ea), name, _text(demangled), _text(signature),
+        rows.append((sqlite_ea(func.start_ea), sqlite_ea(func.end_ea), name, _text(demangled), _text(signature),
                      int(func.flags), int(func.end_ea - func.start_ea),
                      ida_segment.get_segm_name(seg) if seg else None,
                      int(bool(func.flags & ida_funcs.FUNC_LIB)),
@@ -113,13 +113,14 @@ def add_xrefs(connection) -> None:
             continue
         for item_ea in idautils.Heads(seg.start_ea, seg.end_ea):
             for ref in idautils.XrefsFrom(item_ea, 0):
+                ref_target = int(ref.to)
                 source_func = ida_funcs.get_func(ref.frm)
                 target_func = ida_funcs.get_func(ref.to)
                 flags = ida_bytes.get_full_flags(ref.frm)
-                rows.append((int(ref.frm), int(ref.to), int(ref.type), int(ida_bytes.is_code(flags)),
+                rows.append((sqlite_ea(ref.frm), sqlite_ea(ref_target), int(ref.type), int(ida_bytes.is_code(flags)),
                              int(ida_bytes.is_data(flags)),
-                             int(source_func.start_ea) if source_func else None,
-                             int(target_func.start_ea) if target_func else None))
+                             sqlite_ea(source_func.start_ea) if source_func else None,
+                             sqlite_ea(target_func.start_ea) if target_func else None))
                 if len(rows) >= 10000:
                     connection.executemany(statement, rows)
                     rows.clear()
@@ -139,9 +140,9 @@ def add_cfg(connection, addresses: list[int]) -> None:
         block_rows, edge_rows = [], []
         edge_index = 0
         for index, block in enumerate(blocks):
-            block_rows.append((func_ea, index, int(block.start_ea), int(block.end_ea)))
+            block_rows.append((sqlite_ea(func_ea), index, sqlite_ea(block.start_ea), sqlite_ea(block.end_ea)))
             for successor in block.succs():
-                edge_rows.append((func_ea, edge_index, int(block.start_ea), int(successor.start_ea)))
+                edge_rows.append((sqlite_ea(func_ea), edge_index, sqlite_ea(block.start_ea), sqlite_ea(successor.start_ea)))
                 edge_index += 1
         connection.executemany("INSERT INTO basic_blocks(function_ea,block_index,start_ea,end_ea) VALUES(?,?,?,?)", block_rows)
         connection.executemany("INSERT INTO cfg_edges(function_ea,edge_index,source_block_ea,target_block_ea) VALUES(?,?,?,?)", edge_rows)
@@ -166,13 +167,13 @@ def add_disassembly(connection, addresses: list[int]) -> None:
     now = utc_now()
     for ordinal, func_ea in enumerate(addresses, 1):
         try:
-            connection.execute("DELETE FROM instructions WHERE function_ea = ?", (func_ea,))
+            connection.execute("DELETE FROM instructions WHERE function_ea = ?", (sqlite_ea(func_ea),))
             lines = disassembly_lines(func_ea)
             text = "\n".join(f"{ea:X}: {line}" for ea, _, _, line, _, _, _ in lines)
-            connection.execute("INSERT OR REPLACE INTO disassembly(function_ea,text,line_count,status,error,generated_at) VALUES(?,?,?,?,?,?)", (func_ea, text, len(lines), "ok", None, now))
-            connection.executemany("INSERT OR REPLACE INTO instructions(ea,function_ea,offset,size,text,mnemonic,operands,bytes_hex) VALUES(?,?,?,?,?,?,?,?)", ((ea, func_ea, offset, size, text_line, mnemonic, operands, raw) for ea, offset, size, text_line, mnemonic, operands, raw in lines))
+            connection.execute("INSERT OR REPLACE INTO disassembly(function_ea,text,line_count,status,error,generated_at) VALUES(?,?,?,?,?,?)", (sqlite_ea(func_ea), text, len(lines), "ok", None, now))
+            connection.executemany("INSERT OR REPLACE INTO instructions(ea,function_ea,offset,size,text,mnemonic,operands,bytes_hex) VALUES(?,?,?,?,?,?,?,?)", ((sqlite_ea(ea), sqlite_ea(func_ea), offset, size, text_line, mnemonic, operands, raw) for ea, offset, size, text_line, mnemonic, operands, raw in lines))
         except Exception as exc:
-            connection.execute("INSERT OR REPLACE INTO disassembly(function_ea,text,line_count,status,error,generated_at) VALUES(?,?,?,?,?,?)", (func_ea, "", 0, "error", str(exc), now))
+            connection.execute("INSERT OR REPLACE INTO disassembly(function_ea,text,line_count,status,error,generated_at) VALUES(?,?,?,?,?,?)", (sqlite_ea(func_ea), "", 0, "error", str(exc), now))
         if ordinal % 100 == 0:
             connection.commit()
 
@@ -187,9 +188,9 @@ def add_pseudocode(connection, addresses: list[int]) -> None:
             cfunc = ida_hexrays.decompile(func_ea)
             if cfunc is None:
                 raise RuntimeError("decompile returned None")
-            connection.execute("INSERT OR REPLACE INTO pseudocode(function_ea,text,status,error,backend,generated_at) VALUES(?,?,?,?,?,?)", (func_ea, str(cfunc).strip(), "ok", None, "ida_hexrays", now))
+            connection.execute("INSERT OR REPLACE INTO pseudocode(function_ea,text,status,error,backend,generated_at) VALUES(?,?,?,?,?,?)", (sqlite_ea(func_ea), str(cfunc).strip(), "ok", None, "ida_hexrays", now))
         except Exception as exc:
-            connection.execute("INSERT OR REPLACE INTO pseudocode(function_ea,text,status,error,backend,generated_at) VALUES(?,?,?,?,?,?)", (func_ea, None, "error", str(exc), "ida_hexrays", now))
+            connection.execute("INSERT OR REPLACE INTO pseudocode(function_ea,text,status,error,backend,generated_at) VALUES(?,?,?,?,?,?)", (sqlite_ea(func_ea), None, "error", str(exc), "ida_hexrays", now))
         if ordinal % 100 == 0:
             connection.commit()
 
@@ -211,7 +212,7 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
         batch = selected[offset:offset + 500]
         rows = connection.execute(
             f"SELECT status, count(*) AS count FROM {table} WHERE function_ea IN ({','.join('?' for _ in batch)}) GROUP BY status",
-            batch,
+            [sqlite_ea(ea) for ea in batch],
         ).fetchall()
         counts.update({str(row[0]): int(row[1]) for row in rows})
     return {"view": view, "functions": len(selected), "statuses": dict(counts)}
@@ -280,7 +281,7 @@ def _record_memory(connection, address: int, raw: bytes) -> None:
         seg = find_segment(ea)
         perm_text = segment_permissions(int(getattr(seg, "perm", 0))) if seg else None
         seg_name = ida_segment.get_segm_name(seg) if seg else None
-        rows.append((ea, int(value), int(_safe(lambda ea=ea: ida_bytes.get_full_flags(ea), 0) or 0), seg_name, perm_text, now))
+        rows.append((sqlite_ea(ea), int(value), int(_safe(lambda ea=ea: ida_bytes.get_full_flags(ea), 0) or 0), seg_name, perm_text, now))
         if len(rows) == 4096:
             connection.executemany(statement, rows)
             rows.clear()
@@ -301,7 +302,7 @@ def read_bytes(connection, address: int, size: int) -> dict:
     return {"address": address, "address_hex": f"0x{address:X}", "size": len(raw), "hex": raw.hex(" "), "bytes": list(raw)}
 
 
-def write_bytes(connection, address: int, raw: bytes) -> dict:
+def write_bytes(connection, address: int, raw: bytes, idb_path: str | Path) -> dict:
     address = int(address)
     raw = bytes(raw)
     if not raw:
@@ -311,8 +312,9 @@ def write_bytes(connection, address: int, raw: bytes) -> dict:
     ida_bytes.patch_bytes(address, raw)
     if ida_bytes.get_bytes(address, len(raw)) != raw:
         raise RuntimeError("IDA did not retain the patched bytes")
-    ida_auto.auto_wait()
-    if not ida_loader.save_database():
+    if not ida_auto.auto_wait():
+        raise RuntimeError("IDA autoanalysis did not complete after patch")
+    if not ida_loader.save_database(str(idb_path), 0):
         raise RuntimeError("IDA failed to save the patched database")
     _record_memory(connection, address, raw)
     connection.commit()
@@ -331,6 +333,10 @@ def _scan_chunks(start: int, end: int, overlap: int):
         raw = ida_bytes.get_bytes(chunk_start, read_end - chunk_start)
         if raw is not None:
             yield chunk_start, primary_end, bytes(raw)
+
+
+def _loaded_span(address: int, size: int) -> bool:
+    return all(ida_bytes.is_loaded(address + offset) for offset in range(size))
 
 
 def search_patterns(connection, patterns: list[dict], *, start: int | None = None, end: int | None = None, search_id: str, limit: int = 1000) -> dict:
@@ -357,7 +363,7 @@ def search_patterns(connection, patterns: list[dict], *, start: int | None = Non
         for chunk_start, primary_end, raw in _scan_chunks(window_start, window_end, max(p.length for p in parsed) - 1):
             for offset in range(primary_end - chunk_start):
                 for pattern_index, pattern in enumerate(parsed):
-                    if pattern.matches(raw, offset):
+                    if pattern.matches(raw, offset) and _loaded_span(chunk_start + offset, pattern.length):
                         if limit and len(matches) >= limit:
                             truncated = True
                             break
@@ -368,7 +374,7 @@ def search_patterns(connection, patterns: list[dict], *, start: int | None = Non
                 break
         if truncated:
             break
-    rows = [(search_id, ordinal, address, pattern_index, "pattern") for ordinal, (address, pattern_index) in enumerate(matches)]
+    rows = [(search_id, ordinal, sqlite_ea(address), pattern_index, "pattern") for ordinal, (address, pattern_index) in enumerate(matches)]
     connection.executemany("INSERT INTO search_matches(search_id,ordinal,address,pattern_index,match_kind) VALUES(?,?,?,?,?)", rows)
     connection.commit()
     return {"search_id": search_id, "count": len(matches), "truncated": truncated, "matches": [{"address": ea, "address_hex": f"0x{ea:X}", "pattern_index": index} for ea, index in matches]}
@@ -405,13 +411,15 @@ def search_pointers(connection, *, target: int | None = None, start: int | None 
                     offsets.append(position)
                     position = raw.find(needle, position + 1)
             else:
-                offsets = range((-chunk_start) % pointer_size, primary_end - chunk_start, pointer_size)
+                offsets = range(0, primary_end - chunk_start, pointer_size)
             for offset in offsets:
                 source = chunk_start + offset
                 if source >= primary_end or offset + pointer_size > len(raw):
                     continue
                 value = int.from_bytes(raw[offset:offset + pointer_size], byteorder)
-                if target is None and ida_segment.getseg(value) is None:
+                if target is None and (value == 0 or ida_segment.getseg(value) is None):
+                    continue
+                if not _loaded_span(source, pointer_size):
                     continue
                 if limit and len(matches) >= limit:
                     truncated = True
@@ -419,31 +427,38 @@ def search_pointers(connection, *, target: int | None = None, start: int | None 
                 source_func = ida_funcs.get_func(source)
                 target_func = ida_funcs.get_func(value)
                 target_name = ida_name.get_name(value) or None
-                target_type = "function" if target_func else "data"
+                if target_func:
+                    target_type = "function"
+                elif ida_bytes.is_strlit(ida_bytes.get_full_flags(value)):
+                    target_type = "string"
+                elif ida_bytes.is_code(ida_bytes.get_full_flags(value)):
+                    target_type = "code"
+                else:
+                    target_type = "data"
                 connection.execute(
                     "INSERT OR REPLACE INTO pointers(source_address,target_address,pointer_size,source_segment,target_name,target_type,source_function_ea,target_function_ea,source_kind) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (source, value, pointer_size, ida_segment.get_segm_name(seg) or "", target_name, target_type,
-                     int(source_func.start_ea) if source_func else None, int(target_func.start_ea) if target_func else None, "raw_scan"),
+                    (sqlite_ea(source), sqlite_ea(value), pointer_size, ida_segment.get_segm_name(seg) or "", target_name, target_type,
+                     sqlite_ea(source_func.start_ea) if source_func else None, sqlite_ea(target_func.start_ea) if target_func else None, "raw_scan"),
                 )
-                matches.append({"source_address": source, "source_address_hex": f"0x{source:X}", "target_address": value, "target_address_hex": f"0x{value:X}", "pointer_size": pointer_size})
+                matches.append({"source_address": source, "source_address_hex": f"0x{source:X}", "target_address": value, "target_address_hex": f"0x{value:X}", "pointer_size": pointer_size, "target_name": target_name, "target_type": target_type})
             if truncated:
                 break
         if truncated:
             break
     connection.executemany(
         "INSERT INTO search_matches(search_id,ordinal,address,pattern_index,match_kind) VALUES(?,?,?,?,?)",
-        ((search_id, index, item["source_address"], None, "pointer") for index, item in enumerate(matches)),
+        ((search_id, index, sqlite_ea(item["source_address"]), None, "pointer") for index, item in enumerate(matches)),
     )
     connection.commit()
     return {"search_id": search_id, "pointer_size": pointer_size, "count": len(matches), "truncated": truncated, "matches": matches}
 
 
-def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: bool = False) -> dict:
-    if not skip_analysis:
-        ida_auto.auto_wait()
+def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: bool = False, clear_operations: bool = False) -> dict:
+    if not skip_analysis and not ida_auto.auto_wait():
+        raise RuntimeError("IDA autoanalysis did not complete")
     connection = connect(output)
     try:
-        reset_analysis(connection)
+        reset_analysis(connection, clear_operations=clear_operations)
         metadata = {
             "input_path": _safe(ida_nalt.get_input_file_path, ""),
             "root_filename": _safe(ida_nalt.get_root_filename, ""),

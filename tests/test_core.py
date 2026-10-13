@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ida_ai.cli import _query
-from ida_ai.db import connect, operation, record_operation, set_metadata
+from ida_ai.db import connect, ida_ea, operation, record_operation, set_metadata, sqlite_ea
 from ida_ai.runner import run_ida
 from ida_ai.selection import parse_hex_bytes, parse_pattern, select_function_addresses
 
@@ -50,6 +50,18 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(masked.matches(bytes.fromhex("48 8B 12 34")))
         with self.assertRaises(ValueError):
             parse_pattern("48 8B", "FF")
+
+    def test_unsigned_high_addresses_remain_queryable(self):
+        high = 0xFF00000000000040
+        self.assertEqual(ida_ea(sqlite_ea(high)), high)
+        with closing(connect(self.db_path)) as connection:
+            connection.execute(
+                "INSERT INTO functions(start_ea,end_ea,name,size) VALUES(?,?,?,?)",
+                (sqlite_ea(high), sqlite_ea(high + 0x20), "high_func", 0x20),
+            )
+            connection.commit()
+            self.assertEqual(select_function_addresses(connection, address=hex(high + 1)), [high])
+            self.assertEqual(select_function_addresses(connection, address_range=[hex(high), hex(high + 0x20)]), [high])
 
     def test_sql_read_only_and_explicit_write(self):
         result = _query(self.db_path, "SELECT name, start_ea FROM functions ORDER BY start_ea", 1)

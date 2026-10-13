@@ -28,9 +28,9 @@ def dispatch(request: dict) -> dict:
         idb_path.parent.mkdir(parents=True, exist_ok=True)
         if not ida_auto.auto_wait():
             raise RuntimeError("IDA autoanalysis did not complete")
-        if not ida_loader.save_database(str(idb_path)):
+        if not ida_loader.save_database(str(idb_path), 0):
             raise RuntimeError(f"IDA could not save database to {idb_path}")
-        result = ida_export.export_database(db_path, idb_path=idb_path, skip_analysis=True)
+        result = ida_export.export_database(db_path, idb_path=idb_path, skip_analysis=True, clear_operations=True)
         return {"db_path": str(db_path), "idb_path": str(idb_path), **result}
 
     with closing(connect(db_path)) as connection:
@@ -46,7 +46,7 @@ def dispatch(request: dict) -> dict:
         if action == "read":
             return ida_export.read_bytes(connection, request["address"], request["size"])
         if action == "write":
-            written = ida_export.write_bytes(connection, request["address"], bytes.fromhex(request["data_hex"]))
+            written = ida_export.write_bytes(connection, request["address"], bytes.fromhex(request["data_hex"]), idb_path)
         elif action == "search":
             return ida_export.search_patterns(
                 connection, request["patterns"], start=request.get("start"), end=request.get("end"),
@@ -84,7 +84,7 @@ def main() -> None:
         if request is not None:
             try:
                 with closing(connect(request["db_path"])) as connection:
-                    record_operation(connection, request["request_id"], request["action"], "error", error=str(exc))
+                    record_operation(connection, request["request_id"], request["action"], "error", error=traceback.format_exc())
             except Exception:
                 traceback.print_exc()
     finally:

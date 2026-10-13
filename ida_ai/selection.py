@@ -7,6 +7,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Iterable
 
+from .db import ida_ea
+
 
 def parse_int(value: str | int) -> int:
     if isinstance(value, int):
@@ -100,6 +102,8 @@ def parse_range(values: Iterable[str]) -> tuple[int, int]:
         raise ValueError("range must be START END or START:END")
     if end <= start:
         raise ValueError("range end must be greater than range start")
+    if start < 0 or end > (1 << 64):
+        raise ValueError("range must stay within unsigned 64-bit addresses")
     return start, end
 
 
@@ -114,32 +118,33 @@ def select_function_addresses(
     selectors = sum(value is not None for value in (address, address_range, name)) + int(all_functions)
     if selectors != 1:
         raise ValueError("choose exactly one of --all, --address, --range, or --name")
+    function_rows = connection.execute("SELECT start_ea, end_ea, name, demangled_name FROM functions").fetchall()
+    functions = [
+        {"start": ida_ea(row["start_ea"]), "end": ida_ea(row["end_ea"]), "name": row["name"], "demangled": row["demangled_name"]}
+        for row in function_rows
+    ]
     if all_functions:
-        rows = connection.execute("SELECT start_ea FROM functions ORDER BY start_ea").fetchall()
+        addresses = sorted(item["start"] for item in functions)
     elif address is not None:
         ea = parse_int(address)
-        rows = connection.execute(
-            "SELECT start_ea FROM functions WHERE start_ea <= ? AND end_ea > ? "
-            "UNION SELECT function_ea FROM basic_blocks WHERE start_ea <= ? AND end_ea > ? "
-            "ORDER BY start_ea LIMIT 1",
-            (ea, ea, ea, ea),
-        ).fetchall()
+        addresses = [item["start"] for item in functions if item["start"] <= ea < item["end"]]
+        if not addresses:
+            block_rows = connection.execute("SELECT function_ea, start_ea, end_ea FROM basic_blocks").fetchall()
+            addresses = [ida_ea(row["function_ea"]) for row in block_rows if ida_ea(row["start_ea"]) <= ea < ida_ea(row["end_ea"])]
     elif address_range is not None:
         start, end = parse_range(address_range)
-        rows = connection.execute(
-            "SELECT start_ea FROM functions WHERE start_ea < ? AND end_ea > ? "
-            "UNION SELECT function_ea FROM basic_blocks WHERE start_ea < ? AND end_ea > ? "
-            "ORDER BY start_ea",
-            (end, start, end, start),
-        ).fetchall()
+        addresses = [item["start"] for item in functions if item["start"] < end and item["end"] > start]
+        block_rows = connection.execute("SELECT function_ea, start_ea, end_ea FROM basic_blocks").fetchall()
+        addresses.extend(
+            ida_ea(row["function_ea"])
+            for row in block_rows
+            if ida_ea(row["start_ea"]) < end and ida_ea(row["end_ea"]) > start
+        )
     else:
         assert name is not None
-        rows = connection.execute(
-            "SELECT start_ea FROM functions WHERE name = ? COLLATE NOCASE "
-            "OR demangled_name = ? COLLATE NOCASE ORDER BY start_ea",
-            (name, name),
-        ).fetchall()
-    addresses = [int(row[0]) for row in rows]
+        folded = name.casefold()
+        addresses = [item["start"] for item in functions if item["name"].casefold() == folded or (item["demangled"] or "").casefold() == folded]
+    addresses = sorted(set(addresses))
     if not addresses:
         raise ValueError("function selector matched no functions")
     return addresses
