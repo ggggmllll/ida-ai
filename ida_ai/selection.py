@@ -1,0 +1,140 @@
+"""Address, byte-pattern, and SQLite selection helpers shared by the CLI."""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from dataclasses import dataclass
+from typing import Iterable
+
+
+def parse_int(value: str | int) -> int:
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().replace("_", "")
+    if not text:
+        raise ValueError("address/value cannot be empty")
+    return int(text, 0)
+
+
+def parse_hex_bytes(text: str) -> bytes:
+    """Parse ``90 90``, ``0x9090``, or a compact hex string."""
+
+    cleaned = re.sub(r"0x", "", text.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\s,:_-]+", "", cleaned)
+    if not cleaned:
+        raise ValueError("byte string cannot be empty")
+    if len(cleaned) % 2:
+        raise ValueError(f"hex byte string has odd length: {text!r}")
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"invalid hex bytes: {text!r}") from exc
+
+
+@dataclass(frozen=True)
+class BytePattern:
+    values: tuple[int, ...]
+    mask: tuple[int, ...]
+
+    @property
+    def length(self) -> int:
+        return len(self.values)
+
+    def matches(self, data: bytes, offset: int = 0) -> bool:
+        if offset < 0 or offset + self.length > len(data):
+            return False
+        return all(
+            (data[offset + index] & mask) == (value & mask)
+            for index, (value, mask) in enumerate(zip(self.values, self.mask))
+        )
+
+
+def parse_pattern(pattern: str, mask: str | None = None) -> BytePattern:
+    """Parse hex bytes with ``??`` wildcards or a separate hex mask.
+
+    Examples: ``48 8B ?? ??``, or ``--bytes 48 8B 00 00 --mask FF FF 00 00``.
+    """
+
+    tokens = pattern.replace(",", " ").split()
+    if len(tokens) == 1 and " " not in pattern.strip() and "-" not in pattern:
+        compact = tokens[0].replace("0x", "").replace("0X", "")
+        if len(compact) > 2 and len(compact) % 2 == 0:
+            tokens = [compact[index : index + 2] for index in range(0, len(compact), 2)]
+    values: list[int] = []
+    masks: list[int] = []
+    for token in tokens:
+        token = token.strip()
+        if token.lower().startswith("0x"):
+            token = token[2:]
+        if token in {"?", "??", "**"}:
+            values.append(0)
+            masks.append(0)
+            continue
+        if len(token) != 2 or not re.fullmatch(r"[0-9a-fA-F]{2}", token):
+            raise ValueError(f"pattern token must be a byte or ?? wildcard: {token!r}")
+        values.append(int(token, 16))
+        masks.append(0xFF)
+    if not values:
+        raise ValueError("pattern cannot be empty")
+    if mask is not None:
+        mask_bytes = parse_hex_bytes(mask)
+        if len(mask_bytes) != len(values):
+            raise ValueError("mask length must equal pattern length")
+        masks = list(mask_bytes)
+    return BytePattern(tuple(values), tuple(masks))
+
+
+def parse_range(values: Iterable[str]) -> tuple[int, int]:
+    items = list(values)
+    if len(items) == 1:
+        match = re.fullmatch(r"\s*(0x[0-9a-fA-F]+|[0-9]+)\s*[:,-]\s*(0x[0-9a-fA-F]+|[0-9]+)\s*", items[0])
+        if not match:
+            raise ValueError("range must be START END or START:END")
+        start, end = parse_int(match.group(1)), parse_int(match.group(2))
+    elif len(items) == 2:
+        start, end = parse_int(items[0]), parse_int(items[1])
+    else:
+        raise ValueError("range must be START END or START:END")
+    if end <= start:
+        raise ValueError("range end must be greater than range start")
+    return start, end
+
+
+def select_function_addresses(
+    connection: sqlite3.Connection,
+    *,
+    all_functions: bool = False,
+    address: str | None = None,
+    address_range: Iterable[str] | None = None,
+    name: str | None = None,
+) -> list[int]:
+    selectors = sum(value is not None for value in (address, address_range, name)) + int(all_functions)
+    if selectors != 1:
+        raise ValueError("choose exactly one of --all, --address, --range, or --name")
+    if all_functions:
+        rows = connection.execute("SELECT start_ea FROM functions ORDER BY start_ea").fetchall()
+    elif address is not None:
+        ea = parse_int(address)
+        rows = connection.execute(
+            "SELECT start_ea FROM functions WHERE start_ea <= ? AND end_ea > ? ORDER BY start_ea LIMIT 1",
+            (ea, ea),
+        ).fetchall()
+    elif address_range is not None:
+        start, end = parse_range(address_range)
+        rows = connection.execute(
+            "SELECT start_ea FROM functions WHERE start_ea < ? AND end_ea > ? ORDER BY start_ea",
+            (end, start),
+        ).fetchall()
+    else:
+        assert name is not None
+        rows = connection.execute(
+            "SELECT start_ea FROM functions WHERE name = ? COLLATE NOCASE "
+            "OR demangled_name = ? COLLATE NOCASE ORDER BY start_ea",
+            (name, name),
+        ).fetchall()
+    addresses = [int(row[0]) for row in rows]
+    if not addresses:
+        raise ValueError("function selector matched no functions")
+    return addresses
+
