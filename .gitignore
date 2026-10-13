@@ -11,3 +11,6 @@ __pycache__/
 *.nam
 *.til
 *.log
+.venv/
+*.egg-info/
+uv.lock
