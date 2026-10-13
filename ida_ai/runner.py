@@ -72,7 +72,10 @@ def run_ida(
         request_file = Path(temporary) / "request.json"
         request_file.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
         environment["IDA_AI_REQUEST"] = str(request_file)
-        command = [str(find_idat(idat)), "-A", f"-S{script}", str(input_path)]
+        command = [str(find_idat(idat)), "-A"]
+        if action == "init":
+            command.append(f"-o{request['idb_path']}")
+        command.extend((f"-S{script}", str(input_path)))
         try:
             completed = subprocess.run(
                 command, env=environment, cwd=str(db_path.parent), capture_output=True,

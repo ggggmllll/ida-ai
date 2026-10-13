@@ -101,7 +101,8 @@ class DatabaseTests(unittest.TestCase):
 
         def fake_run(command, **kwargs):
             self.assertEqual(command[1], "-A")
-            self.assertTrue(command[2].startswith("-S"))
+            self.assertEqual(command[2], f"-o{idb}")
+            self.assertTrue(command[3].startswith("-S"))
             request = json.loads(Path(kwargs["env"]["IDA_AI_REQUEST"]).read_text(encoding="utf-8"))
             self.assertEqual(request["idb_path"], str(idb))
             with closing(connect(self.db_path)) as connection:
