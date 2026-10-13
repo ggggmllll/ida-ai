@@ -216,12 +216,10 @@ def reset_analysis(connection: sqlite3.Connection) -> None:
         "memory_bytes",
         "pointers",
         "search_matches",
-        "operations",
     )
     for table in tables:
         connection.execute(f"DELETE FROM {table}")
     connection.execute("DELETE FROM metadata")
-    connection.commit()
 
 
 def set_metadata(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
@@ -230,7 +228,6 @@ def set_metadata(connection: sqlite3.Connection, values: Mapping[str, Any]) -> N
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         ((str(key), json.dumps(value, ensure_ascii=False)) for key, value in values.items()),
     )
-    connection.commit()
 
 
 def get_metadata(connection: sqlite3.Connection, key: str, default: Any = None) -> Any:

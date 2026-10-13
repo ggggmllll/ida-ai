@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ida-ai"
+version = "0.1.0"
+description = "Headless IDA analysis artifacts and SQLite CLI for AI-assisted reverse engineering"
+requires-python = ">=3.10"
+
+[project.scripts]
+ida-ai = "ida_ai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ida_ai*"]

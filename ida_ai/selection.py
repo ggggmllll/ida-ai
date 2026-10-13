@@ -14,7 +14,9 @@ def parse_int(value: str | int) -> int:
     text = str(value).strip().replace("_", "")
     if not text:
         raise ValueError("address/value cannot be empty")
-    return int(text, 0)
+    if re.fullmatch(r"[+-]?0[xX][0-9a-fA-F]+", text):
+        return int(text, 16)
+    return int(text, 10)
 
 
 def parse_hex_bytes(text: str) -> bytes:
@@ -53,7 +55,7 @@ class BytePattern:
 def parse_pattern(pattern: str, mask: str | None = None) -> BytePattern:
     """Parse hex bytes with ``??`` wildcards or a separate hex mask.
 
-    Examples: ``48 8B ?? ??``, or ``--bytes 48 8B 00 00 --mask FF FF 00 00``.
+    Examples: ``48 8B ?? ??``, or ``--pattern '48 8B 00 00' --mask 'FF FF 00 00'``.
     """
 
     tokens = pattern.replace(",", " ").split()
@@ -117,14 +119,18 @@ def select_function_addresses(
     elif address is not None:
         ea = parse_int(address)
         rows = connection.execute(
-            "SELECT start_ea FROM functions WHERE start_ea <= ? AND end_ea > ? ORDER BY start_ea LIMIT 1",
-            (ea, ea),
+            "SELECT start_ea FROM functions WHERE start_ea <= ? AND end_ea > ? "
+            "UNION SELECT function_ea FROM basic_blocks WHERE start_ea <= ? AND end_ea > ? "
+            "ORDER BY start_ea LIMIT 1",
+            (ea, ea, ea, ea),
         ).fetchall()
     elif address_range is not None:
         start, end = parse_range(address_range)
         rows = connection.execute(
-            "SELECT start_ea FROM functions WHERE start_ea < ? AND end_ea > ? ORDER BY start_ea",
-            (end, start),
+            "SELECT start_ea FROM functions WHERE start_ea < ? AND end_ea > ? "
+            "UNION SELECT function_ea FROM basic_blocks WHERE start_ea < ? AND end_ea > ? "
+            "ORDER BY start_ea",
+            (end, start, end, start),
         ).fetchall()
     else:
         assert name is not None
