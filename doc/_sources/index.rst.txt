@@ -1,0 +1,324 @@
+IDAPython API Reference
+=======================
+
+IDAPython allows you to create custom scripts and plugins that enhance IDA's core functionality.
+This reference documentation covers 50+ modules for disassembly manipulation, decompilation,
+debugging, and UI customization. You can explore the IDAPython API by navigating the modules below,
+or use the quick reference to jump straight to what you need.
+
+.. tip::
+   IDA Domain API - A Modern Alternative
+   --------------------------------------
+
+   Looking for a simpler, more Pythonic way to script IDA? The `IDA Domain API <https://ida-domain.docs.hex-rays.com/>`_
+   provides a high-level, developer-friendly interface built on top of IDAPython. It's designed from the ground up
+   with modern Python best practices, offering:
+
+   * **Cleaner syntax** - Write less boilerplate, focus on reverse engineering tasks
+   * **Better type hints** - Enhanced IDE support with full type annotations
+   * **Intuitive abstractions** - Work directly with domain concepts like functions, types, and cross-references
+   * **Full compatibility** - Use alongside IDAPython; both APIs work seamlessly together
+   * **Open source** - Community-driven development with independent versioning
+   * **Pure Python** - No compilation required, works with modern Python versions
+
+   The Domain API doesn't replace IDAPython—it complements it. Use Domain API for everyday scripting tasks
+   and drop down to IDAPython when you need fine-grained control or access to advanced features.
+
+
+Quick Reference by Task
+-----------------------
+
+Reading/Writing Bytes
+^^^^^^^^^^^^^^^^^^^^^
+
+* :doc:`ida_bytes </ida_bytes/index>`: :py:obj:`~ida_bytes.get_byte`, :py:obj:`~ida_bytes.patch_byte`, :py:obj:`~ida_bytes.get_flags`, :py:obj:`~ida_bytes.get_strlit_contents`
+* :doc:`idc </idc/index>`: :py:obj:`~idc.get_wide_byte`, :py:obj:`~idc.patch_byte`, :py:obj:`~idc.get_strlit_contents`
+
+Working with Functions
+^^^^^^^^^^^^^^^^^^^^^^
+
+* :doc:`ida_funcs </ida_funcs/index>`: :py:obj:`~ida_funcs.get_func`, :py:obj:`~ida_funcs.add_func`, :py:obj:`~ida_funcs.get_func_name`, :py:class:`~ida_funcs.func_t`
+* :doc:`ida_frame </ida_frame/index>`: :py:obj:`~ida_frame.get_frame`, :py:obj:`~ida_frame.add_stkvar`, :py:obj:`~ida_frame.get_spd`
+* :doc:`idautils </idautils/index>`: :py:func:`~idautils.Functions`, :py:func:`~idautils.FuncItems`
+
+Names and Labels
+^^^^^^^^^^^^^^^^
+
+* :doc:`ida_name </ida_name/index>`: :py:obj:`~ida_name.set_name`, :py:obj:`~ida_name.get_name`, :py:obj:`~ida_name.demangle_name`
+* :doc:`idc </idc/index>`: :py:obj:`~idc.set_name`, :py:obj:`~idc.get_name`
+
+Segments
+^^^^^^^^
+
+* :doc:`ida_segment </ida_segment/index>`: :py:obj:`~ida_segment.get_segm_by_name`, :py:obj:`~ida_segment.add_segm`, :py:class:`~ida_segment.segment_t`
+* :doc:`idautils </idautils/index>`: :py:func:`~idautils.Segments`
+
+Cross-References
+^^^^^^^^^^^^^^^^
+
+* :doc:`ida_xref </ida_xref/index>`: :py:obj:`~ida_xref.add_cref`, :py:obj:`~ida_xref.add_dref`, :py:obj:`~ida_xref.get_first_cref_to`
+* :doc:`idautils </idautils/index>`: :py:func:`~idautils.XrefsTo`, :py:func:`~idautils.XrefsFrom`
+
+Types and Structures
+^^^^^^^^^^^^^^^^^^^^
+
+* :doc:`ida_typeinf </ida_typeinf/index>`: :py:class:`~ida_typeinf.tinfo_t`, :py:obj:`~ida_typeinf.get_idati`, :py:obj:`~ida_typeinf.parse_decl`
+* ``ida_struct`` *(deprecated — use ida_typeinf instead)*: ``get_struc``, ``add_struc_member``
+
+Decompilation
+^^^^^^^^^^^^^
+
+* :doc:`ida_hexrays </ida_hexrays/index>`: :py:obj:`~ida_hexrays.decompile`, :py:class:`~ida_hexrays.cfunc_t`, :py:class:`~ida_hexrays.citem_t`, :py:class:`~ida_hexrays.mba_t`, :py:class:`~ida_hexrays.Hexrays_Hooks`
+
+UI and Dialogs
+^^^^^^^^^^^^^^
+
+* :doc:`ida_kernwin </ida_kernwin/index>`: :py:obj:`~ida_kernwin.ask_yn`, :py:obj:`~ida_kernwin.ask_str`, :py:class:`~ida_kernwin.Choose`, :py:class:`~ida_kernwin.action_handler_t`, :py:obj:`~ida_kernwin.register_action`
+* :doc:`ida_graph </ida_graph/index>`: :py:class:`~ida_graph.GraphViewer`
+
+Debugging
+^^^^^^^^^
+
+* :doc:`ida_dbg </ida_dbg/index>`: :py:obj:`~ida_dbg.run_to`, :py:obj:`~ida_dbg.step_into`, :py:obj:`~ida_dbg.get_reg_val`, :py:obj:`~ida_dbg.add_bpt`
+
+Search
+^^^^^^
+
+* :doc:`ida_search </ida_search/index>`: :py:obj:`~ida_search.find_binary`, :py:obj:`~ida_search.find_text`
+* :doc:`idautils </idautils/index>`: :py:func:`~idautils.Heads`
+
+
+Module Reference
+----------------
+
+Essential (Start Here)
+^^^^^^^^^^^^^^^^^^^^^^
+
+* :doc:`idautils </idautils/index>` — High-level iteration: :py:func:`~idautils.Functions`, :py:func:`~idautils.Segments`, :py:func:`~idautils.Heads`, :py:func:`~idautils.XrefsTo`, :py:func:`~idautils.XrefsFrom`, :py:func:`~idautils.Names`
+* :doc:`idc </idc/index>` — IDC compatibility layer: :py:obj:`~idc.get_wide_byte`, :py:obj:`~idc.set_name`, :py:obj:`~idc.get_func_name`, :py:obj:`~idc.add_func`
+* :doc:`ida_idaapi </ida_idaapi/index>` — Plugin base class, :py:obj:`~ida_idaapi.BADADDR`, :py:obj:`~ida_idaapi.ea_t`, :py:class:`~ida_idaapi.plugin_t`
+* :doc:`idaapi </idaapi/index>` — Legacy compatibility module
+
+Bytes and Flags
+^^^^^^^^^^^^^^^
+
+* :doc:`ida_bytes </ida_bytes/index>` — :py:obj:`~ida_bytes.get_byte`, :py:obj:`~ida_bytes.patch_byte`, :py:obj:`~ida_bytes.get_flags`, :py:obj:`~ida_bytes.del_items`, :py:obj:`~ida_bytes.create_data`, :py:obj:`~ida_bytes.get_strlit_contents`; ``flags64_t`` manipulation
+* :doc:`ida_nalt </ida_nalt/index>` — Netnode altvals/supvals: :py:obj:`~ida_nalt.get_aflags`, :py:obj:`~ida_nalt.set_aflags`, :py:class:`~ida_nalt.refinfo_t`
+
+Functions
+^^^^^^^^^
+
+* :doc:`ida_funcs </ida_funcs/index>` — :py:class:`~ida_funcs.func_t`, :py:obj:`~ida_funcs.get_func`, :py:obj:`~ida_funcs.add_func`, :py:obj:`~ida_funcs.del_func`, :py:obj:`~ida_funcs.get_func_qty`, :py:obj:`~ida_funcs.set_func_cmt`; use with :doc:`ida_frame </ida_frame/index>`, :doc:`ida_name </ida_name/index>`
+* :doc:`ida_frame </ida_frame/index>` — Stack frames: :py:obj:`~ida_frame.get_frame`, :py:obj:`~ida_frame.add_stkvar`, :py:obj:`~ida_frame.get_spd`
+
+Names
+^^^^^
+
+* :doc:`ida_name </ida_name/index>` — :py:obj:`~ida_name.set_name`, :py:obj:`~ida_name.get_name`, :py:obj:`~ida_name.get_name_ea`, :py:obj:`~ida_name.demangle_name`, ``SN_*`` flags
+* :doc:`ida_entry </ida_entry/index>` — Entry points: :py:obj:`~ida_entry.add_entry`, :py:obj:`~ida_entry.get_entry_qty`, :py:obj:`~ida_entry.get_entry`
+
+Segments
+^^^^^^^^
+
+* :doc:`ida_segment </ida_segment/index>` — :py:class:`~ida_segment.segment_t`, :py:obj:`~ida_segment.get_segm_by_name`, :py:obj:`~ida_segment.add_segm_ex`, :py:obj:`~ida_segment.getseg`, :py:obj:`~ida_segment.get_segm_qty`
+* :doc:`ida_segregs </ida_segregs/index>` — Segment registers: :py:obj:`~ida_segregs.get_sreg`, :py:obj:`~ida_segregs.set_default_sreg_value`
+* :doc:`ida_range </ida_range/index>` — :py:class:`~ida_range.range_t` base class for address ranges
+
+Cross-References
+^^^^^^^^^^^^^^^^
+
+* :doc:`ida_xref </ida_xref/index>` — :py:obj:`~ida_xref.add_cref`, :py:obj:`~ida_xref.add_dref`, :py:obj:`~ida_xref.del_cref`, :py:obj:`~ida_xref.get_first_cref_to`, :py:class:`~ida_xref.xrefblk_t`; ``fl_*`` and ``dr_*`` constants
+
+Search
+^^^^^^
+
+* :doc:`ida_search </ida_search/index>` — :py:obj:`~ida_search.find_binary`, :py:obj:`~ida_search.find_text`, :py:obj:`~ida_search.find_code`, ``SEARCH_*`` flags
+
+Decompiler (Hex-Rays)
+^^^^^^^^^^^^^^^^^^^^^
+
+* :doc:`ida_hexrays </ida_hexrays/index>` — :py:obj:`~ida_hexrays.decompile`, :py:class:`~ida_hexrays.cfunc_t`, :py:class:`~ida_hexrays.citem_t`, :py:class:`~ida_hexrays.cexpr_t`, :py:class:`~ida_hexrays.cinsn_t`, :py:class:`~ida_hexrays.mba_t`, :py:class:`~ida_hexrays.minsn_t`, :py:class:`~ida_hexrays.lvar_t`, :py:class:`~ida_hexrays.Hexrays_Hooks`, :py:class:`~ida_hexrays.ctree_visitor_t`
+
+Types
+^^^^^
+
+* :doc:`ida_typeinf </ida_typeinf/index>` — :py:class:`~ida_typeinf.tinfo_t`, :py:obj:`~ida_typeinf.parse_decl`, :py:obj:`~ida_typeinf.get_idati`, :py:obj:`~ida_typeinf.apply_tinfo`, :py:class:`~ida_typeinf.udt_type_data_t`, :py:class:`~ida_typeinf.func_type_data_t`
+
+UI
+^^
+
+* :doc:`ida_kernwin </ida_kernwin/index>` — :py:obj:`~ida_kernwin.ask_yn`, :py:obj:`~ida_kernwin.ask_str`, :py:obj:`~ida_kernwin.jumpto`, :py:obj:`~ida_kernwin.refresh_idaview`, :py:class:`~ida_kernwin.Choose`, :py:class:`~ida_kernwin.simplecustviewer_t`, :py:class:`~ida_kernwin.action_handler_t`, :py:obj:`~ida_kernwin.register_action`, :py:class:`~ida_kernwin.UI_Hooks`
+* :doc:`ida_lines </ida_lines/index>` — :py:obj:`~ida_lines.generate_disasm_line`, :py:obj:`~ida_lines.tag_remove`, :py:obj:`~ida_lines.COLSTR`, ``COLOR_*``
+* :doc:`ida_graph </ida_graph/index>` — :py:class:`~ida_graph.GraphViewer`, :py:obj:`~ida_graph.set_node_info`, :py:obj:`~ida_graph.get_graph_viewer`
+
+Debugging
+^^^^^^^^^
+
+* :doc:`ida_dbg </ida_dbg/index>` — :py:obj:`~ida_dbg.run_to`, :py:obj:`~ida_dbg.step_into`, :py:obj:`~ida_dbg.step_over`, :py:obj:`~ida_dbg.get_reg_val`, :py:obj:`~ida_dbg.add_bpt`, :py:class:`~ida_dbg.DBG_Hooks`
+* :doc:`ida_idd </ida_idd/index>` — :py:class:`~ida_idd.debugger_t`, :py:class:`~ida_idd.register_info_t`, :py:class:`~ida_idd.bpt_t`
+
+Instructions
+^^^^^^^^^^^^
+
+* :doc:`ida_ua </ida_ua/index>` — :py:class:`~ida_ua.insn_t`, :py:class:`~ida_ua.op_t`, :py:obj:`~ida_ua.decode_insn`, :py:obj:`~ida_ua.create_insn`, :py:obj:`~ida_ua.print_insn_mnem`
+* :doc:`ida_idp </ida_idp/index>` — :py:class:`~ida_idp.processor_t`, :py:obj:`~ida_idp.ph` (processor handle), :py:class:`~ida_idp.IDP_Hooks`
+* ``ida_allins`` — Instruction opcodes (``NN_*``, ``ARM_*``, etc.)
+
+Database
+^^^^^^^^
+
+* :doc:`ida_netnode </ida_netnode/index>` — :py:class:`~ida_netnode.netnode` class for persistent storage: :py:obj:`~ida_netnode.netnode.altval`, :py:obj:`~ida_netnode.netnode.supval`, :py:obj:`~ida_netnode.netnode.hashval`
+* :doc:`ida_loader </ida_loader/index>` — :py:obj:`~ida_loader.load_file`, :py:obj:`~ida_loader.save_database`, :py:class:`~ida_loader.snapshot_t`
+* :doc:`ida_auto </ida_auto/index>` — :py:obj:`~ida_auto.auto_wait`, :py:obj:`~ida_auto.plan_ea`, ``AU_*`` queue constants
+
+Analysis
+^^^^^^^^
+
+* :doc:`ida_problems </ida_problems/index>` — ``PR_*`` problem types, :py:obj:`~ida_problems.get_problem`
+* :doc:`ida_offset </ida_offset/index>` — :py:obj:`~ida_offset.op_offset`, :py:obj:`~ida_offset.get_offbase`
+* :doc:`ida_fixup </ida_fixup/index>` — :py:class:`~ida_fixup.fixup_data_t`, :py:obj:`~ida_fixup.set_fixup`, :py:obj:`~ida_fixup.get_fixup`
+* :doc:`ida_libfuncs </ida_libfuncs/index>` — :py:obj:`~ida_libfuncs.apply_idasgn_to` (FLIRT)
+
+Lumina
+^^^^^^
+
+* :doc:`ida_lumina </ida_lumina/index>` — :py:obj:`~ida_lumina.calc_func_metadata`, :py:obj:`~ida_lumina.apply_metadata`, :py:obj:`~ida_lumina.score_metadata`, :py:obj:`~ida_lumina.backup_metadata`, :py:obj:`~ida_lumina.revert_metadata`, :py:obj:`~ida_lumina.get_server_connection`, :py:class:`~ida_lumina.func_info_t`, :py:class:`~ida_lumina.lumina_client_t`
+* :doc:`lumina_model </lumina_model/index>` — High-level helpers: :py:class:`~lumina_model.func_md_t`, :py:class:`~lumina_model.idb_md_t`, :py:class:`~lumina_model.differ_t`
+
+Utility
+^^^^^^^
+
+* :doc:`ida_pro </ida_pro/index>` — :py:class:`~ida_pro.qvector`, :py:class:`~ida_pro.qstring`, :py:obj:`~ida_pro.ea_t`, :py:obj:`~ida_pro.BADADDR`
+* :doc:`ida_ida </ida_ida/index>` — :py:class:`~ida_ida.idainfo` (``inf`` structure), ``cvar.inf``
+* :doc:`ida_expr </ida_expr/index>` — :py:class:`~ida_expr.idc_value_t`, :py:obj:`~ida_expr.eval_idc_expr`
+* :doc:`ida_strlist </ida_strlist/index>` — :py:class:`~ida_strlist.string_info_t`, :py:obj:`~ida_strlist.get_strlist_qty`
+* :doc:`ida_diskio </ida_diskio/index>` — :py:obj:`~ida_diskio.idadir`, :py:obj:`~ida_diskio.getsysfile`
+* :doc:`ida_registry </ida_registry/index>` — :py:obj:`~ida_registry.reg_read_string`, :py:obj:`~ida_registry.reg_write_string`
+
+Less Common
+^^^^^^^^^^^
+
+* :doc:`ida_gdl </ida_gdl/index>` — :py:class:`~ida_gdl.qflow_chart_t`, GDL graph export
+* :doc:`ida_bitrange </ida_bitrange/index>` — :py:class:`~ida_bitrange.bitrange_t` for bit-level operations
+* :doc:`ida_tryblks </ida_tryblks/index>` — :py:class:`~ida_tryblks.tryblk_t` exception handling info
+* :doc:`ida_undo </ida_undo/index>` — :py:obj:`~ida_undo.perform_undo`, :py:obj:`~ida_undo.create_undo_point`
+* :doc:`ida_merge </ida_merge/index>` — Database merging
+* :doc:`ida_mergemod </ida_mergemod/index>` — Merge module interface
+* :doc:`ida_srclang </ida_srclang/index>` — Source language detection
+* :doc:`ida_regfinder </ida_regfinder/index>` — Register value tracking
+* :doc:`ida_fpro </ida_fpro/index>` — File operations
+* :doc:`ida_ieee </ida_ieee/index>` — IEEE float conversion
+* :doc:`ida_dirtree </ida_dirtree/index>` — Folder organization
+* :doc:`ida_moves </ida_moves/index>` — Navigation history
+* :doc:`idadex </idadex/index>` — Extension utilities
+* :doc:`init </init/index>` — Initialization
+
+
+Common Patterns
+---------------
+
+.. code-block:: python
+
+   # Iterate all functions
+   for ea in idautils.Functions():
+       name = idc.get_func_name(ea)
+
+   # Get xrefs to address
+   for xref in idautils.XrefsTo(ea):
+       print(hex(xref.frm))
+
+   # Decompile function
+   cfunc = ida_hexrays.decompile(ea)
+   print(cfunc)
+
+   # Create action
+   class MyHandler(ida_kernwin.action_handler_t):
+       def activate(self, ctx): ...
+       def update(self, ctx): return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+Other Documentation Resources
+------------------------------
+
+Explore the `Developer Guide <https://docs.hex-rays.com/developer-guide>`_ in our Hex-Rays Documentation Hub:
+
+* **Cookbook**: Check our `examples library <https://docs.hex-rays.com/developer-guide/idapython/idapython-examples>`_,
+  which demonstrates practical implementation for the IDAPython API, complementing this reference.
+  The samples include recent examples for `working with types <https://docs.hex-rays.com/developer-guide/idapython/idapython-examples#working-with-types>`_.
+
+* **Getting Started**: If you're new to IDAPython, we recommend starting with
+  `Getting Started with IDAPython <https://docs.hex-rays.com/developer-guide/idapython/idapython-getting-started>`_.
+  These docs introduce key concepts and help you begin exploring IDAPython's capabilities.
+
+* **Migration Guide**: Read our `Porting Guide <https://docs.hex-rays.com/developer-guide/idapython/idapython-porting-guide-ida-9#how-to-examples>`_
+  that streamlines the process of updating your current scripts and plugins to the latest version of
+  IDAPython API, along with how-to examples.
+
+* **Release Notes**: For a complete list of recent API changes, refer to the latest
+  `Release Notes <https://docs.hex-rays.com/release-notes>`_.
+
+* **C++ SDK**: For the native C++ SDK reference, see the `C++ SDK documentation <https://cpp.docs.hex-rays.com/>`_.
+
+If you need further assistance, you can `contact us <https://hex-rays.com/contact>`_ or
+`submit a request <https://get.support.hex-rays.com/servicedesk/customer/portals>`_ to our support team.
+
+
+.. toctree::
+   :hidden:
+
+   /ida_auto/index
+   /ida_bitrange/index
+   /ida_bytes/index
+   /ida_dbg/index
+   /ida_dirtree/index
+   /ida_diskio/index
+   /ida_dscu/index
+   /ida_entry/index
+   /ida_expr/index
+   /ida_fixup/index
+   /ida_fpro/index
+   /ida_frame/index
+   /ida_funcs/index
+   /ida_gdl/index
+   /ida_graph/index
+   /ida_hexrays/index
+   /ida_ida/index
+   /ida_idaapi/index
+   /ida_idc/index
+   /ida_idd/index
+   /ida_idp/index
+   /ida_ieee/index
+   /ida_indexer/index
+   /ida_kernwin/index
+   /ida_libfuncs/index
+   /ida_lines/index
+   /ida_lumina/index
+   /ida_loader/index
+   /ida_merge/index
+   /ida_mergemod/index
+   /ida_moves/index
+   /ida_nalt/index
+   /ida_name/index
+   /ida_netnode/index
+   /ida_offset/index
+   /ida_pro/index
+   /ida_problems/index
+   /ida_range/index
+   /ida_regfinder/index
+   /ida_registry/index
+   /ida_search/index
+   /ida_segment/index
+   /ida_segregs/index
+   /ida_srclang/index
+   /ida_strlist/index
+   /ida_tryblks/index
+   /ida_typeinf/index
+   /ida_ua/index
+   /ida_undo/index
+   /ida_xref/index
+   /idaapi/index
+   /idadex/index
+   /idautils/index
+   /idc/index
+   /init/index
+   /lumina_model/index

@@ -1,0 +1,285 @@
+{
+  "site": "https://python.docs.hex-rays.com/",
+  "files": {
+    "ida_allins/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_allins/index.rst.txt",
+      "sha256": "9ca6021fff3806a9d77eb701fc03879f83bcb7b976f54fa2fb194c961f3ccc86",
+      "bytes": 1118174
+    },
+    "ida_auto/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_auto/index.rst.txt",
+      "sha256": "c1607c32fc832059b3267834f226a04d85ecf29c829726f065fa0b12318303a1",
+      "bytes": 10429
+    },
+    "ida_bitrange/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_bitrange/index.rst.txt",
+      "sha256": "b61fb0709d5f335263b5b6e412f1845fb9bc537c3079446a7c271e6f40455995",
+      "bytes": 2045
+    },
+    "ida_bytes/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_bytes/index.rst.txt",
+      "sha256": "866152147b6bc194339c7494792e115d819f806c66bde2fe1fe2117a969fd93f",
+      "bytes": 105094
+    },
+    "ida_dbg/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_dbg/index.rst.txt",
+      "sha256": "f4d0373b15b4684acc12ea63aabd5c9f966996ac221c2156fa84e4d63a19e765",
+      "bytes": 84005
+    },
+    "ida_dirtree/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_dirtree/index.rst.txt",
+      "sha256": "be8cba91ff1f4c536fae41d1cffbe6678ca11a6ffcc99e7acaa4db9a49269844",
+      "bytes": 21615
+    },
+    "ida_diskio/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_diskio/index.rst.txt",
+      "sha256": "58982675c85652a4f15f10f8f90c98e02c18d531bd8a46fc714c1ed417c5e60b",
+      "bytes": 7331
+    },
+    "ida_entry/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_entry/index.rst.txt",
+      "sha256": "1b815dae054fc60e525045d58905edc1647febd2fe83aea662f3d130d5133de3",
+      "bytes": 3881
+    },
+    "ida_expr/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_expr/index.rst.txt",
+      "sha256": "d304f81a3e0ed12444918e33ff37f29b1173b8cba184ab89c3d2dc928e36c224",
+      "bytes": 19735
+    },
+    "ida_fixup/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_fixup/index.rst.txt",
+      "sha256": "679028d7082415eb0ca0b480d73f7347dafe4b55d43dad85958c5454307ee976",
+      "bytes": 10033
+    },
+    "ida_fpro/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_fpro/index.rst.txt",
+      "sha256": "59ebae2b31018ea113396879b697bd4c6edb270177604f5e20b142e0ad739809",
+      "bytes": 3568
+    },
+    "ida_frame/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_frame/index.rst.txt",
+      "sha256": "fb92be82f5fd3e3f1fa11f1f2e5313f822f6440b85dbe16f9fc498eb56d33956",
+      "bytes": 45299
+    },
+    "ida_funcs/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_funcs/index.rst.txt",
+      "sha256": "a03a5522b090eb3415f5977bad666340c8af10dba6c2e458653fd114903c4287",
+      "bytes": 55838
+    },
+    "ida_gdl/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_gdl/index.rst.txt",
+      "sha256": "e0ff12e058404482ba318364b5f3394541143892c221d18bc298e25f17ffcf1a",
+      "bytes": 14674
+    },
+    "ida_graph/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_graph/index.rst.txt",
+      "sha256": "1a196406be5fe65100679faa9bfb8d6a89e1c243fa952c4df937332f3efe3d33",
+      "bytes": 41928
+    },
+    "ida_hexrays/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_hexrays/index.rst.txt",
+      "sha256": "caf2a73cf44abd28d5b464c9d1df839595bf0d13361772d5f56f5ee7b9fa0b97",
+      "bytes": 411906
+    },
+    "ida_ida/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_ida/index.rst.txt",
+      "sha256": "6b2f11c35d7efcd51822fd533c0e74e456b43932213981a7d4320db0cedcdb20",
+      "bytes": 70820
+    },
+    "ida_idaapi/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_idaapi/index.rst.txt",
+      "sha256": "9d32e48fd30d61af00e05d4cd3806b9371bf5d169223e69e23538b75aad1c45c",
+      "bytes": 14795
+    },
+    "ida_idc/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_idc/index.rst.txt",
+      "sha256": "33188752f8173c4b52da3400c04fa451fc44717a74100b88c44a283fdd0a495c",
+      "bytes": 439
+    },
+    "ida_idd/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_idd/index.rst.txt",
+      "sha256": "2c6fa47708851edfcc1a6c1e454d03c4919a82003aba4f6fc52e6ec46a20079e",
+      "bytes": 66529
+    },
+    "ida_idp/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_idp/index.rst.txt",
+      "sha256": "4cfacc0c8fc040321c0d130de5abba42c780efc0ee318eab56da6e03ce7a9de0",
+      "bytes": 152857
+    },
+    "ida_ieee/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_ieee/index.rst.txt",
+      "sha256": "a7b58fb272af0151a2e520bd0aa2cd694f5c56e49543f12c15c65a3f6140ccce",
+      "bytes": 5249
+    },
+    "ida_kernwin/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_kernwin/index.rst.txt",
+      "sha256": "d9db3d0299f1d0d239893550f4068b0ba19a165b950fc398ccdd0b010fff652a",
+      "bytes": 248034
+    },
+    "ida_libfuncs/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_libfuncs/index.rst.txt",
+      "sha256": "3fbbecde75a577d4a3e24260ccaf1bcd0d2517b4b3fda4ed8fb131d69316fd99",
+      "bytes": 3116
+    },
+    "ida_lines/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_lines/index.rst.txt",
+      "sha256": "6b331d2781d3ea41be99c1c7822f2935b13a147ecfe01bbd8bfde09644c5704a",
+      "bytes": 20398
+    },
+    "ida_loader/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_loader/index.rst.txt",
+      "sha256": "dd1fdbc29530f13e9ff706926859a7e1eb93b3adc6e216b5969d5716d606d783",
+      "bytes": 23227
+    },
+    "ida_lumina/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_lumina/index.rst.txt",
+      "sha256": "63f91ea152c1040e215b3d07a3cd09df28bb7edddd8e718277bf738547c4451f",
+      "bytes": 42764
+    },
+    "ida_merge/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_merge/index.rst.txt",
+      "sha256": "3b976bc12771c028b4c66dde2fb8d5a6637674dd25b0489a6db54448b7af6a69",
+      "bytes": 25920
+    },
+    "ida_mergemod/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_mergemod/index.rst.txt",
+      "sha256": "2b7b98ebb2e299f8560e2b90895556ef66d7ab0e5d30de89df324956723b31b6",
+      "bytes": 3864
+    },
+    "ida_moves/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_moves/index.rst.txt",
+      "sha256": "7d836c138b1e100cf6707a199963527f5e93a27a28cc3157ba589ae9cfbbb6ad",
+      "bytes": 7716
+    },
+    "ida_nalt/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_nalt/index.rst.txt",
+      "sha256": "3570894f869518bf4fa653a0c844bea578f3e672488082253cdce654c45aadcd",
+      "bytes": 55192
+    },
+    "ida_name/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_name/index.rst.txt",
+      "sha256": "53da7516fca562f40551eccf87de06ce8d420d0f5e28994ab78050053423b56d",
+      "bytes": 29316
+    },
+    "ida_netnode/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_netnode/index.rst.txt",
+      "sha256": "e470902c1f49991840143d1ef4ed717c93c82d183a7a7a1a127bab37a700eb1f",
+      "bytes": 12398
+    },
+    "ida_offset/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_offset/index.rst.txt",
+      "sha256": "267a2cb9b25cde28c34847f69969eff76d9516e64f136b83153353c8b96acd3a",
+      "bytes": 7926
+    },
+    "ida_pro/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_pro/index.rst.txt",
+      "sha256": "13635ac57d6c5fd141a42fdcbb3e52cb07b1fb4a42d7fd4a8a9fea64dfc12b73",
+      "bytes": 32504
+    },
+    "ida_problems/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_problems/index.rst.txt",
+      "sha256": "e12a221caba6558c2c6d37734b6873299f8e4830ef0a816466b49af3542ca36c",
+      "bytes": 4177
+    },
+    "ida_range/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_range/index.rst.txt",
+      "sha256": "6691090ee0f20507e82234288eb17849c596fd6a847842e36ab05a46dadb273a",
+      "bytes": 10771
+    },
+    "ida_regfinder/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_regfinder/index.rst.txt",
+      "sha256": "86c9d46e5bc5f1127409b66792b476e0a880f654130066e1a9d5f38850fd5c12",
+      "bytes": 17887
+    },
+    "ida_registry/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_registry/index.rst.txt",
+      "sha256": "00cda744148c5c4cf4df2b7020a868421a2b6bac59f407007d8998dfb52adb16",
+      "bytes": 6157
+    },
+    "ida_search/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_search/index.rst.txt",
+      "sha256": "594883ea8b6e8df84836506dbcb677fad403088eaee5b14eec6a955dd9d4f8ce",
+      "bytes": 3192
+    },
+    "ida_segment/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_segment/index.rst.txt",
+      "sha256": "6c9d4f3e9ff3a04106f5b44e16467cbae9f0fc9115b9fdae85153fd28dae7b24",
+      "bytes": 58734
+    },
+    "ida_segregs/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_segregs/index.rst.txt",
+      "sha256": "98068eaa330f4eb26baa9679ecc3d40098d6810d526d4111d96242a3c7f85a85",
+      "bytes": 6996
+    },
+    "ida_srclang/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_srclang/index.rst.txt",
+      "sha256": "51b7cdcaf035a7de9d5230d0a42c58610baa7a274dd670744e0366b286135ec4",
+      "bytes": 4450
+    },
+    "ida_strlist/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_strlist/index.rst.txt",
+      "sha256": "8b1c40a57084910dbb813c6bae7463ffaff8f653251003c5d878da9d3da1eb39",
+      "bytes": 2404
+    },
+    "ida_tryblks/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_tryblks/index.rst.txt",
+      "sha256": "11486f316f1d84607d974bb3dd084a3d94feb239c941ff9166da27ed06d6a06b",
+      "bytes": 7536
+    },
+    "ida_typeinf/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_typeinf/index.rst.txt",
+      "sha256": "888cb8af3f7d60a2d72b9085953c0183c95f204d8b243474e9f4286fc71fbef5",
+      "bytes": 214728
+    },
+    "ida_ua/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_ua/index.rst.txt",
+      "sha256": "fa99120fb02721a065a4235315786ab70dd5bf693d66271d3642de3bbdf27083",
+      "bytes": 44260
+    },
+    "ida_undo/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_undo/index.rst.txt",
+      "sha256": "f6d4a9c25e7d1f41b609160d63bbc8d42867664273cd364660173569dc12faba",
+      "bytes": 1113
+    },
+    "ida_xref/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/ida_xref/index.rst.txt",
+      "sha256": "22ea54c1b7b65bbefb31e10baab8fce9f561247c7fa6729a2945b8220aa0a5a7",
+      "bytes": 15588
+    },
+    "idaapi/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/idaapi/index.rst.txt",
+      "sha256": "dcd1b7d86561a93336f8f9f3cf0f4700fd02f2fe4471fa440a2baf18dd167633",
+      "bytes": 270
+    },
+    "idadex/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/idadex/index.rst.txt",
+      "sha256": "d1bde75e576b06bb21205857709a5a24d53cb8f8830fc652e1c8fe3aa41a9b5a",
+      "bytes": 4234
+    },
+    "idautils/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/idautils/index.rst.txt",
+      "sha256": "8923c97d1ddfacea214857bbbceb591028d7b60eb87e4e8538d944a75b76823b",
+      "bytes": 10146
+    },
+    "idc/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/idc/index.rst.txt",
+      "sha256": "adc3e06d50bee8fac6d64889d271fd266ed157a5d1aa7f37d0a638026e14e0fa",
+      "bytes": 122852
+    },
+    "index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/index.rst.txt",
+      "sha256": "cb512c0284895f01b6e4405a7fe72a91aba7429e48cd3fe032bfa08adaaf4c5a",
+      "bytes": 16109
+    },
+    "init/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/init/index.rst.txt",
+      "sha256": "dc22e31b02ef5cc8ccfc6a24b39314ae0769ad3e3d704f19a207f5f8f56a3232",
+      "bytes": 1542
+    },
+    "lumina_model/index.rst.txt": {
+      "url": "https://python.docs.hex-rays.com/_sources/lumina_model/index.rst.txt",
+      "sha256": "c35245e6805e3e24e71dd9fcc66dc715c5febe51263f983715f0e14c681016b7",
+      "bytes": 2130
+    }
+  }
+}
