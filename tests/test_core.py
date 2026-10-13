@@ -79,6 +79,21 @@ class DatabaseTests(unittest.TestCase):
             result = operation(connection, "request-1")
         self.assertEqual(result["result"]["matches"][0]["address"], 0x1000)
 
+    def test_legacy_xrefs_table_is_migrated(self):
+        old_path = Path(self.temporary.name) / "legacy.sqlite"
+        with closing(sqlite3.connect(old_path)) as connection:
+            connection.execute(
+                "CREATE TABLE xrefs(source_ea INTEGER NOT NULL,target_ea INTEGER NOT NULL,xref_type INTEGER NOT NULL,"
+                "is_code INTEGER NOT NULL DEFAULT 0,is_data INTEGER NOT NULL DEFAULT 0,"
+                "source_function_ea INTEGER,target_function_ea INTEGER,"
+                "PRIMARY KEY(source_ea,target_ea,xref_type))"
+            )
+            connection.commit()
+        with closing(connect(old_path)) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(xrefs)")}
+            self.assertIn("type_name", columns)
+            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "2")
+
     def test_runner_reads_result_from_sqlite(self):
         binary = Path(self.temporary.name) / "sample.bin"
         binary.write_bytes(b"\x90\xC3")

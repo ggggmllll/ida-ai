@@ -23,6 +23,7 @@ try:  # imported only inside IDA
     import ida_loader
     import ida_name
     import ida_nalt
+    import ida_xref
     import ida_segment
     import idautils
     import idc
@@ -36,6 +37,21 @@ except ImportError:
 
 from .db import connect, reset_analysis, set_metadata, sqlite_ea, utc_now
 from .selection import BytePattern, parse_pattern
+
+
+XREF_TYPE_NAMES = {
+    getattr(ida_xref, "fl_U", -1): "data_unknown",
+    getattr(ida_xref, "dr_O", -2): "data_offset",
+    getattr(ida_xref, "dr_W", -3): "data_write",
+    getattr(ida_xref, "dr_R", -4): "data_read",
+    getattr(ida_xref, "dr_T", -5): "data_text",
+    getattr(ida_xref, "dr_I", -6): "data_informational",
+    getattr(ida_xref, "fl_CF", -7): "code_far_call",
+    getattr(ida_xref, "fl_CN", -8): "code_near_call",
+    getattr(ida_xref, "fl_JF", -9): "code_far_jump",
+    getattr(ida_xref, "fl_JN", -10): "code_near_jump",
+    getattr(ida_xref, "fl_F", -11): "ordinary_flow",
+}
 
 
 def _text(value) -> str | None:
@@ -106,7 +122,7 @@ def add_functions(connection) -> list[int]:
 
 def add_xrefs(connection) -> None:
     rows = []
-    statement = "INSERT OR IGNORE INTO xrefs(source_ea,target_ea,xref_type,is_code,is_data,source_function_ea,target_function_ea) VALUES(?,?,?,?,?,?,?)"
+    statement = "INSERT OR IGNORE INTO xrefs(source_ea,target_ea,xref_type,is_code,is_data,source_function_ea,target_function_ea,type_name) VALUES(?,?,?,?,?,?,?,?)"
     for index in range(ida_segment.get_segm_qty()):
         seg = ida_segment.getnseg(index)
         if seg is None:
@@ -116,11 +132,11 @@ def add_xrefs(connection) -> None:
                 ref_target = int(ref.to)
                 source_func = ida_funcs.get_func(ref.frm)
                 target_func = ida_funcs.get_func(ref.to)
-                flags = ida_bytes.get_full_flags(ref.frm)
-                rows.append((sqlite_ea(ref.frm), sqlite_ea(ref_target), int(ref.type), int(ida_bytes.is_code(flags)),
-                             int(ida_bytes.is_data(flags)),
+                rows.append((sqlite_ea(ref.frm), sqlite_ea(ref_target), int(ref.type), int(bool(ref.iscode)),
+                             int(not bool(ref.iscode)),
                              sqlite_ea(source_func.start_ea) if source_func else None,
-                             sqlite_ea(target_func.start_ea) if target_func else None))
+                             sqlite_ea(target_func.start_ea) if target_func else None,
+                             XREF_TYPE_NAMES.get(int(ref.type), f"type_{int(ref.type)}")))
                 if len(rows) >= 10000:
                     connection.executemany(statement, rows)
                     rows.clear()

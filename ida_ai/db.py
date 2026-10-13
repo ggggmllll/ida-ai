@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def sqlite_ea(address: int) -> int:
@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS xrefs (
     is_data INTEGER NOT NULL DEFAULT 0,
     source_function_ea INTEGER,
     target_function_ea INTEGER,
+    type_name TEXT,
     PRIMARY KEY (source_ea, target_ea, xref_type)
 );
 CREATE INDEX IF NOT EXISTS idx_xrefs_target ON xrefs(target_ea);
@@ -209,6 +210,9 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    xref_columns = {row[1] for row in connection.execute("PRAGMA table_info(xrefs)")}
+    if "type_name" not in xref_columns:
+        connection.execute("ALTER TABLE xrefs ADD COLUMN type_name TEXT")
     connection.execute(
         "INSERT INTO schema_info(key, value) VALUES('version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
