@@ -21,3 +21,5 @@ python -m ida_ai sql --db ANALYSIS.sqlite --query "SELECT function_ea, text FROM
 ```
 
 Run initialization first. A missing function match means inspect `functions` with SQL; do not guess a name or address.
+
+After successful publication, the result includes `job_review`: changed evidence and its dependent claims are marked for review in append-only job revisions. Use `job-resume` before continuing affected research.

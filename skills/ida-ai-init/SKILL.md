@@ -21,3 +21,5 @@ python -m ida_ai sql --db ANALYSIS.sqlite --query "SELECT count(*) AS functions 
 ```
 
 If IDA cannot be found, pass `--idat`; if the IDB path is missing or locked, choose a writable `--idb` path.
+
+After successful publication, the result includes `job_review`: changed evidence and its dependent claims are marked for review in append-only job revisions. Use `job-resume` before continuing affected research.
