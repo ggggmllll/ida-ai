@@ -86,7 +86,7 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
     @app.resource("ida://database/schema")
     def database_schema() -> str:
         """Describe the core analysis tables available to sql_query."""
-        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,...), xrefs(source_ea,target_ea,xref_type,...), basic_blocks, cfg_edges, disassembly(function_ea,text,status,...), instructions, pseudocode(function_ea,text,status,...), symbols(address,name,type), comments(address,function_ea,kind,repeatable,item_preciser,text,updated_at), type_definitions(name,declaration,updated_at), type_assignments(address,declaration,updated_at), memory_bytes, pointers, search_matches, operations. Address integers use signed SQLite representations of unsigned ea_t values."""
+        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs(source_ea,target_ea,xref_type,...), basic_blocks, cfg_edges, disassembly(function_ea,text,status,...), instructions, pseudocode(function_ea,text,status,...), symbols(address,name,type), comments(address,function_ea,kind,repeatable,item_preciser,text,updated_at), type_definitions(name,declaration,updated_at), type_assignments(address,declaration,updated_at), memory_bytes, pointers, search_matches, operations. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values."""
 
     if unsafe:
         def mutate(kind: str, values: dict) -> dict:

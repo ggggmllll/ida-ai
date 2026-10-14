@@ -9,7 +9,7 @@ Run:
 python -m ida_ai init --db ANALYSIS.sqlite --binary SAMPLE --idb ANALYSIS.i64 [--idat PATH]
 ```
 
-The command waits for IDA autoanalysis, saves an IDB, and stores functions, segments, xrefs, and basic-block CFG edges in SQLite. It prints JSON. No GUI or Qt is used. The saved IDB path is stored in `metadata`; later commands reuse it.
+The command waits for IDA autoanalysis, saves an IDB, and stores functions, segments, xrefs, and basic-block CFG edges in SQLite. Function rows include `is_thunk` and `thunk_target_ea`; `is_nullstub` is set only when decoded instructions consist of harmless entry instructions followed by a return. It prints JSON. No GUI or Qt is used. The saved IDB path is stored in `metadata`; later commands reuse it.
 
 Use an absolute path when the binary and database are on different drives. `--idat` is required only when `IDAT` or `IDADIR` is not configured. Do not run export commands before `init` succeeds.
 

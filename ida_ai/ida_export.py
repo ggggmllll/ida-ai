@@ -26,6 +26,8 @@ try:  # imported only inside IDA
     import ida_loader
     import ida_name
     import ida_nalt
+    import ida_idp
+    import ida_ua
     import ida_xref
     import ida_segment
     import ida_typeinf
@@ -40,6 +42,7 @@ except ImportError:
     ida_hexrays = None
 
 from .db import connect, reset_analysis, set_metadata, sqlite_ea, ida_ea, utc_now
+from .function_classification import is_nullstub_sequence
 from .selection import BytePattern, parse_pattern
 
 
@@ -88,6 +91,34 @@ def function_name(ea: int) -> str:
     return ida_funcs.get_func_name(ea) or ida_name.get_name(ea) or f"sub_{ea:X}"
 
 
+def is_nullstub(func) -> bool:
+    """Conservatively recognize an empty function from its actual instructions."""
+    instructions = []
+    for ea in idautils.FuncItems(func.start_ea):
+        if not ida_bytes.is_code(ida_bytes.get_full_flags(ea)):
+            return False
+        insn = ida_ua.insn_t()
+        size = int(ida_ua.decode_insn(insn, ea))
+        if size <= 0 or size != int(ida_bytes.get_item_size(ea)):
+            return False
+        mnemonic = ida_ua.print_insn_mnem(ea) or ""
+        is_return = bool(_safe(lambda: ida_idp.is_ret_insn(insn, ida_idp.IRI_RET_LITERALLY), False))
+        instructions.append((str(mnemonic), is_return))
+    return is_nullstub_sequence(instructions)
+
+
+def _thunk_target_ea(func):
+    """Normalize IDA versions that expose the thunk target as a tuple."""
+    target = _safe(lambda: ida_funcs.calc_thunk_func_target(func), ida_idaapi.BADADDR)
+    if isinstance(target, (tuple, list)):
+        target = target[0] if target else ida_idaapi.BADADDR
+    try:
+        target = int(target)
+    except (TypeError, ValueError):
+        return None
+    return None if target == int(ida_idaapi.BADADDR) else target
+
+
 def add_segments(connection) -> None:
     rows = []
     for index in range(ida_segment.get_segm_qty()):
@@ -113,14 +144,17 @@ def add_functions(connection) -> list[int]:
         signature = _safe(lambda: idc.get_type(ea))
         demangled = _safe(lambda: idc.demangle_name(name, idc.get_inf_attr(idc.INF_LONG_DN)))
         seg = find_segment(ea)
+        is_thunk = bool(func.flags & getattr(ida_funcs, "FUNC_THUNK", 0))
+        thunk_target = _thunk_target_ea(func) if is_thunk else None
         rows.append((sqlite_ea(func.start_ea), sqlite_ea(func.end_ea), name, _text(demangled), _text(signature),
                      int(func.flags), int(func.end_ea - func.start_ea),
                      ida_segment.get_segm_name(seg) if seg else None,
                      int(bool(func.flags & ida_funcs.FUNC_LIB)),
-                     int(bool(func.flags & getattr(ida_funcs, "FUNC_THUNK", 0))),
+                     int(is_thunk), sqlite_ea(thunk_target) if thunk_target is not None else None,
+                     int(is_nullstub(func)) if not is_thunk else 0,
                      _safe(lambda: idc.get_func_cmt(ea, 0)), _safe(lambda: idc.get_func_cmt(ea, 1))))
         addresses.append(int(func.start_ea))
-    connection.executemany("INSERT INTO functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,comment,repeatable_comment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    connection.executemany("INSERT INTO functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     return addresses
 
 

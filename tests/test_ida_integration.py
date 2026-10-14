@@ -34,6 +34,14 @@ class RealIDATests(unittest.TestCase):
             with closing(connect(db_path)) as connection:
                 ea = ida_ea(int(connection.execute("SELECT start_ea FROM functions ORDER BY start_ea LIMIT 1").fetchone()[0]))
                 self.assertEqual(initialized["basic_blocks"], connection.execute("SELECT count(*) FROM basic_blocks").fetchone()[0])
+                thunk_count = connection.execute("SELECT count(*) FROM functions WHERE is_thunk=1").fetchone()[0]
+                self.assertGreater(thunk_count, 0)
+                self.assertEqual(thunk_count, connection.execute(
+                    "SELECT count(*) FROM functions WHERE is_thunk=1 AND thunk_target_ea IS NOT NULL"
+                ).fetchone()[0])
+                self.assertGreater(connection.execute(
+                    "SELECT count(*) FROM functions WHERE is_nullstub=1 AND is_thunk=0"
+                ).fetchone()[0], 0)
 
             disassembly = run_ida("export_view", db_path, addresses=[ea], view="disassembly", idat=idat, timeout=120)
             self.assertEqual(disassembly["functions"], 1)

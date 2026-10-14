@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def sqlite_ea(address: int) -> int:
@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS functions (
     segment_name TEXT,
     is_library INTEGER NOT NULL DEFAULT 0,
     is_thunk INTEGER NOT NULL DEFAULT 0,
+    thunk_target_ea INTEGER,
+    is_nullstub INTEGER NOT NULL DEFAULT 0,
     comment TEXT,
     repeatable_comment TEXT
 );
@@ -239,6 +241,11 @@ def initialize(connection: sqlite3.Connection) -> None:
     xref_columns = {row[1] for row in connection.execute("PRAGMA table_info(xrefs)")}
     if "type_name" not in xref_columns:
         connection.execute("ALTER TABLE xrefs ADD COLUMN type_name TEXT")
+    function_columns = {row[1] for row in connection.execute("PRAGMA table_info(functions)")}
+    if "thunk_target_ea" not in function_columns:
+        connection.execute("ALTER TABLE functions ADD COLUMN thunk_target_ea INTEGER")
+    if "is_nullstub" not in function_columns:
+        connection.execute("ALTER TABLE functions ADD COLUMN is_nullstub INTEGER NOT NULL DEFAULT 0")
     connection.execute(
         "INSERT INTO schema_info(key, value) VALUES('version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

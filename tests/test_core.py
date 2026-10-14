@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from ida_ai.cli import _cache_file, _cached_search, _clear_searches, _query
 from ida_ai.db import connect, ida_ea, operation, record_operation, set_metadata, sqlite_ea
+from ida_ai.function_classification import is_nullstub_sequence
 from ida_ai.runner import run_ida
 from ida_ai.selection import parse_hex_bytes, parse_pattern, select_function_addresses
 
@@ -109,11 +110,33 @@ class DatabaseTests(unittest.TestCase):
                 "source_function_ea INTEGER,target_function_ea INTEGER,"
                 "PRIMARY KEY(source_ea,target_ea,xref_type))"
             )
+            connection.execute(
+                "CREATE TABLE functions(start_ea INTEGER PRIMARY KEY,end_ea INTEGER NOT NULL,name TEXT NOT NULL,"
+                "demangled_name TEXT,signature TEXT,flags INTEGER,size INTEGER NOT NULL,segment_name TEXT,"
+                "is_library INTEGER NOT NULL DEFAULT 0,is_thunk INTEGER NOT NULL DEFAULT 0,comment TEXT,repeatable_comment TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO functions(start_ea,end_ea,name,size,is_thunk) VALUES(4096,4112,'legacy_thunk',16,1)"
+            )
             connection.commit()
         with closing(connect(old_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(xrefs)")}
             self.assertIn("type_name", columns)
-            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "3")
+            function_columns = {row[1] for row in connection.execute("PRAGMA table_info(functions)")}
+            self.assertIn("thunk_target_ea", function_columns)
+            self.assertIn("is_nullstub", function_columns)
+            function = connection.execute(
+                "SELECT is_thunk,thunk_target_ea,is_nullstub FROM functions WHERE start_ea=4096"
+            ).fetchone()
+            self.assertEqual(tuple(function), (1, None, 0))
+            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "4")
+
+    def test_nullstub_classification_is_conservative(self):
+        self.assertTrue(is_nullstub_sequence([("endbr64", False), ("nop", False), ("ret", True)]))
+        self.assertFalse(is_nullstub_sequence([]))
+        self.assertFalse(is_nullstub_sequence([("ret", True), ("nop", False)]))
+        self.assertFalse(is_nullstub_sequence([("mov", False), ("ret", True)]))
+        self.assertFalse(is_nullstub_sequence([("jz", False), ("ret", True)]))
 
     def test_runner_reads_result_from_sqlite(self):
         binary = Path(self.temporary.name) / "sample.bin"
