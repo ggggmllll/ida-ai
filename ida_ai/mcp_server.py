@@ -82,7 +82,8 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
             with closing(connect(database)) as connection:
                 addresses = select_function_addresses(connection, all_functions=all_functions, address=address,
                                                       address_range=address_range, name=name)
-            return run_ida("export_view", database, idat=idat, timeout=timeout, addresses=addresses, view=view)
+            result = run_ida("export_view", database, idat=idat, timeout=timeout, addresses=addresses, view=view)
+            return result
 
     @app.resource("ida://database/schema")
     def database_schema() -> str:
@@ -93,8 +94,8 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
         def mutate(kind: str, values: dict) -> dict:
             with ida_lock:
                 result = run_ida("mutate", database, idat=idat, timeout=timeout, mutation=kind, values=values)
-            from .cli import _cache_file
-            _cache_file(database).unlink(missing_ok=True)
+                from .cli import _cache_file
+                _cache_file(database).unlink(missing_ok=True)
             return result
 
         @app.tool()
@@ -147,8 +148,8 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
             """Rebuild the SQLite snapshot from the saved IDB after external IDA edits."""
             with ida_lock:
                 result = run_ida("sync", database, idat=idat, timeout=timeout, all_views=all_views)
-            from .cli import _cache_file
-            _cache_file(database).unlink(missing_ok=True)
+                from .cli import _cache_file
+                _cache_file(database).unlink(missing_ok=True)
             return result
 
     return app

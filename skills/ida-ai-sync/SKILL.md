@@ -20,3 +20,5 @@ The rebuild uses a staging SQLite database and publishes via SQLite backup after
 Search records, raw pointer scans, memory read snapshots and search operation results are invalidated during rebuild. CLI sync also deletes its acceleration cache. Non-search operation rows are historical records, not current observations.
 
 This is an explicit synchronization boundary, not a live GUI listener. Run sync after external edits and before using SQL to reason from the current IDB. Existing SQL reads do not automatically detect unsaved or external edits.
+
+After the complete SQLite snapshot is published, the runner checks saved job evidence and appends review revisions for affected claims and dependent jobs. The sync result includes `job_review`; inspect it before continuing long-running research. Do not use partial/staging output as current job evidence.

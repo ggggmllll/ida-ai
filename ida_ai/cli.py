@@ -12,7 +12,8 @@ from contextlib import closing
 from pathlib import Path
 
 from .db import connect, get_metadata, record_operation, sqlite_ea
-from .jobs import JOB_STATUSES, create_job, history as job_history, list_jobs, resume_job, revise_job, show_job
+from .jobs import JOB_STATUSES, check_jobs, create_job, history as job_history, list_jobs, resume_job, revise_job, show_job
+from .job_queries import diff_job, find_jobs, impact
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -237,7 +238,32 @@ def _parser() -> argparse.ArgumentParser:
     job_revise.add_argument("--ida-operation", action="append", default=[], metavar="REQUEST_ID")
     job_revise.add_argument("--validation", action="append", default=[], metavar="TEXT")
     job_revise.add_argument("--restore-revision", type=int, help="append a new revision restoring an earlier saved state")
+    job_revise.add_argument("--expected-revision", type=int, help="fail if the job head changed since the resume context")
+    job_revise.add_argument("--handoff", help="JSON object with progress, next_action, and stop_condition")
     job_revise.add_argument("--patch-file", type=Path, help="UTF-8 JSON changes file; cannot be mixed with other change flags")
+
+    job_diff = commands.add_parser("job-diff", help="compare two immutable job VCS revisions")
+    _add_db(job_diff)
+    job_diff.add_argument("--job", required=True, type=int)
+    job_diff.add_argument("--from-revision", required=True, type=int)
+    job_diff.add_argument("--to-revision", type=int, help="defaults to the current head")
+
+    job_search = commands.add_parser("job-search", help="search current job claims, evidence, questions, or revision notes")
+    _add_db(job_search)
+    job_search.add_argument("--query", required=True)
+    job_search.add_argument("--job", type=int)
+    job_search.add_argument("--kind", choices=("all", "claim", "evidence", "question", "note"), default="all")
+    job_search.add_argument("--history", action="store_true", help="search every historical revision, not only current heads")
+    job_search.add_argument("--limit", type=int, default=30)
+
+    job_impact = commands.add_parser("job-impact", help="show potential claim and dependency impact")
+    _add_db(job_impact)
+    job_impact.add_argument("--job", required=True, type=int)
+    job_impact.add_argument("--claim", action="append", default=[], help="claim ID; repeat for multiple roots")
+
+    job_check = commands.add_parser("job-check", help="detect analysis/evidence drift and optionally record review revisions")
+    _add_db(job_check)
+    job_check.add_argument("--apply", action="store_true", help="append review-required revisions for changed evidence")
     return parser
 
 
@@ -280,6 +306,7 @@ def _job_revision_options(args: argparse.Namespace) -> dict:
         "add_dependencies": args.depends_on, "remove_dependencies": args.remove_dependency,
         "operation_ids": args.ida_operation, "validations": args.validation,
         "restore_revision_id": args.restore_revision,
+        "expected_revision_id": args.expected_revision, "handoff": args.handoff,
     }
     if args.patch_file is None:
         return options
@@ -311,6 +338,12 @@ def _job_revision_options(args: argparse.Namespace) -> dict:
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
                 raise ValueError("restore_revision_id must be an integer")
             options[key] = value
+        elif key == "expected_revision_id":
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise ValueError("expected_revision_id must be an integer")
+            options[key] = value
+        elif key == "handoff" and isinstance(value, dict):
+            options[key] = json.dumps(value, ensure_ascii=False)
         elif value is not None and not isinstance(value, str):
             raise ValueError(f"{key} must be a string")
         else:
@@ -341,6 +374,17 @@ def _run(args: argparse.Namespace) -> dict:
                                    revision_id=args.revision)
             if args.command == "job-revise":
                 return revise_job(connection, args.job, message=args.message, **_job_revision_options(args))
+            if args.command == "job-diff":
+                return diff_job(connection, args.job, from_revision=args.from_revision, to_revision=args.to_revision)
+            if args.command == "job-search":
+                return find_jobs(connection, query=args.query, job_id=args.job, kind=args.kind,
+                                 include_history=args.history, limit=args.limit)
+            if args.command == "job-impact":
+                state = show_job(connection, args.job)
+                claim_ids = args.claim or [claim["id"] for claim in state["claims"] if claim["status"] in ("active", "review_required")]
+                return impact(connection, args.job, claim_ids)
+            if args.command == "job-check":
+                return check_jobs(connection, apply=args.apply)
         raise ValueError(f"unknown job command: {args.command}")
     if args.timeout < 0:
         raise ValueError("timeout must be non-negative")
@@ -357,7 +401,8 @@ def _run(args: argparse.Namespace) -> dict:
             raise ValueError("output IDB must differ from input binary; use --idb")
         if idb_path == db_path:
             raise ValueError("output IDB must differ from SQLite database")
-        return run_ida("init", db_path, binary=args.binary, idb_path=str(idb_path), **options)
+        result = run_ida("init", db_path, binary=args.binary, idb_path=str(idb_path), **options)
+        return result
     if args.command == "export":
         if not args.db.is_file():
             raise FileNotFoundError(f"SQLite database does not exist: {args.db}")
@@ -366,7 +411,8 @@ def _run(args: argparse.Namespace) -> dict:
                 connection, all_functions=args.all_functions, address=args.address,
                 address_range=args.address_range, name=args.name,
             )
-        return run_ida("export_view", args.db, view=args.view, addresses=addresses, **options)
+        result = run_ida("export_view", args.db, view=args.view, addresses=addresses, **options)
+        return result
     if args.command == "info":
         location = {"address": parse_int(args.address)} if args.address is not None else {"file_offset": parse_int(args.file_offset)}
         return run_ida("info", args.db, **location, **options)
@@ -378,7 +424,8 @@ def _run(args: argparse.Namespace) -> dict:
         raw = parse_hex_bytes(args.data)
         if len(raw) > (1 << 20):
             raise ValueError("write data must be at most 1048576 bytes")
-        return run_ida("write", args.db, address=parse_int(args.address), data_hex=raw.hex(), **options)
+        result = run_ida("write", args.db, address=parse_int(args.address), data_hex=raw.hex(), **options)
+        return result
     if args.command == "search":
         if args.limit < 0:
             raise ValueError("limit must be non-negative")

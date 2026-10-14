@@ -41,11 +41,18 @@ def analysis_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
         for table in ("disassembly", "pseudocode")
     }
     comment_epoch = connection.execute("SELECT max(updated_at) FROM comments").fetchone()[0]
+    type_state = {
+        "type_definitions": [tuple(row) for row in connection.execute(
+            "SELECT name,declaration FROM type_definitions ORDER BY name")],
+        "type_assignments": [tuple(row) for row in connection.execute(
+            "SELECT address,declaration FROM type_assignments ORDER BY address")],
+    }
     return {
         "identity": identity,
         "analysis_epoch": get_metadata(connection, "synchronized_at") or get_metadata(connection, "generated_at"),
         "view_epochs": view_epochs,
         "comment_epoch": comment_epoch,
+        "type_state_hash": hashlib.sha256(_json(type_state).encode("utf-8")).hexdigest(),
         "counts": counts,
     }
 
@@ -65,15 +72,23 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
     return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
 
 
-def _evidence_changed(connection: sqlite3.Connection, evidence: dict, current: dict) -> bool:
+def _evidence_drift(connection: sqlite3.Connection, evidence: dict, current: dict) -> bool | None:
+    """Return detected drift, stable source, or None when no source fingerprint exists."""
     if _identity_changed(evidence.get("analysis_snapshot"), current):
+        return True
+    old_snapshot = evidence.get("analysis_snapshot") or {}
+    if evidence.get("origin") == "ida_type_dependent" and old_snapshot.get("type_state_hash") != current.get("type_state_hash"):
         return True
     saved = evidence.get("artifact_fingerprint")
     if saved is not None:
         return saved != _artifact_fingerprint(connection, evidence["source_ref"])
     if evidence.get("origin") in ("raw", "external", "analyst"):
-        return False
+        return None
     return evidence.get("analysis_snapshot") != current
+
+
+def _evidence_changed(connection: sqlite3.Connection, evidence: dict, current: dict) -> bool:
+    return _evidence_drift(connection, evidence, current) is True
 
 
 def _identity_changed(old: dict[str, Any] | None, new: dict[str, Any]) -> bool:
@@ -180,7 +195,7 @@ def create_job(
         )
         job_id = cursor.lastrowid
         snapshot = {"title": title, "objective": objective, "status": "planned", "claims": [],
-                    "evidence": [], "questions": [], "depends_on": []}
+                    "evidence": [], "questions": [], "depends_on": [], "handoff": None}
         analysis = analysis_snapshot(connection)
         revision = _append_revision(connection, job_id, snapshot, message=message, changes=[{"kind": "job_created"}], current_analysis=analysis)
         connection.commit()
@@ -200,20 +215,17 @@ def _load_spec(raw: str, description: str) -> dict[str, Any]:
     return value
 
 
-def _evidence_id(state: dict[str, Any]) -> str:
-    used = {item["id"] for item in state["evidence"]}
-    number = 1
-    while f"E{number:04d}" in used:
-        number += 1
-    return f"E{number:04d}"
+def _used_ids(connection: sqlite3.Connection, job_id: int, key: str) -> set[str]:
+    return {item["id"] for row in connection.execute(
+        "SELECT snapshot_json FROM job_revisions WHERE job_id=?", (job_id,)
+    ) for item in _decode(row[0]).get(key, [])}
 
 
-def _claim_id(state: dict[str, Any]) -> str:
-    used = {item["id"] for item in state["claims"]}
+def _next_id(used: set[str], prefix: str) -> str:
     number = 1
-    while f"C{number:04d}" in used:
+    while f"{prefix}{number:04d}" in used:
         number += 1
-    return f"C{number:04d}"
+    return f"{prefix}{number:04d}"
 
 
 def _normalize_relies_on(value: Any) -> list[dict[str, Any]]:
@@ -252,12 +264,16 @@ def _validate_references(
     *, new_claim_ids: set[str] | None = None,
 ) -> None:
     new_claim_ids = new_claim_ids or set()
+    current_analysis = analysis_snapshot(connection)
     for claim in state["claims"]:
         if claim["status"] not in ("active", "review_required"):
             continue
         for evidence_id in claim.get("evidence_ids", []):
-            if not any(item["id"] == evidence_id for item in state["evidence"]):
+            evidence = next((item for item in state["evidence"] if item["id"] == evidence_id), None)
+            if evidence is None:
                 raise ValueError(f"claim {claim['id']} refers to missing evidence {evidence_id}")
+            if claim["id"] in new_claim_ids and _evidence_changed(connection, evidence, current_analysis):
+                raise ValueError(f"claim {claim['id']} cites changed evidence {evidence_id}; record fresh evidence")
         for reference in claim.get("relies_on", []):
             upstream_job = int(reference["job_id"])
             upstream_claim = _find_claim(connection, upstream_job, reference["claim_id"])
@@ -368,15 +384,19 @@ def _invalidate_dependents(
         for source_job, source_claim in batch:
             for target_job, target_state in states.items():
                 for target_claim in target_state["claims"]:
-                    if target_claim["status"] != "active":
+                    if target_claim["status"] not in ("active", "review_required"):
                         continue
                     references = {(int(item["job_id"]), item["claim_id"]) for item in target_claim.get("relies_on", [])}
                     if (source_job, source_claim) in references:
-                        target_claim["status"] = "review_required"
                         reason = f"{source_job}:{source_claim} changed"
-                        target_claim["review_reasons"] = sorted(set(target_claim.get("review_reasons", [])) | {reason})
-                        changed_by_job.setdefault(target_job, []).append(target_claim["id"])
-                        reasons_by_job.setdefault(target_job, set()).add(reason)
+                        was_active = target_claim["status"] == "active"
+                        old_reasons = set(target_claim.get("review_reasons", []))
+                        new_reasons = old_reasons | {reason}
+                        target_claim["status"] = "review_required"
+                        target_claim["review_reasons"] = sorted(new_reasons)
+                        if was_active or new_reasons != old_reasons:
+                            changed_by_job.setdefault(target_job, []).append(target_claim["id"])
+                            reasons_by_job.setdefault(target_job, set()).add(reason)
                         queue.append((target_job, target_claim["id"]))
         for target_job, claim_ids in changed_by_job.items():
             target_state = states[target_job]
@@ -417,7 +437,10 @@ def _invalidate_job_dependents(
             if target_id == source:
                 continue
             target = _state(connection, target_id)
-            if source not in target["depends_on"] or target["status"] in ("planned", "needs_review", "stale"):
+            if source not in target["depends_on"]:
+                continue
+            queue.append(target_id)
+            if target["status"] in ("planned", "needs_review", "stale"):
                 continue
             old_status = target["status"]
             target["status"] = "needs_review"
@@ -430,8 +453,111 @@ def _invalidate_job_dependents(
                 current_analysis=current_analysis,
             )
             affected.append(target_id)
-            queue.append(target_id)
     return sorted(set(affected))
+
+
+def _review_plan(connection: sqlite3.Connection, current: dict) -> dict[int, dict]:
+    """Compute evidence and transitive claim review without changing saved history."""
+    states = {int(row[0]): _state(connection, int(row[0]))
+              for row in connection.execute("SELECT job_id FROM jobs ORDER BY job_id")}
+    pending: dict[int, dict[str, set[str]]] = {}
+    for job_id, state in states.items():
+        changed = {item["id"] for item in state["evidence"] if _evidence_changed(connection, item, current)}
+        for claim in state["claims"]:
+            if claim["status"] not in ("active", "review_required"):
+                continue
+            reasons = {f"evidence {eid} changed" for eid in changed.intersection(claim.get("evidence_ids", []))}
+            if claim["status"] == "review_required":
+                reasons.update(claim.get("review_reasons", []) or ["recorded review required"])
+            if reasons:
+                pending.setdefault(job_id, {})[claim["id"]] = reasons
+    changed = True
+    while changed:
+        changed = False
+        for job_id, state in states.items():
+            for claim in state["claims"]:
+                if claim["status"] not in ("active", "review_required"):
+                    continue
+                for ref in claim.get("relies_on", []):
+                    upstream = states.get(ref["job_id"], {})
+                    upstream_claim = next((c for c in upstream.get("claims", []) if c["id"] == ref["claim_id"]), None)
+                    if (ref["claim_id"] in pending.get(ref["job_id"], {}) or upstream_claim is None or
+                            upstream_claim["status"] in ("withdrawn", "superseded")):
+                        reason = f"upstream {ref['job_id']}:{ref['claim_id']} requires review"
+                        reasons = pending.setdefault(job_id, {}).setdefault(claim["id"], set())
+                        if reason not in reasons:
+                            reasons.add(reason)
+                            changed = True
+    return {job_id: {claim_id: sorted(reasons) for claim_id, reasons in claims.items()}
+            for job_id, claims in pending.items()}
+
+
+def _apply_review(connection: sqlite3.Connection, current: dict) -> list[int]:
+    affected = []
+    plan = _review_plan(connection, current)
+    for job_id, claims in plan.items():
+        state = _state(connection, job_id)
+        changes = []
+        for claim in state["claims"]:
+            if claim["id"] not in claims:
+                continue
+            reasons = claims[claim["id"]]
+            if claim["status"] == "review_required" and claim.get("review_reasons") == reasons:
+                continue
+            claim["status"] = "review_required"
+            claim["review_reasons"] = reasons
+            changes.append({"kind": "claim_review_required", "claim_id": claim["id"], "reasons": reasons})
+        if state["status"] != "needs_review":
+            changes.append({"kind": "status_changed", "from": state["status"], "to": "needs_review"})
+            state["status"] = "needs_review"
+        if changes:
+            _append_revision(connection, job_id, state, message="Evidence/dependency review required",
+                             changes=changes, current_analysis=current)
+            affected.append(job_id)
+    return sorted(set(affected) | set(_invalidate_job_dependents(connection, list(plan), current_analysis=current)))
+
+
+def _job_review_plan(connection: sqlite3.Connection, initial_job_ids: list[int]) -> dict[int, list[str]]:
+    """Project job-status review caused by direct and transitive job dependencies."""
+    states = {int(row[0]): _state(connection, int(row[0]))
+              for row in connection.execute("SELECT job_id FROM jobs ORDER BY job_id")}
+    queue = list(initial_job_ids)
+    seen = set(queue)
+    reasons: dict[int, set[str]] = {job_id: {"one or more claims require review"} for job_id in initial_job_ids}
+    while queue:
+        source = queue.pop(0)
+        for target, state in states.items():
+            if source not in state["depends_on"]:
+                continue
+            reasons.setdefault(target, set()).add(f"dependency job {source} changed")
+            if target not in seen:
+                seen.add(target)
+                queue.append(target)
+    return {job_id: sorted(items) for job_id, items in reasons.items()}
+
+
+def check_jobs(connection: sqlite3.Connection, *, apply: bool = False) -> dict[str, Any]:
+    """Preview or persist review requirements after a complete analysis publication."""
+    connection.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
+    try:
+        current = analysis_snapshot(connection)
+        plan = _review_plan(connection, current)
+        job_plan = _job_review_plan(connection, list(plan))
+        statuses_before = {job_id: _state(connection, job_id)["status"] for job_id in job_plan}
+        affected = _apply_review(connection, current) if apply else []
+        result = {"applied": apply, "claims_requiring_review": [
+            {"job_id": job_id, "claim_id": claim_id, "reasons": reasons}
+            for job_id, claims in plan.items() for claim_id, reasons in claims.items()
+        ], "jobs_requiring_review": [
+            {"job_id": job_id, "status": statuses_before[job_id], "reasons": reasons}
+            for job_id, reasons in job_plan.items()
+            if job_id in plan or statuses_before[job_id] not in ("planned", "needs_review", "stale")
+        ], "jobs_revised": affected}
+        connection.commit()
+        return result
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def revise_job(
@@ -454,20 +580,33 @@ def revise_job(
     operation_ids: list[str] | None = None,
     validations: list[str] | None = None,
     restore_revision_id: int | None = None,
+    expected_revision_id: int | None = None,
+    handoff: str | None = None,
 ) -> dict[str, Any]:
     if not message.strip():
         raise ValueError("revision message must not be empty")
     if status is not None and status not in JOB_STATUSES:
         raise ValueError(f"status must be one of: {', '.join(JOB_STATUSES)}")
+    if expected_revision_id is not None and expected_revision_id < 1:
+        raise ValueError("expected_revision_id must be positive")
+    if restore_revision_id is not None and restore_revision_id < 1:
+        raise ValueError("restore_revision_id must be positive")
     connection.execute("BEGIN IMMEDIATE")
     try:
-        _job_row(connection, job_id)
-        before = _state(connection, job_id)
+        job = _job_row(connection, job_id)
         current_analysis = analysis_snapshot(connection)
+        # Apply drift inside this revision transaction so an ordinary status
+        # change or restore cannot bypass evidence review. Failed edits roll back
+        # both the requested change and this automatic review transition.
+        _apply_review(connection, current_analysis)
+        job = _job_row(connection, job_id)
+        if expected_revision_id is not None and job["head_revision_id"] != expected_revision_id:
+            raise ValueError(f"job head changed: expected {expected_revision_id}, current {job['head_revision_id']}; resume first")
+        before = _state(connection, job_id)
         if restore_revision_id is not None:
             if any((title is not None, objective is not None, status is not None, add_claims, update_claims,
                     withdraw_claims, add_evidence, add_questions, resolve_questions,
-                    add_dependencies, remove_dependencies)):
+                    add_dependencies, remove_dependencies, handoff is not None)):
                 raise ValueError("restoring a revision cannot be combined with other state changes")
             source = connection.execute(
                 "SELECT snapshot_json FROM job_revisions WHERE revision_id=? AND job_id=?",
@@ -488,6 +627,15 @@ def revise_job(
         else:
             after = json.loads(_json(before))
             changes: list[dict[str, Any]] = []
+            if handoff is not None:
+                checkpoint = _load_spec(handoff, "handoff")
+                if set(checkpoint) - {"progress", "next_action", "stop_condition"}:
+                    raise ValueError("handoff fields are progress, next_action, stop_condition")
+                if not all(isinstance(checkpoint.get(key), str) and checkpoint[key].strip()
+                           for key in ("progress", "next_action", "stop_condition")):
+                    raise ValueError("handoff requires non-empty progress, next_action, stop_condition")
+                after["handoff"] = checkpoint
+                changes.append({"kind": "handoff_updated"})
             if title is not None:
                 if not title.strip():
                     raise ValueError("title must not be empty")
@@ -508,9 +656,12 @@ def revise_job(
                 unknown = set(spec) - {"id", "kind", "origin", "source_ref", "description"}
                 if unknown:
                     raise ValueError(f"unsupported evidence fields: {', '.join(sorted(unknown))}")
-                evidence_id = str(spec.get("id") or _evidence_id(after)).strip()
+                used_evidence_ids = _used_ids(connection, job_id, "evidence") | {item["id"] for item in after["evidence"]}
+                evidence_id = str(spec.get("id") or _next_id(used_evidence_ids, "E")).strip()
                 if not evidence_id or any(item["id"] == evidence_id for item in after["evidence"]):
                     raise ValueError(f"evidence ID is empty or already used: {evidence_id}")
+                if evidence_id in used_evidence_ids:
+                    raise ValueError(f"evidence ID was used by an earlier revision: {evidence_id}")
                 kind = str(spec.get("kind", "observation"))
                 origin = str(spec.get("origin", "ida_analysis"))
                 source_ref = str(spec.get("source_ref", "")).strip()
@@ -533,9 +684,12 @@ def revise_job(
                 unknown = set(spec) - {"id", "kind", "basis", "text", "summary", "rationale", "evidence_ids", "relies_on", "supersedes", "supersedes_reason"}
                 if unknown:
                     raise ValueError(f"unsupported claim fields: {', '.join(sorted(unknown))}")
-                claim_id = str(spec.get("id") or _claim_id(after)).strip()
+                used_claim_ids = _used_ids(connection, job_id, "claims") | {item["id"] for item in after["claims"]}
+                claim_id = str(spec.get("id") or _next_id(used_claim_ids, "C")).strip()
                 if not claim_id or any(item["id"] == claim_id for item in after["claims"]):
                     raise ValueError(f"claim ID is empty or already used: {claim_id}")
+                if claim_id in used_claim_ids:
+                    raise ValueError(f"claim ID was used by an earlier revision: {claim_id}")
                 kind = str(spec.get("kind", ""))
                 if kind not in CLAIM_KINDS:
                     raise ValueError(f"claim kind must be one of: {', '.join(CLAIM_KINDS)}")
@@ -562,8 +716,8 @@ def revise_job(
                     if not supersedes_reason:
                         raise ValueError("supersedes requires supersedes_reason")
                     previous = next((item for item in after["claims"] if item["id"] == supersedes), None)
-                    if previous is None or previous["status"] != "active":
-                        raise ValueError(f"supersedes must identify an active claim in this job: {supersedes}")
+                    if previous is None or previous["status"] not in ("active", "review_required"):
+                        raise ValueError(f"supersedes must identify an active or review-required claim in this job: {supersedes}")
                     previous["status"] = "superseded"
                     previous["retirement_reason"] = supersedes_reason
                     changes.append({"kind": "claim_superseded", "claim_id": supersedes, "by": claim_id})
@@ -629,8 +783,8 @@ def revise_job(
                 claim_id = str(spec.get("id", "")).strip()
                 reason = str(spec.get("reason", "")).strip()
                 claim = next((item for item in after["claims"] if item["id"] == claim_id), None)
-                if claim is None or claim["status"] != "active":
-                    raise ValueError(f"withdrawal requires an active claim ID: {claim_id}")
+                if claim is None or claim["status"] not in ("active", "review_required"):
+                    raise ValueError(f"withdrawal requires an active or review-required claim ID: {claim_id}")
                 if not reason:
                     raise ValueError("claim withdrawal requires a reason")
                 claim["status"] = "withdrawn"
@@ -644,11 +798,8 @@ def revise_job(
                     raise ValueError("question must not be empty")
                 if any(item["text"] == question and item["status"] == "open" for item in after["questions"]):
                     raise ValueError("question is already open")
-                number = 1
-                used = {item["id"] for item in after["questions"]}
-                while f"Q{number:04d}" in used:
-                    number += 1
-                question_id = f"Q{number:04d}"
+                used = _used_ids(connection, job_id, "questions") | {item["id"] for item in after["questions"]}
+                question_id = _next_id(used, "Q")
                 after["questions"].append({"id": question_id, "text": question, "status": "open", "resolution": None})
                 changes.append({"kind": "question_added", "question_id": question_id})
             for raw in resolve_questions or []:
@@ -690,6 +841,8 @@ def revise_job(
             claim["status"] == "review_required" for claim in after["claims"]
         ):
             raise ValueError("resolve all review-required claims before setting a job to active or done")
+        if before["status"] in ("done", "needs_review", "stale") and after["status"] != before["status"] and not details.strip():
+            raise ValueError("reopening or clearing review requires --details explaining the new evidence or evaluation")
 
         changed_claim_ids = _changed_claims(before, after)
         if not changes:
@@ -780,17 +933,33 @@ def list_jobs(
         tree_values = [result for job_id in roots if (result := prune(build(job_id))) is not None]
     else:
         tree_values = [build(job_id) for job_id in roots]
-    return {"tree": tree_values, "count": len(values)}
+    def node_count(item: dict[str, Any]) -> int:
+        return 1 + sum(node_count(child) for child in item["children"])
+    return {"tree": tree_values, "count": sum(node_count(item) for item in tree_values)}
 
 
 def show_job(connection: sqlite3.Connection, job_id: int) -> dict[str, Any]:
     state = _state(connection, job_id)
     current = analysis_snapshot(connection)
+    review_plan = _review_plan(connection, current)
+    job_review_plan = _job_review_plan(connection, list(review_plan))
     revision = _head(connection, job_id)
     prior_analysis = _decode(revision["analysis_snapshot_json"])
     children = [int(row[0]) for row in connection.execute("SELECT job_id FROM jobs WHERE parent_job_id=? ORDER BY job_id", (job_id,))]
+    drifted = [{"evidence_id": item["id"], "source_ref": item["source_ref"],
+                "origin": item["origin"], "source_changed": _evidence_drift(connection, item, current)}
+               for item in state["evidence"] if _evidence_drift(connection, item, current) is not False]
+    pending_claims = [{"claim_id": claim_id, "reasons": reasons}
+                      for claim_id, reasons in review_plan.get(job_id, {}).items()]
+    dependent_status = state["status"] not in ("planned", "needs_review", "stale")
+    effective_status = ("needs_review" if pending_claims or
+                        (job_id in job_review_plan and dependent_status) else state["status"])
     return {**_summary(connection, job_id), "claims": state["claims"], "evidence": state["evidence"],
             "questions": state["questions"],
+            "handoff": state.get("handoff"), "evidence_drift": drifted,
+            "effective_status": effective_status,
+            "claims_requiring_review": pending_claims,
+            "jobs_requiring_review": job_review_plan,
             "depends_on": state["depends_on"], "children": [_summary(connection, child) for child in children],
             "analysis_snapshot": prior_analysis,
             "analysis_snapshot_changed": prior_analysis != current,
@@ -832,6 +1001,9 @@ def resume_job(connection: sqlite3.Connection, job_id: int, *, recent: int = 3) 
     head = _head(connection, job_id)
     saved_analysis = _decode(head["analysis_snapshot_json"])
     current_analysis = analysis_snapshot(connection)
+    all_review_plan = _review_plan(connection, current_analysis)
+    review_plan = all_review_plan.get(job_id, {})
+    job_review_plan = _job_review_plan(connection, list(all_review_plan))
     children = [_summary(connection, int(child[0])) for child in connection.execute(
         "SELECT job_id FROM jobs WHERE parent_job_id=? ORDER BY job_id", (job_id,)
     )]
@@ -846,8 +1018,16 @@ def resume_job(connection: sqlite3.Connection, job_id: int, *, recent: int = 3) 
         return {key: claim[key] for key in ("id", "kind", "basis", "summary", "rationale", "status", "evidence_ids",
                                            "relies_on", "review_reasons") if key in claim}
 
-    claims = {kind: [compact(claim) for claim in state["claims"] if claim["kind"] == kind and claim["status"] == "active"] for kind in CLAIM_KINDS}
-    review_claims = [compact(claim) for claim in state["claims"] if claim["status"] == "review_required"]
+    claims = {kind: [compact(claim) for claim in state["claims"]
+                     if claim["kind"] == kind and claim["status"] == "active" and claim["id"] not in review_plan]
+              for kind in CLAIM_KINDS}
+    review_claims = []
+    for claim in state["claims"]:
+        if claim["status"] == "review_required" or claim["id"] in review_plan:
+            item = compact(claim)
+            item["status"] = "review_required"
+            item["review_reasons"] = review_plan.get(claim["id"], item.get("review_reasons", []))
+            review_claims.append(item)
     retired_claims = [{"id": claim["id"], "kind": claim["kind"], "summary": claim["summary"],
                        "status": claim["status"], "reason": claim.get("withdrawal_reason") or claim.get("retirement_reason") or claim.get("rationale")}
                       for claim in state["claims"] if claim["status"] in ("withdrawn", "superseded")]
@@ -859,17 +1039,28 @@ def resume_job(connection: sqlite3.Connection, job_id: int, *, recent: int = 3) 
                                   changed_evidence.intersection(claim.get("evidence_ids", []))]
     known_scope = []
     for evidence in state["evidence"]:
+        drift = _evidence_drift(connection, evidence, current_analysis)
         known_scope.append({"evidence_id": evidence["id"], "source_ref": evidence["source_ref"],
                             "description": evidence["description"], "origin": evidence["origin"],
-                            "source_changed": _evidence_changed(connection, evidence, current_analysis)})
+                            "source_changed": drift,
+                            "drift_check": "untracked" if drift is None else "checked"})
     return {
         "job_id": row["job_id"], "parent_job_id": row["parent_job_id"], "title": state["title"],
-        "objective": state["objective"], "status": state["status"], "revision_no": head["revision_no"],
+        "objective": state["objective"], "status": state["status"],
+        "effective_status": ("needs_review" if review_plan or
+                             (job_id in job_review_plan and state["status"] not in ("planned", "needs_review", "stale"))
+                             else state["status"]),
+        "jobs_requiring_review": [{"job_id": affected_job,
+                                   "status": _state(connection, affected_job)["status"],
+                                   "reasons": reasons}
+                                  for affected_job, reasons in job_review_plan.items()],
+        "revision_no": head["revision_no"],
         "current_claims": claims,
         "claims_needing_review": review_claims,
         "claims_needing_type_review": claims_needing_type_review,
         "retired_claims": retired_claims,
         "open_questions": [item for item in state["questions"] if item["status"] == "open"],
+        "handoff": state.get("handoff"),
         "known_evidence_scope": known_scope,
         "dependencies": dependencies,
         "children": children,

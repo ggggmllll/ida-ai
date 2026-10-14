@@ -89,7 +89,16 @@ def run_ida(
             result = operation(connection, request_id)
         if result is not None:
             if result["status"] == "ok" and completed.returncode == 0:
-                return result["result"]
+                value = result["result"]
+                if action in {"init", "sync", "export_view", "mutate", "write"}:
+                    # The IDA entrypoint publishes a complete DB snapshot before
+                    # recording success. Review evidence only after that commit,
+                    # regardless of whether the caller is CLI, MCP, or Python.
+                    from .jobs import check_jobs
+
+                    with closing(connect(db_path)) as connection:
+                        value["job_review"] = check_jobs(connection, apply=True)
+                return value
             if result["status"] == "error":
                 raise RuntimeError(result["error"] or "IDA operation failed")
     details = "\n".join(part for part in (completed.stdout[-4000:], completed.stderr[-4000:]) if part)

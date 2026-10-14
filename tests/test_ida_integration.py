@@ -50,10 +50,10 @@ class RealIDATests(unittest.TestCase):
                     values={"address": function_ea, "name": "job_test_compress2"}, idat=idat, timeout=120)
             with closing(connect(db_path)) as connection:
                 self.assertEqual(show_job(connection, child["job_id"])["title"], "compress2 wrapper")
-                self.assertEqual(history(connection, child["job_id"], limit=0)["count"], 2)
+                self.assertEqual(history(connection, child["job_id"], limit=0)["count"], 3)
                 resumed = resume_job(connection, child["job_id"])
                 self.assertTrue(resumed["known_evidence_scope"][0]["source_changed"])
-                self.assertEqual(resumed["claims_needing_type_review"][0]["id"], "C0001")
+                self.assertEqual(resumed["claims_needing_review"][0]["id"], "C0001")
 
     def test_headless_round_trip(self):
         source = Path(os.environ["IDA_AI_TEST_BINARY"]).resolve()

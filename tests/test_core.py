@@ -157,7 +157,8 @@ class DatabaseTests(unittest.TestCase):
 
         with patch("ida_ai.runner.find_idat", return_value=binary), patch("ida_ai.runner.subprocess.run", side_effect=fake_run):
             result = run_ida("init", self.db_path, binary=binary, idb_path=str(idb))
-        self.assertEqual(result, {"functions": 2})
+        self.assertEqual(result["functions"], 2)
+        self.assertTrue(result["job_review"]["applied"])
 
 
 if __name__ == "__main__":
