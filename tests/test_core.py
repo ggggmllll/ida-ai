@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ida_ai.cli import _query
+from ida_ai.cli import _cache_file, _cached_search, _clear_searches, _query
 from ida_ai.db import connect, ida_ea, operation, record_operation, set_metadata, sqlite_ea
 from ida_ai.runner import run_ida
 from ida_ai.selection import parse_hex_bytes, parse_pattern, select_function_addresses
@@ -78,6 +78,27 @@ class DatabaseTests(unittest.TestCase):
             record_operation(connection, "request-1", "search", "ok", {"matches": [{"address": 0x1000}]})
             result = operation(connection, "request-1")
         self.assertEqual(result["result"]["matches"][0]["address"], 0x1000)
+
+    def test_search_cache_restores_records_and_clear_removes_cache(self):
+        idb_path = Path(self.temporary.name) / "analysis.i64"
+        idb_path.write_bytes(b"idb snapshot")
+        with closing(connect(self.db_path)) as connection:
+            set_metadata(connection, {"idb_path": str(idb_path)})
+            connection.commit()
+        result = {"search_id": "ida-request", "count": 1, "truncated": False,
+                  "matches": [{"address": 0x1234, "address_hex": "0x1234", "pattern_index": 0}]}
+        with patch("ida_ai.cli.run_ida", return_value=result) as run:
+            first = _cached_search(self.db_path, "search", {"patterns": [{"pattern": "90", "mask": None}], "start": None, "end": None, "limit": 100}, {})
+            second = _cached_search(self.db_path, "search", {"patterns": [{"pattern": "90", "mask": None}], "start": None, "end": None, "limit": 100}, {})
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        run.assert_called_once()
+        with closing(connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM search_matches").fetchone()[0], 1)
+        self.assertTrue(_clear_searches(self.db_path)["cache_cleared"])
+        with closing(connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM search_matches").fetchone()[0], 0)
+        self.assertFalse(_cache_file(self.db_path).exists())
 
     def test_legacy_xrefs_table_is_migrated(self):
         old_path = Path(self.temporary.name) / "legacy.sqlite"

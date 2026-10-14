@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ida_ai.db import connect, ida_ea
 from ida_ai.runner import run_ida
+from ida_ai.cli import _cached_search, _clear_searches
 
 
 @unittest.skipUnless(os.environ.get("IDAT") and os.environ.get("IDA_AI_TEST_BINARY"), "requires IDAT and IDA_AI_TEST_BINARY")
@@ -47,9 +48,27 @@ class RealIDATests(unittest.TestCase):
             )
             self.assertEqual(searched["count"], 1)
             self.assertEqual(searched["matches"][0]["address"], ea)
+            search_options = dict(patterns=[{"pattern": read["hex"], "mask": None}], start=ea, end=ea+1, limit=10)
+            runner_options = dict(idat=idat, timeout=120)
+            cold = _cached_search(db_path, "search", search_options, runner_options)
+            warm = _cached_search(db_path, "search", search_options, runner_options)
+            self.assertFalse(cold["cached"])
+            self.assertTrue(warm["cached"])
+            self.assertEqual(cold["matches"], warm["matches"])
+            pointer_options = dict(target=ea, start=None, end=None, pointer_size=8, limit=10)
+            cold_pointer = _cached_search(db_path, "pointer_search", pointer_options, runner_options)
+            warm_pointer = _cached_search(db_path, "pointer_search", pointer_options, runner_options)
+            self.assertTrue(warm_pointer["cached"])
+            self.assertEqual(cold_pointer["matches"], warm_pointer["matches"])
 
             written = run_ida("write", db_path, address=ea, data_hex=read["hex"].replace(" ", ""), idat=idat, timeout=120)
             self.assertEqual(written["written"]["bytes"], read["bytes"])
+            self.assertFalse(_cached_search(db_path, "search", search_options, runner_options)["cached"])
+            _clear_searches(db_path)
+            with closing(connect(db_path)) as connection:
+                self.assertEqual(connection.execute("SELECT count(*) FROM search_matches").fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT count(*) FROM operations WHERE action IN ('search','pointer_search')").fetchone()[0], 0)
+            self.assertFalse(_cached_search(db_path, "search", search_options, runner_options)["cached"])
             with closing(connect(db_path)) as connection:
                 self.assertGreater(connection.execute("SELECT count(*) FROM functions").fetchone()[0], 0)
 

@@ -14,3 +14,4 @@ __pycache__/
 .venv/
 *.egg-info/
 uv.lock
+.ida-ai-cache/

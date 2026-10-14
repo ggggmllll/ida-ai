@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
 import sys
+import uuid
 from contextlib import closing
 from pathlib import Path
 
-from .db import connect
+from .db import connect, get_metadata, record_operation, sqlite_ea
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -25,6 +27,86 @@ def _add_ida(parser: argparse.ArgumentParser) -> None:
 
 def _add_range(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"), help="half-open address range")
+
+
+def _cache_file(db_path: Path) -> Path:
+    key = hashlib.sha256(str(db_path.expanduser().resolve()).encode("utf-8")).hexdigest()
+    return db_path.expanduser().resolve().parent / ".ida-ai-cache" / f"{key}.json"
+
+
+def _idb_fingerprint(db_path: Path) -> dict:
+    if not db_path.is_file():
+        raise FileNotFoundError(f"SQLite database does not exist: {db_path}")
+    with closing(connect(db_path)) as connection:
+        idb = get_metadata(connection, "idb_path")
+    if not idb or not Path(idb).is_file():
+        raise FileNotFoundError("saved IDA database is missing; run init first")
+    path = Path(idb).resolve()
+    stat = path.stat()
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _restore_cached_search(db_path: Path, search_id: str, result: dict, pointer: bool) -> None:
+    with closing(connect(db_path)) as connection:
+        connection.execute("DELETE FROM search_matches WHERE search_id = ?", (search_id,))
+        if pointer:
+            for ordinal, item in enumerate(result["matches"]):
+                connection.execute(
+                    "INSERT OR IGNORE INTO pointers(source_address,target_address,pointer_size,target_name,target_type,source_kind) VALUES(?,?,?,?,?,?)",
+                    (sqlite_ea(item["source_address"]), sqlite_ea(item["target_address"]), item["pointer_size"], item.get("target_name"), item.get("target_type"), "raw_scan"),
+                )
+                connection.execute(
+                    "INSERT INTO search_matches(search_id,ordinal,address,pattern_index,match_kind) VALUES(?,?,?,?,?)",
+                    (search_id, ordinal, sqlite_ea(item["source_address"]), None, "pointer"),
+                )
+        else:
+            connection.executemany(
+                "INSERT INTO search_matches(search_id,ordinal,address,pattern_index,match_kind) VALUES(?,?,?,?,?)",
+                ((search_id, ordinal, sqlite_ea(item["address"]), item["pattern_index"], "pattern") for ordinal, item in enumerate(result["matches"])),
+            )
+        connection.commit()
+
+
+def _clear_searches(db_path: Path) -> dict:
+    if not db_path.is_file():
+        raise FileNotFoundError(f"SQLite database does not exist: {db_path}")
+    with closing(connect(db_path)) as connection:
+        matches = connection.execute("SELECT count(*) FROM search_matches").fetchone()[0]
+        connection.execute("DELETE FROM search_matches")
+        connection.execute("DELETE FROM pointers WHERE source_kind='raw_scan'")
+        connection.execute("DELETE FROM operations WHERE action IN ('search','pointer_search')")
+        connection.commit()
+    cache = _cache_file(db_path)
+    cache.unlink(missing_ok=True)
+    return {"cleared_search_matches": matches, "cache_cleared": True}
+
+
+def _cached_search(db_path: Path, action: str, options: dict, ida_options: dict) -> dict:
+    fingerprint = _idb_fingerprint(db_path)
+    cache_path = _cache_file(db_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cache = {"idb": fingerprint, "entries": {}}
+    if not isinstance(cache, dict) or cache.get("idb") != fingerprint or not isinstance(cache.get("entries"), dict):
+        cache = {"idb": fingerprint, "entries": {}}
+    key = json.dumps({"idb": fingerprint, "action": action, "options": options}, sort_keys=True, separators=(",", ":"))
+    key = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    if key in cache["entries"]:
+        result = cache["entries"][key]
+        search_id = uuid.uuid4().hex
+        _restore_cached_search(db_path, search_id, result, action == "pointer_search")
+        result = {**result, "search_id": search_id, "cached": True}
+        with closing(connect(db_path)) as connection:
+            record_operation(connection, search_id, action, "ok", result)
+        return result
+    result = run_ida(action, db_path, **ida_options, **options)
+    cache["entries"][key] = result
+    temporary = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(cache_path)
+    return {**result, "cached": False}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -84,6 +166,9 @@ def _parser() -> argparse.ArgumentParser:
     _add_range(pointers)
     pointers.add_argument("--limit", type=int, default=1000, help="maximum matches; 0 means unlimited")
 
+    clear = commands.add_parser("clear-searches", help="clear persisted search records and local search cache")
+    _add_db(clear)
+
     sql = commands.add_parser("sql", help="run a read-only SQLite query without starting IDA")
     _add_db(sql)
     sql.add_argument("--query", required=True)
@@ -125,6 +210,8 @@ def _query(db_path: Path, query: str, limit: int, write: bool = False) -> dict:
 def _run(args: argparse.Namespace) -> dict:
     if args.command == "sql":
         return _query(args.db, args.query, args.limit, args.write)
+    if args.command == "clear-searches":
+        return _clear_searches(args.db)
     if args.timeout < 0:
         raise ValueError("timeout must be non-negative")
     options = {"idat": args.idat, "timeout": args.timeout}
@@ -168,16 +255,16 @@ def _run(args: argparse.Namespace) -> dict:
             parse_pattern(value, mask)
             patterns.append({"pattern": value, "mask": mask})
         address_range = parse_range(args.address_range) if args.address_range else (None, None)
-        return run_ida("search", args.db, patterns=patterns, start=address_range[0], end=address_range[1], limit=args.limit, **options)
+        search_options = {"patterns": patterns, "start": address_range[0], "end": address_range[1], "limit": args.limit}
+        return _cached_search(args.db, "search", search_options, options)
     if args.command == "pointer-search":
         if args.limit < 0:
             raise ValueError("limit must be non-negative")
         address_range = parse_range(args.address_range) if args.address_range else (None, None)
-        return run_ida(
-            "pointer_search", args.db, target=parse_int(args.target) if args.target is not None else None,
-            pointer_size=args.pointer_size, start=address_range[0], end=address_range[1], limit=args.limit,
-            **options,
-        )
+        search_options = {"target": parse_int(args.target) if args.target is not None else None,
+                          "pointer_size": args.pointer_size, "start": address_range[0],
+                          "end": address_range[1], "limit": args.limit}
+        return _cached_search(args.db, "pointer_search", search_options, options)
     raise ValueError(f"unknown command: {args.command}")
 
 
