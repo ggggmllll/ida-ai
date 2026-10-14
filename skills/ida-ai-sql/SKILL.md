@@ -11,7 +11,7 @@ Read-only query:
 python -m ida_ai sql --db ANALYSIS.sqlite --query "SELECT ..." [--limit N]
 ```
 
-The result is JSON with `columns`, `rows`, `count`, and `truncated`; `--limit 0` removes the row cap. The database contains `metadata`, `segments`, `functions`, `xrefs`, `basic_blocks`, `cfg_edges`, `disassembly`, `instructions`, `pseudocode`, `memory_bytes`, `pointers`, `search_matches`, and `operations`. In `functions`, `is_thunk` marks IDA thunks, `thunk_target_ea` stores a resolved target when available, and `is_nullstub` marks a conservative empty-return pattern. Search acceleration is held in a separate local cache and is not part of this database.
+The result is JSON with `columns`, `rows`, `count`, and `truncated`; `--limit 0` removes the row cap. The database contains `metadata`, `segments`, `functions`, `xrefs`, `basic_blocks`, `cfg_edges`, `disassembly`, `instructions`, `pseudocode`, `memory_bytes`, `pointers`, `search_matches`, `operations`, `jobs`, and `job_revisions`. In `functions`, `is_thunk` marks IDA thunks, `thunk_target_ea` stores a resolved target when available, and `is_nullstub` marks a conservative empty-return pattern. Job state is the latest revision snapshot; `job_revisions` is append-only history with notes, claims, evidence, and the bound analysis snapshot. Search acceleration is held in a separate local cache and is not part of this database.
 
 Use `--write` only for an intentional maintenance statement. Prefer parameter-free literal SQL in the CLI and keep analysis mutations in the dedicated commands. Query schema names and function rows instead of guessing addresses or identifiers.
 

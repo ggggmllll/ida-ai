@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import subprocess
@@ -14,10 +15,46 @@ from pathlib import Path
 from ida_ai.db import connect, ida_ea
 from ida_ai.runner import run_ida
 from ida_ai.cli import _cached_search, _clear_searches
+from ida_ai.jobs import create_job, history, resume_job, revise_job, show_job
 
 
 @unittest.skipUnless(os.environ.get("IDAT") and os.environ.get("IDA_AI_TEST_BINARY"), "requires IDAT and IDA_AI_TEST_BINARY")
 class RealIDATests(unittest.TestCase):
+    def test_zlib_job_history_survives_sync_and_flags_changed_evidence(self):
+        source = Path(os.environ["IDA_AI_TEST_BINARY"]).resolve()
+        idat = os.environ["IDAT"]
+        with tempfile.TemporaryDirectory(prefix="ida-ai-zlib-job-") as temporary:
+            directory = Path(temporary)
+            binary = directory / source.name
+            shutil.copy2(source, binary)
+            db_path = directory / "analysis.sqlite"
+            idb_path = directory / "analysis.i64"
+            run_ida("init", db_path, binary=binary, idb_path=str(idb_path), idat=idat, timeout=240)
+            with closing(connect(db_path)) as connection:
+                function_ea = ida_ea(connection.execute(
+                    "SELECT start_ea FROM functions WHERE name='compress2'"
+                ).fetchone()[0])
+            run_ida("export_view", db_path, addresses=[function_ea], view="pseudocode", idat=idat, timeout=120)
+            with closing(connect(db_path)) as connection:
+                root = create_job(connection, title="zlib compression data flow", objective="Understand compression input and output.")
+                child = create_job(connection, title="compress2 wrapper", objective="Trace compress2 argument use.",
+                                   parent_job_id=root["job_id"])
+                revise_job(connection, child["job_id"], message="Record decompiler observation",
+                           add_evidence=[json.dumps({"origin": "ida_type_dependent", "source_ref": f"pseudocode:0x{function_ea:X}",
+                                                     "description": "compress2 pseudocode was inspected"})],
+                           add_claims=[json.dumps({"kind": "hypothesis", "summary": "compress2 forwards a stream",
+                                                   "text": "compress2 appears to forward compression state",
+                                                   "evidence_ids": ["E0001"]})])
+                self.assertFalse(resume_job(connection, child["job_id"])["claims_needing_type_review"])
+            run_ida("mutate", db_path, mutation="rename_symbol",
+                    values={"address": function_ea, "name": "job_test_compress2"}, idat=idat, timeout=120)
+            with closing(connect(db_path)) as connection:
+                self.assertEqual(show_job(connection, child["job_id"])["title"], "compress2 wrapper")
+                self.assertEqual(history(connection, child["job_id"], limit=0)["count"], 2)
+                resumed = resume_job(connection, child["job_id"])
+                self.assertTrue(resumed["known_evidence_scope"][0]["source_changed"])
+                self.assertEqual(resumed["claims_needing_type_review"][0]["id"], "C0001")
+
     def test_headless_round_trip(self):
         source = Path(os.environ["IDA_AI_TEST_BINARY"]).resolve()
         idat = os.environ["IDAT"]

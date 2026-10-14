@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def sqlite_ea(address: int) -> int:
@@ -215,6 +215,41 @@ CREATE TABLE IF NOT EXISTS operations (
     finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_operations_created ON operations(created_at);
+
+-- Job state is a compact head pointer; job_revisions stores immutable snapshots.
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_job_id INTEGER REFERENCES jobs(job_id),
+    title TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('planned','active','blocked','done','stale','needs_review')),
+    head_revision_id INTEGER REFERENCES job_revisions(revision_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+CREATE TABLE IF NOT EXISTS job_revisions (
+    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id),
+    revision_no INTEGER NOT NULL,
+    parent_revision_id INTEGER REFERENCES job_revisions(revision_id),
+    message TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '',
+    changes_json TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    analysis_snapshot_json TEXT NOT NULL,
+    state_hash TEXT NOT NULL,
+    restored_from_revision INTEGER REFERENCES job_revisions(revision_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(job_id,revision_no)
+);
+CREATE INDEX IF NOT EXISTS idx_job_revisions_job ON job_revisions(job_id,revision_no DESC);
+CREATE TRIGGER IF NOT EXISTS job_revisions_no_update BEFORE UPDATE ON job_revisions
+BEGIN SELECT RAISE(ABORT, 'job revisions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS job_revisions_no_delete BEFORE DELETE ON job_revisions
+BEGIN SELECT RAISE(ABORT, 'job revisions are immutable'); END;
 """
 
 

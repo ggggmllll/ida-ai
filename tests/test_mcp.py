@@ -71,6 +71,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("type_definitions", schema.contents[0].text)
                     self.assertIn("thunk_target_ea", schema.contents[0].text)
                     self.assertIn("is_nullstub", schema.contents[0].text)
+                    self.assertIn("job_revisions", schema.contents[0].text)
                     denied = await session.call_tool(
                         "sql_query", {"query": "DELETE FROM functions", "limit": 10}
                     )

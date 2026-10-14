@@ -129,7 +129,7 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT is_thunk,thunk_target_ea,is_nullstub FROM functions WHERE start_ea=4096"
             ).fetchone()
             self.assertEqual(tuple(function), (1, None, 0))
-            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "4")
+            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "5")
 
     def test_nullstub_classification_is_conservative(self):
         self.assertTrue(is_nullstub_sequence([("endbr64", False), ("nop", False), ("ret", True)]))

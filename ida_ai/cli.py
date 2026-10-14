@@ -12,6 +12,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .db import connect, get_metadata, record_operation, sqlite_ea
+from .jobs import JOB_STATUSES, create_job, history as job_history, list_jobs, resume_job, revise_job, show_job
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -187,6 +188,56 @@ def _parser() -> argparse.ArgumentParser:
     sql.add_argument("--query", required=True)
     sql.add_argument("--limit", type=int, default=1000, help="maximum rows; 0 means unlimited")
     sql.add_argument("--write", action="store_true", help="allow a mutating SQL statement and commit it")
+
+    job_create = commands.add_parser("job-create", help="create a hierarchical reverse-engineering research job")
+    _add_db(job_create)
+    job_create.add_argument("--title", required=True)
+    job_create.add_argument("--objective", required=True)
+    job_create.add_argument("--parent", type=int, help="parent research job ID")
+    job_create.add_argument("--message", required=True, help="initial VCS revision message")
+
+    job_list = commands.add_parser("job-list", help="list research jobs or print the job hierarchy")
+    _add_db(job_list)
+    job_list.add_argument("--parent", type=int, help="show direct children of this job")
+    job_list.add_argument("--status", choices=JOB_STATUSES)
+    job_list.add_argument("--tree", action="store_true", help="return the hierarchy as nested JSON")
+
+    job_show = commands.add_parser("job-show", help="show current job claims, evidence, and revisions")
+    _add_db(job_show)
+    job_show.add_argument("--job", required=True, type=int)
+
+    job_resume = commands.add_parser("job-resume", help="restore compact context before continuing a research job")
+    _add_db(job_resume)
+    job_resume.add_argument("--job", required=True, type=int)
+    job_resume.add_argument("--recent", type=int, default=3, help="number of recent VCS revisions to include; 0 means all")
+
+    job_history_parser = commands.add_parser("job-history", help="inspect immutable VCS revisions for a research job")
+    _add_db(job_history_parser)
+    job_history_parser.add_argument("--job", required=True, type=int)
+    job_history_parser.add_argument("--limit", type=int, default=20, help="recent revisions; 0 means all")
+    job_history_parser.add_argument("--include-state", action="store_true", help="include each full saved job snapshot")
+    job_history_parser.add_argument("--revision", type=int, help="read one exact revision ID")
+
+    job_revise = commands.add_parser("job-revise", help="append a VCS revision with claims, evidence, or job state changes")
+    _add_db(job_revise)
+    job_revise.add_argument("--job", required=True, type=int)
+    job_revise.add_argument("--message", required=True, help="short reason for this revision")
+    job_revise.add_argument("--details", default="", help="detailed analysis note stored in the VCS revision")
+    job_revise.add_argument("--title")
+    job_revise.add_argument("--objective")
+    job_revise.add_argument("--status", choices=JOB_STATUSES)
+    job_revise.add_argument("--add-claim", action="append", default=[], metavar="JSON")
+    job_revise.add_argument("--update-claim", action="append", default=[], metavar="JSON")
+    job_revise.add_argument("--withdraw-claim", action="append", default=[], metavar="JSON")
+    job_revise.add_argument("--add-evidence", action="append", default=[], metavar="JSON")
+    job_revise.add_argument("--add-question", action="append", default=[], metavar="TEXT")
+    job_revise.add_argument("--resolve-question", action="append", default=[], metavar="JSON")
+    job_revise.add_argument("--depends-on", action="append", default=[], type=int, metavar="JOB_ID")
+    job_revise.add_argument("--remove-dependency", action="append", default=[], type=int, metavar="JOB_ID")
+    job_revise.add_argument("--ida-operation", action="append", default=[], metavar="REQUEST_ID")
+    job_revise.add_argument("--validation", action="append", default=[], metavar="TEXT")
+    job_revise.add_argument("--restore-revision", type=int, help="append a new revision restoring an earlier saved state")
+    job_revise.add_argument("--patch-file", type=Path, help="UTF-8 JSON changes file; cannot be mixed with other change flags")
     return parser
 
 
@@ -220,11 +271,77 @@ def _query(db_path: Path, query: str, limit: int, write: bool = False) -> dict:
         return {"columns": columns, "rows": values, "count": len(values), "truncated": truncated}
 
 
+def _job_revision_options(args: argparse.Namespace) -> dict:
+    options = {
+        "details": args.details, "title": args.title, "objective": args.objective, "status": args.status,
+        "add_claims": args.add_claim, "update_claims": args.update_claim,
+        "withdraw_claims": args.withdraw_claim, "add_evidence": args.add_evidence,
+        "add_questions": args.add_question, "resolve_questions": args.resolve_question,
+        "add_dependencies": args.depends_on, "remove_dependencies": args.remove_dependency,
+        "operation_ids": args.ida_operation, "validations": args.validation,
+        "restore_revision_id": args.restore_revision,
+    }
+    if args.patch_file is None:
+        return options
+    if any(value for value in options.values()):
+        raise ValueError("--patch-file cannot be combined with other job change flags")
+    try:
+        patch = json.loads(args.patch_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"job patch file must contain valid JSON: {exc.msg}") from exc
+    if not isinstance(patch, dict):
+        raise ValueError("job patch file must contain a JSON object")
+    unknown = set(patch) - set(options)
+    if unknown:
+        raise ValueError(f"unsupported job patch fields: {', '.join(sorted(unknown))}")
+    for key, value in patch.items():
+        if key in ("add_claims", "update_claims", "withdraw_claims", "add_evidence", "resolve_questions"):
+            if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+                raise ValueError(f"{key} must be a list of JSON objects")
+            options[key] = [json.dumps(item, ensure_ascii=False) for item in value]
+        elif key in ("add_questions", "operation_ids", "validations"):
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"{key} must be a list of strings")
+            options[key] = value
+        elif key in ("add_dependencies", "remove_dependencies"):
+            if not isinstance(value, list) or not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+                raise ValueError(f"{key} must be a list of integer job IDs")
+            options[key] = value
+        elif key == "restore_revision_id":
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise ValueError("restore_revision_id must be an integer")
+            options[key] = value
+        elif value is not None and not isinstance(value, str):
+            raise ValueError(f"{key} must be a string")
+        else:
+            options[key] = value
+    return options
+
+
 def _run(args: argparse.Namespace) -> dict:
     if args.command == "sql":
         return _query(args.db, args.query, args.limit, args.write)
     if args.command == "clear-searches":
         return _clear_searches(args.db)
+    if args.command.startswith("job-"):
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite analysis database does not exist: {args.db}")
+        with closing(connect(args.db)) as connection:
+            if args.command == "job-create":
+                return create_job(connection, title=args.title, objective=args.objective,
+                                  parent_job_id=args.parent, message=args.message)
+            if args.command == "job-list":
+                return list_jobs(connection, parent_job_id=args.parent, status=args.status, tree=args.tree)
+            if args.command == "job-show":
+                return show_job(connection, args.job)
+            if args.command == "job-resume":
+                return resume_job(connection, args.job, recent=args.recent)
+            if args.command == "job-history":
+                return job_history(connection, args.job, limit=args.limit, include_state=args.include_state,
+                                   revision_id=args.revision)
+            if args.command == "job-revise":
+                return revise_job(connection, args.job, message=args.message, **_job_revision_options(args))
+        raise ValueError(f"unknown job command: {args.command}")
     if args.timeout < 0:
         raise ValueError("timeout must be non-negative")
     options = {"idat": args.idat, "timeout": args.timeout}
