@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import closing
@@ -37,6 +38,35 @@ class RealIDATests(unittest.TestCase):
             self.assertEqual(disassembly["functions"], 1)
             pseudocode = run_ida("export_view", db_path, addresses=[ea], view="pseudocode", idat=idat, timeout=120)
             self.assertEqual(pseudocode["functions"], 1)
+            # Simulate edits made by another IDA session, outside our exporter.
+            with closing(connect(db_path)) as connection:
+                dependent = ida_ea(connection.execute("SELECT start_ea FROM functions WHERE name='zError'").fetchone()[0])
+            for view in ("disassembly", "pseudocode"):
+                run_ida("export_view", db_path, addresses=[dependent], view=view, idat=idat, timeout=120)
+            edit = directory / "edit.py"
+            edit.write_text(
+                "import ida_name, ida_loader, ida_pro, idc\n"
+                f"assert ida_name.set_name({ea}, 'sync_test_function')\n"
+                "g = ida_name.get_name_ea(0xffffffffffffffff, 'z_errmsg')\n"
+                "assert g != 0xffffffffffffffff\n"
+                "assert ida_name.set_name(g, 'sync_test_global')\n"
+                "assert idc.SetType(g, 'const char *sync_test_global[10];')\n"
+                f"assert ida_loader.save_database({str(idb_path)!r}, 0)\n"
+                "ida_pro.qexit(0)\n", encoding="utf-8")
+            subprocess.run([idat, "-A", f"-S{edit}", str(idb_path)], check=True, timeout=120, capture_output=True)
+            synced = run_ida("sync", db_path, idat=idat, timeout=120)
+            self.assertEqual(synced["views"]["disassembly"]["functions"], len({ea, dependent}))
+            with closing(connect(db_path)) as connection:
+                self.assertEqual(connection.execute("SELECT name FROM functions WHERE start_ea=?", (ea,)).fetchone()[0], "sync_test_function")
+                symbol = connection.execute("SELECT type FROM symbols WHERE name='sync_test_global'").fetchone()
+                self.assertIsNotNone(symbol)
+                self.assertIn("char", symbol[0])
+                pseudo = connection.execute("SELECT text,status FROM pseudocode WHERE function_ea=?", (ea,)).fetchone()
+                self.assertEqual(pseudo[1], "ok")
+                self.assertIn("sync_test_function", pseudo[0])
+                for view in ("disassembly", "pseudocode"):
+                    text = connection.execute(f"SELECT text FROM {view} WHERE function_ea=?", (dependent,)).fetchone()[0]
+                    self.assertIn("sync_test_global", text)
 
             info = run_ida("info", db_path, address=ea, idat=idat, timeout=120)
             self.assertTrue(info["mapped"])

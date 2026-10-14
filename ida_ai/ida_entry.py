@@ -37,6 +37,8 @@ def dispatch(request: dict) -> dict:
         idb_path = get_metadata(connection, "idb_path")
         if not idb_path:
             raise RuntimeError("database has no IDA database path; run init first")
+        if action == "sync":
+            return ida_export.synchronize_database(db_path, idb_path, request.get("all_views", False))
         if action == "export_view":
             return ida_export.export_views(connection, request["addresses"], request["view"])
         if action == "info":

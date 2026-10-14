@@ -9,6 +9,8 @@ file.
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import closing
+import tempfile
 from typing import Iterable
 from collections import Counter
 
@@ -35,7 +37,7 @@ try:
 except ImportError:
     ida_hexrays = None
 
-from .db import connect, reset_analysis, set_metadata, sqlite_ea, utc_now
+from .db import connect, reset_analysis, set_metadata, sqlite_ea, ida_ea, utc_now
 from .selection import BytePattern, parse_pattern
 
 
@@ -201,6 +203,7 @@ def add_pseudocode(connection, addresses: list[int]) -> None:
         try:
             if not decompiler_ready:
                 raise RuntimeError("Hex-Rays decompiler unavailable")
+            ida_hexrays.mark_cfunc_dirty(func_ea, False)
             cfunc = ida_hexrays.decompile(func_ea)
             if cfunc is None:
                 raise RuntimeError("decompile returned None")
@@ -469,6 +472,40 @@ def search_pointers(connection, *, target: int | None = None, start: int | None 
     return {"search_id": search_id, "pointer_size": pointer_size, "count": len(matches), "truncated": truncated, "matches": matches}
 
 
+def synchronize_database(output: str | Path, idb_path: str | Path, all_views: bool = False) -> dict:
+    """Rebuild observations in isolation, then publish one SQLite snapshot."""
+    if not ida_auto.auto_wait():
+        raise RuntimeError("IDA autoanalysis did not complete")
+    if ida_hexrays is not None and ida_hexrays.init_hexrays_plugin():
+        ida_hexrays.clear_cached_cfuncs()
+    with closing(connect(output)) as source:
+        selections = {view: [ida_ea(row[0]) for row in source.execute(
+            f"SELECT function_ea FROM {view}")] for view in ("disassembly", "pseudocode")}
+        with tempfile.TemporaryDirectory(prefix="ida-ai-sync-", dir=Path(output).parent) as directory:
+            staging = Path(directory) / "snapshot.sqlite"
+            with closing(connect(staging)) as target:
+                source.backup(target)
+            summary = export_database(staging, idb_path=idb_path, skip_analysis=True)
+            with closing(connect(staging)) as target:
+                functions = {ida_ea(row[0]) for row in target.execute("SELECT start_ea FROM functions")}
+                views = {}
+                for view, previous in selections.items():
+                    selected = sorted(functions if all_views else functions.intersection(previous))
+                    views[view] = export_views(target, selected, view)
+                # Global symbols/types are part of the same revision as the views.
+                target.execute("CREATE TABLE IF NOT EXISTS symbols(address INTEGER PRIMARY KEY,name TEXT,type TEXT)")
+                target.execute("DELETE FROM symbols")
+                target.executemany("INSERT INTO symbols VALUES(?,?,?)",
+                    ((sqlite_ea(ea), name, idc.get_type(ea)) for ea, name in idautils.Names()))
+                target.execute("DELETE FROM operations WHERE action IN ('search','pointer_search')")
+                set_metadata(target, {"synchronized_at": utc_now()})
+                target.commit()
+                if not ida_loader.save_database(str(idb_path), 0):
+                    raise RuntimeError("IDA failed to save synchronized database")
+                target.backup(source)
+    return {**summary, "views": views, "scope": "full analysis; all or previously exported views"}
+
+
 def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: bool = False, clear_operations: bool = False) -> dict:
     if not skip_analysis and not ida_auto.auto_wait():
         raise RuntimeError("IDA autoanalysis did not complete")
@@ -487,6 +524,8 @@ def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: 
             "generated_at": utc_now(),
         }
         set_metadata(connection, metadata)
+        connection.executemany("INSERT INTO symbols VALUES(?,?,?)",
+            ((sqlite_ea(ea), name, idc.get_type(ea)) for ea, name in idautils.Names()))
         add_segments(connection)
         addresses = add_functions(connection)
         add_xrefs(connection)

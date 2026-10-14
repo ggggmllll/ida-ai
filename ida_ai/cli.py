@@ -175,6 +175,10 @@ def _parser() -> argparse.ArgumentParser:
 
     clear = commands.add_parser("clear-searches", help="clear persisted search records and local search cache")
     _add_db(clear)
+    sync = commands.add_parser("sync", help="rebuild the SQLite snapshot from the saved IDB")
+    _add_db(sync)
+    _add_ida(sync)
+    sync.add_argument("--all-views", action="store_true", help="generate both views for every function")
 
     sql = commands.add_parser("sql", help="run a read-only SQLite query without starting IDA")
     _add_db(sql)
@@ -222,6 +226,10 @@ def _run(args: argparse.Namespace) -> dict:
     if args.timeout < 0:
         raise ValueError("timeout must be non-negative")
     options = {"idat": args.idat, "timeout": args.timeout}
+    if args.command == "sync":
+        result = run_ida("sync", args.db, all_views=args.all_views, **options)
+        _cache_file(args.db).unlink(missing_ok=True)
+        return result
     if args.command == "init":
         db_path = args.db.expanduser().resolve()
         idb_path = (args.idb or db_path.with_suffix(".i64")).expanduser().resolve()

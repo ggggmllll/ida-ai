@@ -3,6 +3,8 @@ name: ida-ai-sql
 description: Query the SQLite analysis database directly when an AI needs precise joins, counts, metadata, or previously exported views.
 ---
 
+After external IDB edits, run `python -m ida_ai sync --db ANALYSIS.sqlite` before querying. SQL reads a snapshot, not live IDA state. `symbols` contains named addresses and their IDA type declarations.
+
 Read-only query:
 
 ```text
