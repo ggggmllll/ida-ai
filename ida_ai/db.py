@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def sqlite_ea(address: int) -> int:
@@ -50,6 +50,27 @@ CREATE TABLE IF NOT EXISTS symbols (
     address INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     type TEXT
+);
+CREATE TABLE IF NOT EXISTS comments (
+    address INTEGER NOT NULL,
+    function_ea INTEGER,
+    kind TEXT NOT NULL CHECK(kind IN ('assembly','pseudocode')),
+    repeatable INTEGER NOT NULL DEFAULT 0,
+    item_preciser INTEGER NOT NULL DEFAULT 0,
+    text TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(address,kind,repeatable,item_preciser)
+);
+CREATE INDEX IF NOT EXISTS idx_comments_function ON comments(function_ea,kind);
+CREATE TABLE IF NOT EXISTS type_definitions (
+    name TEXT PRIMARY KEY,
+    declaration TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS type_assignments (
+    address INTEGER PRIMARY KEY,
+    declaration TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS segments (
@@ -231,6 +252,7 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
 
     tables = (
         "symbols",
+        "comments",
         "segments",
         "functions",
         "xrefs",

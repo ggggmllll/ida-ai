@@ -178,7 +178,9 @@ def _parser() -> argparse.ArgumentParser:
     sync = commands.add_parser("sync", help="rebuild the SQLite snapshot from the saved IDB")
     _add_db(sync)
     _add_ida(sync)
-    sync.add_argument("--all-views", action="store_true", help="generate both views for every function")
+    sync_scope = sync.add_mutually_exclusive_group()
+    sync_scope.add_argument("--all-views", action="store_true", help="generate both views for every function")
+    sync_scope.add_argument("--address", help="refresh one function after local variable edits")
 
     sql = commands.add_parser("sql", help="run a read-only SQLite query without starting IDA")
     _add_db(sql)
@@ -227,7 +229,8 @@ def _run(args: argparse.Namespace) -> dict:
         raise ValueError("timeout must be non-negative")
     options = {"idat": args.idat, "timeout": args.timeout}
     if args.command == "sync":
-        result = run_ida("sync", args.db, all_views=args.all_views, **options)
+        result = run_ida("sync", args.db, all_views=args.all_views,
+                         address=parse_int(args.address) if args.address is not None else None, **options)
         _cache_file(args.db).unlink(missing_ok=True)
         return result
     if args.command == "init":

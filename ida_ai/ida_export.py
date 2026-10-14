@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from contextlib import closing
 import tempfile
+import re
 from typing import Iterable
 from collections import Counter
 
@@ -27,6 +28,7 @@ try:  # imported only inside IDA
     import ida_nalt
     import ida_xref
     import ida_segment
+    import ida_typeinf
     import idautils
     import idc
 except ImportError as exc:  # pragma: no cover - exercised by IDA
@@ -120,6 +122,66 @@ def add_functions(connection) -> list[int]:
         addresses.append(int(func.start_ea))
     connection.executemany("INSERT INTO functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,comment,repeatable_comment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     return addresses
+
+
+def add_assembly_comments(connection, addresses: Iterable[int] | None = None) -> None:
+    """Refresh IDA's per-address comments without touching Hex-Rays comments."""
+    selected = set(int(ea) for ea in addresses) if addresses is not None else None
+    if selected is None:
+        connection.execute("DELETE FROM comments WHERE kind='assembly'")
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"DELETE FROM comments WHERE kind='assembly' AND function_ea IN ({placeholders})",
+            [sqlite_ea(ea) for ea in selected],
+        )
+    rows = []
+    for index in range(ida_segment.get_segm_qty()):
+        seg = ida_segment.getnseg(index)
+        if seg is None:
+            continue
+        for ea in idautils.Heads(seg.start_ea, seg.end_ea):
+            func = ida_funcs.get_func(ea)
+            if selected is not None and (func is None or int(func.start_ea) not in selected):
+                continue
+            for repeatable in (0, 1):
+                comment = ida_bytes.get_cmt(ea, repeatable)
+                if comment:
+                    rows.append((sqlite_ea(ea), sqlite_ea(func.start_ea) if func else None,
+                                 "assembly", repeatable, 0, str(comment), utc_now()))
+    connection.executemany(
+        "INSERT OR REPLACE INTO comments(address,function_ea,kind,repeatable,item_preciser,text,updated_at) VALUES(?,?,?,?,?,?,?)",
+        rows,
+    )
+
+
+def add_pseudocode_comments(connection, addresses: Iterable[int]) -> None:
+    """Mirror the durable Hex-Rays comment map independently of rendered text."""
+    if ida_hexrays is None or not ida_hexrays.init_hexrays_plugin():
+        return
+    for func_ea in addresses:
+        stored_ea = sqlite_ea(func_ea)
+        connection.execute(
+            "DELETE FROM comments WHERE kind='pseudocode' AND function_ea=?",
+            (stored_ea,),
+        )
+        user_comments = ida_hexrays.restore_user_cmts(func_ea)
+        if user_comments is None:
+            continue
+        try:
+            iterator = ida_hexrays.user_cmts_begin(user_comments)
+            for _ in range(int(ida_hexrays.user_cmts_size(user_comments))):
+                location = ida_hexrays.user_cmts_first(iterator)
+                comment = ida_hexrays.user_cmts_second(iterator).c_str()
+                if comment:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO comments(address,function_ea,kind,repeatable,item_preciser,text,updated_at) VALUES(?,?,?,?,?,?,?)",
+                        (sqlite_ea(location.ea), stored_ea, "pseudocode", 0,
+                         int(location.itp), comment, utc_now()),
+                    )
+                iterator = ida_hexrays.user_cmts_next(iterator)
+        finally:
+            ida_hexrays.user_cmts_free(user_comments)
 
 
 def add_xrefs(connection) -> None:
@@ -222,6 +284,7 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
         add_disassembly(connection, selected)
     elif view == "pseudocode":
         add_pseudocode(connection, selected)
+        add_pseudocode_comments(connection, selected)
     else:
         raise ValueError(f"unsupported function view: {view}")
     connection.commit()
@@ -235,6 +298,135 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
         ).fetchall()
         counts.update({str(row[0]): int(row[1]) for row in rows})
     return {"view": view, "functions": len(selected), "statuses": dict(counts)}
+
+
+def apply_mutation(connection, idb_path: str | Path, kind: str, values: dict) -> dict:
+    """Apply one typed write in IDA, persist it, and mirror its durable input to SQLite."""
+    now = utc_now()
+    address = int(values.get("address", 0))
+    function = ida_funcs.get_func(address) if address else None
+    if kind == "assembly_comment":
+        comment = str(values["comment"])
+        repeatable = bool(values.get("repeatable", False))
+        if not ida_bytes.set_cmt(address, comment, repeatable):
+            raise RuntimeError(f"failed to set assembly comment at {address:#x}")
+        connection.execute(
+            "DELETE FROM comments WHERE address=? AND kind='assembly' AND repeatable=? AND item_preciser=0",
+            (sqlite_ea(address), int(repeatable)),
+        )
+        if comment:
+            connection.execute(
+                "INSERT INTO comments VALUES(?,?,?,?,?,?,?)",
+                (sqlite_ea(address), sqlite_ea(function.start_ea) if function else None,
+                 "assembly", int(repeatable), 0, comment, now),
+            )
+    elif kind == "function_comment":
+        if function is None:
+            raise ValueError(f"no function contains {address:#x}")
+        repeatable = bool(values.get("repeatable", False))
+        if not idc.set_func_cmt(function.start_ea, str(values["comment"]), repeatable):
+            raise RuntimeError(f"failed to set function comment at {function.start_ea:#x}")
+        connection.execute(
+            "UPDATE functions SET comment=?,repeatable_comment=? WHERE start_ea=?",
+            (idc.get_func_cmt(function.start_ea, False), idc.get_func_cmt(function.start_ea, True),
+             sqlite_ea(function.start_ea)),
+        )
+    elif kind == "pseudocode_comment":
+        if ida_hexrays is None or not ida_hexrays.init_hexrays_plugin():
+            raise RuntimeError("Hex-Rays decompiler unavailable")
+        if function is None:
+            raise ValueError(f"no function contains {address:#x}")
+        cfunc = ida_hexrays.decompile(function.start_ea)
+        if cfunc is None:
+            raise RuntimeError("failed to decompile function for pseudocode comment")
+        item_preciser = int(values.get("item_preciser", ida_hexrays.ITP_SEMI))
+        location = ida_hexrays.treeloc_t()
+        location.ea = address
+        location.itp = item_preciser
+        comment = str(values["comment"])
+        cfunc.set_user_cmt(location, comment)
+        cfunc.save_user_cmts()
+        connection.execute(
+            "DELETE FROM comments WHERE address=? AND kind='pseudocode' AND repeatable=0 AND item_preciser=?",
+            (sqlite_ea(address), item_preciser),
+        )
+        if comment:
+            connection.execute(
+                "INSERT INTO comments VALUES(?,?,?,?,?,?,?)",
+                (sqlite_ea(address), sqlite_ea(function.start_ea), "pseudocode", 0,
+                 item_preciser, comment, now),
+            )
+    elif kind == "register_type":
+        declaration = str(values["declaration"]).strip()
+        errors = int(idc.parse_decls(declaration, 0))
+        if errors:
+            raise ValueError(f"IDA rejected type declaration (parse errors: {errors})")
+        match = re.search(r"\b(?:struct|union|enum|typedef)\s+([A-Za-z_]\w*)", declaration)
+        name = str(values.get("name") or (match.group(1) if match else declaration[:128]))
+        connection.execute(
+            "INSERT INTO type_definitions(name,declaration,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET declaration=excluded.declaration,updated_at=excluded.updated_at",
+            (name, declaration, now),
+        )
+    elif kind == "apply_type":
+        declaration = str(values["declaration"])
+        if not idc.SetType(address, declaration):
+            raise RuntimeError(f"IDA rejected type for {address:#x}: {declaration}")
+        connection.execute(
+            "INSERT INTO type_assignments(address,declaration,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(address) DO UPDATE SET declaration=excluded.declaration,updated_at=excluded.updated_at",
+            (sqlite_ea(address), declaration, now),
+        )
+    elif kind == "rename_symbol":
+        name = str(values["name"])
+        if not ida_name.set_name(address, name, ida_name.SN_NOWARN):
+            raise RuntimeError(f"IDA rejected symbol rename at {address:#x}: {name}")
+    elif kind == "rename_local":
+        if ida_hexrays is None or not ida_hexrays.init_hexrays_plugin():
+            raise RuntimeError("Hex-Rays decompiler unavailable")
+        if function is None:
+            raise ValueError(f"no function contains {address:#x}")
+        ida_hexrays.mark_cfunc_dirty(function.start_ea, False)
+        ida_hexrays.decompile(function.start_ea)
+        locator = ida_hexrays.lvar_locator_t()
+        if not ida_hexrays.locate_lvar(locator, function.start_ea, str(values["old_name"])):
+            raise ValueError(f"local variable not found: {values['old_name']}")
+        info = ida_hexrays.lvar_saved_info_t()
+        info.ll = locator
+        info.name = str(values["new_name"])
+        if not ida_hexrays.modify_user_lvar_info(function.start_ea, ida_hexrays.MLI_NAME, info):
+            raise RuntimeError(f"IDA rejected local rename in {function.start_ea:#x}")
+    elif kind == "set_local_type":
+        if ida_hexrays is None or not ida_hexrays.init_hexrays_plugin():
+            raise RuntimeError("Hex-Rays decompiler unavailable")
+        if function is None:
+            raise ValueError(f"no function contains {address:#x}")
+        ida_hexrays.mark_cfunc_dirty(function.start_ea, False)
+        ida_hexrays.decompile(function.start_ea)
+        locator = ida_hexrays.lvar_locator_t()
+        if not ida_hexrays.locate_lvar(locator, function.start_ea, str(values["name"])):
+            raise ValueError(f"local variable not found: {values['name']}")
+        declaration = str(values["declaration"]).strip().rstrip(";") + " __ida_ai_local;"
+        local_type = ida_typeinf.tinfo_t()
+        if not ida_typeinf.parse_decl(
+            local_type,
+            ida_typeinf.get_idati(),
+            declaration,
+            ida_typeinf.PT_VAR | ida_typeinf.PT_SIL,
+        ):
+            raise ValueError(f"IDA rejected local variable type: {declaration}")
+        info = ida_hexrays.lvar_saved_info_t()
+        info.ll = locator
+        info.type = local_type
+        if not ida_hexrays.modify_user_lvar_info(function.start_ea, ida_hexrays.MLI_TYPE, info):
+            raise RuntimeError(f"IDA rejected local type change in {function.start_ea:#x}")
+    else:
+        raise ValueError(f"unknown mutation: {kind}")
+
+    if not ida_loader.save_database(str(idb_path), 0):
+        raise RuntimeError("IDA failed to save the modified database")
+    connection.commit()
+    return {"mutation": kind, "address": address or None, "saved": True}
 
 
 def _segment_info(seg) -> dict | None:
@@ -472,6 +664,35 @@ def search_pointers(connection, *, target: int | None = None, start: int | None 
     return {"search_id": search_id, "pointer_size": pointer_size, "count": len(matches), "truncated": truncated, "matches": matches}
 
 
+def synchronize_function(output: str | Path, idb_path: str | Path, address: int) -> dict:
+    """Refresh one function after a function-local decompiler edit."""
+    if not ida_auto.auto_wait():
+        raise RuntimeError("IDA autoanalysis did not complete")
+    function = ida_funcs.get_func(address)
+    if function is None:
+        raise ValueError(f"no function contains {address:#x}")
+    ea = int(function.start_ea)
+    with closing(connect(output)) as source:
+        if source.execute("SELECT 1 FROM functions WHERE start_ea=?", (sqlite_ea(ea),)).fetchone() is None:
+            raise ValueError("function is absent from snapshot; run full sync")
+        with tempfile.TemporaryDirectory(prefix="ida-ai-local-sync-", dir=Path(output).parent) as directory:
+            staging = Path(directory) / "snapshot.sqlite"
+            with closing(connect(staging)) as target:
+                source.backup(target)
+                views = {}
+                # Pseudocode is always regenerated, including its lvar user settings.
+                views["pseudocode"] = export_views(target, [ea], "pseudocode")
+                if target.execute("SELECT 1 FROM disassembly WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
+                    views["disassembly"] = export_views(target, [ea], "disassembly")
+                    add_assembly_comments(target, [ea])
+                set_metadata(target, {f"function_sync:{ea:X}": utc_now()})
+                target.commit()
+                if not ida_loader.save_database(str(idb_path), 0):
+                    raise RuntimeError("IDA failed to save locally synchronized database")
+                target.backup(source)
+    return {"function_ea": ea, "views": views, "scope": "function-local views"}
+
+
 def synchronize_database(output: str | Path, idb_path: str | Path, all_views: bool = False) -> dict:
     """Rebuild observations in isolation, then publish one SQLite snapshot."""
     if not ida_auto.auto_wait():
@@ -528,6 +749,8 @@ def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: 
             ((sqlite_ea(ea), name, idc.get_type(ea)) for ea, name in idautils.Names()))
         add_segments(connection)
         addresses = add_functions(connection)
+        add_assembly_comments(connection)
+        add_pseudocode_comments(connection, addresses)
         add_xrefs(connection)
         add_cfg(connection, addresses)
         connection.commit()

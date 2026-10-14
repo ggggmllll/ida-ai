@@ -7,9 +7,11 @@ name = "ida-ai"
 version = "0.1.0"
 description = "Headless IDA analysis artifacts and SQLite CLI for AI-assisted reverse engineering"
 requires-python = ">=3.10"
+dependencies = ["mcp>=1.10,<2", "regex>=2024.11.6"]
 
 [project.scripts]
 ida-ai = "ida_ai.cli:main"
+ida-ai-mcp = "ida_ai.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["ida_ai*"]

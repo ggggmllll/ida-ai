@@ -33,11 +33,32 @@ def dispatch(request: dict) -> dict:
         result = ida_export.export_database(db_path, idb_path=idb_path, skip_analysis=True, clear_operations=True)
         return {"db_path": str(db_path), "idb_path": str(idb_path), **result}
 
+    if action == "mutate":
+        with closing(connect(db_path)) as connection:
+            idb_path = get_metadata(connection, "idb_path")
+            if not idb_path:
+                raise RuntimeError("database has no IDA database path; run init first")
+            result = ida_export.apply_mutation(connection, idb_path, request["mutation"], request["values"])
+        mutation = request["mutation"]
+        if mutation in ("rename_local", "set_local_type"):
+            result["sync"] = ida_export.synchronize_function(db_path, idb_path, request["values"]["address"])
+        elif mutation == "pseudocode_comment":
+            result["sync"] = ida_export.synchronize_function(db_path, idb_path, request["values"]["address"])
+        elif mutation == "assembly_comment":
+            function = ida_export.ida_funcs.get_func(request["values"]["address"])
+            if function is not None:
+                result["sync"] = ida_export.synchronize_function(db_path, idb_path, request["values"]["address"])
+        elif mutation in ("register_type", "apply_type", "rename_symbol"):
+            result["sync"] = ida_export.synchronize_database(db_path, idb_path, False)
+        return result
+
     with closing(connect(db_path)) as connection:
         idb_path = get_metadata(connection, "idb_path")
         if not idb_path:
             raise RuntimeError("database has no IDA database path; run init first")
         if action == "sync":
+            if request.get("address") is not None:
+                return ida_export.synchronize_function(db_path, idb_path, request["address"])
             return ida_export.synchronize_database(db_path, idb_path, request.get("all_views", False))
         if action == "export_view":
             return ida_export.export_views(connection, request["addresses"], request["view"])

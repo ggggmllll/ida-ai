@@ -6,9 +6,12 @@ description: Rebuild an IDA analysis SQLite snapshot after saved IDB changes, in
 ```text
 python -m ida_ai sync --db ANALYSIS.sqlite [--idat PATH]
 python -m ida_ai sync --db ANALYSIS.sqlite --all-views
+python -m ida_ai sync --db ANALYSIS.sqlite --address FUNCTION_EA
 ```
 
 Save and close an externally edited IDB before launching this headless command. Unsaved GUI edits are not visible to the batch process. IDB is authoritative; editing SQLite does not change IDA.
+
+For strictly function-local variable edits, `--address` refreshes only that function's pseudocode and previously exported disassembly; see `../ida-ai-local-sync/SKILL.md`. It is mutually exclusive with `--all-views`. The full rebuild behavior below applies when `--address` is omitted.
 
 Sync waits for queued autoanalysis, clears Hex-Rays cached functions, rebuilds all function metadata, symbols (address/name/type), xrefs and CFG, then regenerates previously exported asm/pseudocode. `--all-views` generates both views for every current function. Removed functions disappear. A full rebuild avoids incomplete dependency inference through global types and indirect references.
 

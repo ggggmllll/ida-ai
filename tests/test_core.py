@@ -113,7 +113,7 @@ class DatabaseTests(unittest.TestCase):
         with closing(connect(old_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(xrefs)")}
             self.assertIn("type_name", columns)
-            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "2")
+            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "3")
 
     def test_runner_reads_result_from_sqlite(self):
         binary = Path(self.temporary.name) / "sample.bin"

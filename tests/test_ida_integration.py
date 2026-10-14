@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -69,6 +70,31 @@ class RealIDATests(unittest.TestCase):
                     self.assertIn("sync_test_global", text)
 
             info = run_ida("info", db_path, address=ea, idat=idat, timeout=120)
+            # Rename a true local (not a parameter) in another IDA process.
+            with closing(connect(db_path)) as connection:
+                local_ea = ida_ea(connection.execute("SELECT start_ea FROM functions WHERE name='compress2'").fetchone()[0])
+                untouched = tuple(connection.execute("SELECT text,generated_at FROM pseudocode WHERE function_ea=?", (dependent,)).fetchone())
+            run_ida("export_view", db_path, addresses=[local_ea], view="pseudocode", idat=idat, timeout=120)
+            with closing(connect(db_path)) as connection:
+                current_pseudocode = connection.execute("SELECT text FROM pseudocode WHERE function_ea=?", (local_ea,)).fetchone()[0]
+                local_name = re.search(r"^\s+[\w\s\*]+\s+(\w+)(?:\[\d+\])?;\s*// \[", current_pseudocode, re.MULTILINE).group(1)
+            local = run_ida("mutate", db_path, mutation="rename_local",
+                            values={"address": local_ea, "old_name": local_name, "new_name": "local_sync_value"},
+                            idat=idat, timeout=120)
+            self.assertEqual(local["sync"]["function_ea"], local_ea)
+            with closing(connect(db_path)) as connection:
+                self.assertIn("local_sync_value", connection.execute("SELECT text FROM pseudocode WHERE function_ea=?", (local_ea,)).fetchone()[0])
+                self.assertEqual(untouched, tuple(connection.execute("SELECT text,generated_at FROM pseudocode WHERE function_ea=?", (dependent,)).fetchone()))
+            typed_local = run_ida(
+                "mutate", db_path, mutation="set_local_type",
+                values={"address": local_ea, "name": "local_sync_value", "declaration": "unsigned int"},
+                idat=idat, timeout=120,
+            )
+            self.assertEqual(typed_local["sync"]["function_ea"], local_ea)
+            with closing(connect(db_path)) as connection:
+                self.assertIn("unsigned int local_sync_value", connection.execute(
+                    "SELECT text FROM pseudocode WHERE function_ea=?", (local_ea,)
+                ).fetchone()[0])
             self.assertTrue(info["mapped"])
             read = run_ida("read", db_path, address=ea, size=1, idat=idat, timeout=120)
             self.assertEqual(read["size"], 1)
@@ -101,6 +127,72 @@ class RealIDATests(unittest.TestCase):
             self.assertFalse(_cached_search(db_path, "search", search_options, runner_options)["cached"])
             with closing(connect(db_path)) as connection:
                 self.assertGreater(connection.execute("SELECT count(*) FROM functions").fetchone()[0], 0)
+
+            assembly_comment = run_ida(
+                "mutate", db_path, mutation="assembly_comment",
+                values={"address": ea, "comment": "MCP assembly marker"},
+                idat=idat, timeout=120,
+            )
+            self.assertTrue(assembly_comment["saved"])
+            function_comment = run_ida(
+                "mutate", db_path, mutation="function_comment",
+                values={"address": ea, "comment": "MCP function marker", "repeatable": False},
+                idat=idat, timeout=120,
+            )
+            self.assertTrue(function_comment["saved"])
+            pseudo_comment = run_ida(
+                "mutate", db_path, mutation="pseudocode_comment",
+                values={"address": local_ea, "comment": "MCP pseudocode marker"},
+                idat=idat, timeout=120,
+            )
+            self.assertEqual(pseudo_comment["sync"]["function_ea"], local_ea)
+            with closing(connect(db_path)) as connection:
+                self.assertIsNotNone(connection.execute(
+                    "SELECT 1 FROM comments WHERE address=? AND kind='assembly' AND text='MCP assembly marker'",
+                    (ea,),
+                ).fetchone())
+                self.assertEqual(connection.execute(
+                    "SELECT comment FROM functions WHERE start_ea=?", (ea,)
+                ).fetchone()[0], "MCP function marker")
+                self.assertIsNotNone(connection.execute(
+                    "SELECT 1 FROM comments WHERE function_ea=? AND kind='pseudocode' AND text='MCP pseudocode marker'",
+                    (local_ea,),
+                ).fetchone())
+
+            registered = run_ida(
+                "mutate", db_path, mutation="register_type",
+                values={"name": "McpTestType", "declaration": "typedef struct McpTestType { int value; } McpTestType;"},
+                idat=idat, timeout=120,
+            )
+            self.assertTrue(registered["saved"])
+            with closing(connect(db_path)) as connection:
+                self.assertIsNotNone(connection.execute(
+                    "SELECT 1 FROM type_definitions WHERE name='McpTestType'"
+                ).fetchone())
+                global_ea = ida_ea(connection.execute(
+                    "SELECT address FROM symbols WHERE name='sync_test_global'"
+                ).fetchone()[0])
+            applied = run_ida(
+                "mutate", db_path, mutation="apply_type",
+                values={"address": global_ea, "declaration": "const unsigned char *sync_test_global[10];"},
+                idat=idat, timeout=120,
+            )
+            self.assertIn("views", applied["sync"])
+            renamed = run_ida(
+                "mutate", db_path, mutation="rename_symbol",
+                values={"address": global_ea, "name": "mcp_renamed_global"},
+                idat=idat, timeout=120,
+            )
+            self.assertIn("views", renamed["sync"])
+            with closing(connect(db_path)) as connection:
+                symbol = connection.execute(
+                    "SELECT name,type FROM symbols WHERE address=?", (global_ea,)
+                ).fetchone()
+                self.assertEqual(symbol["name"], "mcp_renamed_global")
+                self.assertIn("unsigned", symbol["type"])
+                self.assertIsNotNone(connection.execute(
+                    "SELECT 1 FROM type_assignments WHERE address=?", (global_ea,)
+                ).fetchone())
 
 
 if __name__ == "__main__":
