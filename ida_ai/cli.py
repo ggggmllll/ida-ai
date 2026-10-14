@@ -102,6 +102,13 @@ def _cached_search(db_path: Path, action: str, options: dict, ida_options: dict)
             record_operation(connection, search_id, action, "ok", result)
         return result
     result = run_ida(action, db_path, **ida_options, **options)
+    # IDA may save its database even after a read-only batch request.
+    fingerprint = _idb_fingerprint(db_path)
+    cache = {"idb": fingerprint, "entries": {}}
+    key = hashlib.sha256(json.dumps(
+        {"idb": fingerprint, "action": action, "options": options},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
     cache["entries"][key] = result
     temporary = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
     temporary.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
