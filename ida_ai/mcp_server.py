@@ -32,7 +32,7 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
         with ida_lock:
             with closing(connect(database)) as connection:
                 metadata = {row["key"]: json.loads(row["value"]) for row in connection.execute("SELECT key,value FROM metadata")}
-                tables = ("functions", "xrefs", "basic_blocks", "disassembly", "pseudocode", "symbols", "comments",
+                tables = ("functions", "xrefs", "basic_blocks", "disassembly", "pseudocode", "microcode", "micro_instructions", "symbols", "comments",
                           "jobs", "job_revisions")
                 counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
             return {"metadata": metadata, "counts": counts}
@@ -88,7 +88,7 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
     @app.resource("ida://database/schema")
     def database_schema() -> str:
         """Describe the core analysis tables available to sql_query."""
-        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs(source_ea,target_ea,xref_type,...), basic_blocks, cfg_edges, disassembly(function_ea,text,status,...), instructions, pseudocode(function_ea,text,status,...), symbols(address,name,type), comments(address,function_ea,kind,repeatable,item_preciser,text,updated_at), type_definitions(name,declaration,updated_at), type_assignments(address,declaration,updated_at), memory_bytes, pointers, search_matches, operations. Research job history uses jobs(job_id,parent_job_id,title,objective,status,head_revision_id) and immutable job_revisions(revision_id,job_id,revision_no,parent_revision_id,message,details,changes_json,snapshot_json,analysis_snapshot_json,state_hash). is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values."""
+        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs(source_ea,target_ea,xref_type,...), basic_blocks, cfg_edges, disassembly(function_ea,text,status,...), instructions, pseudocode(function_ea,text,status,...), microcode(function_ea,maturity,status,error,content_hash,...), micro_instructions(function_ea,block_serial,ordinal,ea,opcode,text,l_json,r_json,d_json), symbols(address,name,type), comments(address,function_ea,kind,repeatable,item_preciser,text,updated_at), type_definitions(name,declaration,updated_at), type_assignments(address,declaration,updated_at), memory_bytes, pointers, search_matches, operations. Research job history uses jobs(job_id,parent_job_id,title,objective,status,head_revision_id) and immutable job_revisions(revision_id,job_id,revision_no,parent_revision_id,message,details,changes_json,snapshot_json,analysis_snapshot_json,state_hash). is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values."""
 
     if unsafe:
         def mutate(kind: str, values: dict) -> dict:

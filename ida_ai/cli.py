@@ -14,6 +14,7 @@ from pathlib import Path
 from .db import connect, get_metadata, record_operation, sqlite_ea
 from .jobs import JOB_STATUSES, check_jobs, create_job, history as job_history, list_jobs, resume_job, revise_job, show_job
 from .job_queries import diff_job, find_jobs, impact
+from .type_features import normalize_spec, scan_type_features
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -130,7 +131,7 @@ def _parser() -> argparse.ArgumentParser:
 
     export = commands.add_parser("export", help="export a function view into SQLite")
     views = export.add_subparsers(dest="view", required=True)
-    for name in ("disassembly", "pseudocode"):
+    for name in ("disassembly", "pseudocode", "microcode"):
         view = views.add_parser(name, help=f"export {name} for selected functions")
         _add_db(view)
         _add_ida(view)
@@ -181,7 +182,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_db(sync)
     _add_ida(sync)
     sync_scope = sync.add_mutually_exclusive_group()
-    sync_scope.add_argument("--all-views", action="store_true", help="generate both views for every function")
+    sync_scope.add_argument("--all-views", action="store_true", help="generate disassembly, pseudocode, and microcode for every function")
     sync_scope.add_argument("--address", help="refresh one function after local variable edits")
 
     sql = commands.add_parser("sql", help="run a read-only SQLite query without starting IDA")
@@ -264,6 +265,22 @@ def _parser() -> argparse.ArgumentParser:
     job_check = commands.add_parser("job-check", help="detect analysis/evidence drift and optionally record review revisions")
     _add_db(job_check)
     job_check.add_argument("--apply", action="store_true", help="append review-required revisions for changed evidence")
+
+    type_scan = commands.add_parser("type-scan", help="scan microcode for a structured type-usage form")
+    _add_db(type_scan)
+    _add_ida(type_scan)
+    type_scan.add_argument("--spec", required=True, type=Path, help="UTF-8 JSON utilization-form specification")
+    type_scan_selection = type_scan.add_mutually_exclusive_group(required=True)
+    type_scan_selection.add_argument("--all", action="store_true", dest="all_functions",
+                                     help="refresh and scan every indexed function")
+    type_scan_selection.add_argument("--address", help="refresh and scan the function containing this address")
+    type_scan_selection.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"),
+                                     help="refresh and scan every function overlapping this half-open range")
+    type_scan_selection.add_argument("--name", help="refresh and scan the exact function or demangled name")
+    type_scan.add_argument("--no-refresh", action="store_true",
+                           help="use existing SQLite microcode without launching IDA")
+    type_scan.add_argument("--limit", type=int, default=1000, help="maximum returned candidate locations; 0 means unlimited")
+    type_scan.add_argument("--min-score", type=float, help="override the specification score threshold")
     return parser
 
 
@@ -386,6 +403,39 @@ def _run(args: argparse.Namespace) -> dict:
             if args.command == "job-check":
                 return check_jobs(connection, apply=args.apply)
         raise ValueError(f"unknown job command: {args.command}")
+    if args.command == "type-scan":
+        if args.limit < 0:
+            raise ValueError("type-scan limit must be non-negative")
+        try:
+            spec = json.loads(args.spec.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise FileNotFoundError(f"type scan specification cannot be read: {args.spec}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"type scan specification must be valid JSON: {exc.msg}") from exc
+        normalize_spec(spec)
+        if args.timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        if args.min_score is not None and not 0 <= args.min_score <= 1:
+            raise ValueError("min_score must be between 0 and 1")
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite database does not exist: {args.db}")
+        with closing(connect(args.db)) as connection:
+            addresses = select_function_addresses(
+                connection, all_functions=args.all_functions, address=args.address,
+                address_range=args.address_range, name=args.name,
+            )
+        refresh = None
+        if not args.no_refresh:
+            refresh = run_ida("export_view", args.db, view="microcode", addresses=addresses,
+                              idat=args.idat, timeout=args.timeout)
+        with closing(connect(args.db)) as connection:
+            result = scan_type_features(connection, spec, function_eas=addresses,
+                                        limit=args.limit, min_score=args.min_score)
+        result["refresh"] = refresh
+        result["scope"] = {"function_count": len(addresses),
+                           "function_addresses": [f"0x{address:X}" for address in addresses],
+                           "refreshed": not args.no_refresh}
+        return result
     if args.timeout < 0:
         raise ValueError("timeout must be non-negative")
     options = {"idat": args.idat, "timeout": args.timeout}

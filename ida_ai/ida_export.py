@@ -1,9 +1,8 @@
 """IDA-side headless exporter.
 
-This module is loaded by ``idat -A -S``.  It intentionally contains no Qt or
-``ida_kernwin`` dependency, so the same export works in batch mode and under
-an idalib host.  The parent process only needs to read the resulting SQLite
-file.
+This module is loaded by ``idat -A -S``. It performs no Qt or GUI operations;
+microcode export uses ida_kernwin only for the kernel version. The parent
+process only needs to read the resulting SQLite file.
 """
 
 from __future__ import annotations
@@ -44,6 +43,7 @@ except ImportError:
 from .db import connect, reset_analysis, set_metadata, sqlite_ea, ida_ea, utc_now
 from .function_classification import is_nullstub_sequence
 from .selection import BytePattern, parse_pattern
+from .ida_microcode import export_microcode
 
 
 XREF_TYPE_NAMES = {
@@ -319,6 +319,8 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
     elif view == "pseudocode":
         add_pseudocode(connection, selected)
         add_pseudocode_comments(connection, selected)
+    elif view == "microcode":
+        return export_microcode(connection, selected)
     else:
         raise ValueError(f"unsupported function view: {view}")
     connection.commit()
@@ -719,6 +721,8 @@ def synchronize_function(output: str | Path, idb_path: str | Path, address: int)
                 if target.execute("SELECT 1 FROM disassembly WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
                     views["disassembly"] = export_views(target, [ea], "disassembly")
                     add_assembly_comments(target, [ea])
+                if target.execute("SELECT 1 FROM microcode WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
+                    views["microcode"] = export_views(target, [ea], "microcode")
                 set_metadata(target, {f"function_sync:{ea:X}": utc_now()})
                 target.commit()
                 if not ida_loader.save_database(str(idb_path), 0):
@@ -735,7 +739,7 @@ def synchronize_database(output: str | Path, idb_path: str | Path, all_views: bo
         ida_hexrays.clear_cached_cfuncs()
     with closing(connect(output)) as source:
         selections = {view: [ida_ea(row[0]) for row in source.execute(
-            f"SELECT function_ea FROM {view}")] for view in ("disassembly", "pseudocode")}
+            f"SELECT function_ea FROM {view}")] for view in ("disassembly", "pseudocode", "microcode")}
         with tempfile.TemporaryDirectory(prefix="ida-ai-sync-", dir=Path(output).parent) as directory:
             staging = Path(directory) / "snapshot.sqlite"
             with closing(connect(staging)) as target:

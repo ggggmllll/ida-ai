@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def sqlite_ea(address: int) -> int:
@@ -170,6 +170,32 @@ CREATE TABLE IF NOT EXISTS pseudocode (
     generated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS microcode (
+    function_ea INTEGER PRIMARY KEY,
+    maturity TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    decompiler_version TEXT,
+    instruction_count INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT,
+    generated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS micro_instructions (
+    function_ea INTEGER NOT NULL,
+    block_serial INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    ea INTEGER,
+    opcode TEXT NOT NULL,
+    text TEXT NOT NULL,
+    l_json TEXT NOT NULL,
+    r_json TEXT NOT NULL,
+    d_json TEXT NOT NULL,
+    PRIMARY KEY(function_ea,block_serial,ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_instructions_ea ON micro_instructions(ea);
+CREATE INDEX IF NOT EXISTS idx_micro_instructions_opcode ON micro_instructions(opcode);
+
 CREATE TABLE IF NOT EXISTS memory_bytes (
     address INTEGER PRIMARY KEY,
     value INTEGER NOT NULL CHECK(value >= 0 AND value <= 255),
@@ -303,6 +329,8 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
         "disassembly",
         "instructions",
         "pseudocode",
+        "microcode",
+        "micro_instructions",
         "memory_bytes",
         "pointers",
         "search_matches",

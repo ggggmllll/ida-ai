@@ -16,10 +16,44 @@ from ida_ai.db import connect, ida_ea
 from ida_ai.runner import run_ida
 from ida_ai.cli import _cached_search, _clear_searches
 from ida_ai.jobs import create_job, history, resume_job, revise_job, show_job
+from ida_ai.type_features import scan_type_features
 
 
 @unittest.skipUnless(os.environ.get("IDAT") and os.environ.get("IDA_AI_TEST_BINARY"), "requires IDAT and IDA_AI_TEST_BINARY")
 class RealIDATests(unittest.TestCase):
+    def test_zlib_microcode_search_and_sync(self):
+        source = Path(os.environ["IDA_AI_TEST_BINARY"]).resolve()
+        idat = os.environ["IDAT"]
+        with tempfile.TemporaryDirectory(prefix="ida-ai-zlib-micro-") as temporary:
+            directory = Path(temporary)
+            binary = directory / source.name
+            shutil.copy2(source, binary)
+            db_path = directory / "analysis.sqlite"
+            run_ida("init", db_path, binary=binary, idb_path=str(directory / "analysis.i64"), idat=idat, timeout=240)
+            with closing(connect(db_path)) as connection:
+                addresses = [ida_ea(row[0]) for row in connection.execute("SELECT start_ea FROM functions")]
+            exported = run_ida("export_view", db_path, view="microcode", addresses=addresses, idat=idat, timeout=180)
+            self.assertGreater(exported["statuses"]["ok"], 0)
+            spec = {"features": [{"kind": "memory_access", "direction": "read", "width": 1}], "min_score": 1}
+            with closing(connect(db_path)) as connection:
+                result = scan_type_features(connection, spec)
+                self.assertGreater(result["candidate_count"], 0)
+                self.assertTrue(any(item["operand_path"] != "root" for item in result["matches"]))
+                function_ea = result["matches"][0]["function_ea"]
+                before = connection.execute("SELECT content_hash FROM microcode WHERE function_ea=?", (function_ea,)).fetchone()[0]
+                job = create_job(connection, title="microcode usage", objective="Record byte load evidence")
+                revise_job(connection, job["job_id"], message="Pin microcode evidence", add_evidence=[json.dumps({
+                    "origin": "ida_type_dependent", "source_ref": f"microcode:0x{function_ea:X}",
+                    "description": "Observed indirect byte read"})])
+            local = run_ida("sync", db_path, address=function_ea, idat=idat, timeout=120)
+            self.assertEqual(local["views"]["microcode"]["statuses"].get("ok"), 1)
+            full = run_ida("sync", db_path, idat=idat, timeout=240)
+            self.assertEqual(full["views"]["microcode"]["statuses"], exported["statuses"])
+            with closing(connect(db_path)) as connection:
+                self.assertEqual(connection.execute("SELECT content_hash FROM microcode WHERE function_ea=?", (function_ea,)).fetchone()[0], before)
+                self.assertFalse(resume_job(connection, job["job_id"])["known_evidence_scope"][0]["source_changed"])
+                self.assertEqual(scan_type_features(connection, spec)["total_candidates"], result["total_candidates"])
+
     def test_zlib_job_history_survives_sync_and_flags_changed_evidence(self):
         source = Path(os.environ["IDA_AI_TEST_BINARY"]).resolve()
         idat = os.environ["IDAT"]

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ida_ai.cli import _cache_file, _cached_search, _clear_searches, _query
-from ida_ai.db import connect, ida_ea, operation, record_operation, set_metadata, sqlite_ea
+from ida_ai.db import SCHEMA_VERSION, connect, ida_ea, operation, record_operation, set_metadata, sqlite_ea
 from ida_ai.function_classification import is_nullstub_sequence
 from ida_ai.runner import run_ida
 from ida_ai.selection import parse_hex_bytes, parse_pattern, select_function_addresses
@@ -129,7 +129,7 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT is_thunk,thunk_target_ea,is_nullstub FROM functions WHERE start_ea=4096"
             ).fetchone()
             self.assertEqual(tuple(function), (1, None, 0))
-            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], "5")
+            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], str(SCHEMA_VERSION))
 
     def test_nullstub_classification_is_conservative(self):
         self.assertTrue(is_nullstub_sequence([("endbr64", False), ("nop", False), ("ret", True)]))
