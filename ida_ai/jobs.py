@@ -34,11 +34,12 @@ def analysis_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
     for table in (
         "functions", "xrefs", "basic_blocks", "cfg_edges", "symbols", "comments",
         "disassembly", "instructions", "pseudocode", "microcode", "micro_instructions",
+        "micro_flow", "micro_flow_instructions",
     ):
         counts[table] = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     view_epochs = {
         table: connection.execute(f"SELECT max(generated_at) FROM {table}").fetchone()[0]
-        for table in ("disassembly", "pseudocode", "microcode")
+        for table in ("disassembly", "pseudocode", "microcode", "micro_flow")
     }
     comment_epoch = connection.execute("SELECT max(updated_at) FROM comments").fetchone()[0]
     type_state = {
@@ -60,6 +61,7 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
     """Content identity for explicitly addressed artifacts; timestamps are excluded."""
     table, separator, address = source_ref.partition(":")
     keys = {"pseudocode": "function_ea", "disassembly": "function_ea", "microcode": "function_ea",
+            "micro_flow": "function_ea",
             "functions": "start_ea", "instructions": "ea"}
     if not separator or table not in keys:
         return None

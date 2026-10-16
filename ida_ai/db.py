@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 def sqlite_ea(address: int) -> int:
@@ -196,6 +196,94 @@ CREATE TABLE IF NOT EXISTS micro_instructions (
 CREATE INDEX IF NOT EXISTS idx_micro_instructions_ea ON micro_instructions(ea);
 CREATE INDEX IF NOT EXISTS idx_micro_instructions_opcode ON micro_instructions(opcode);
 
+CREATE TABLE IF NOT EXISTS micro_flow (
+    function_ea INTEGER PRIMARY KEY,
+    maturity TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    decompiler_version TEXT,
+    instruction_count INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT,
+    generated_at TEXT NOT NULL,
+    arguments_json TEXT NOT NULL DEFAULT '[]',
+    return_json TEXT NOT NULL DEFAULT '{}',
+    locals_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS micro_flow_instructions (
+    function_ea INTEGER NOT NULL,
+    block_serial INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    ea INTEGER,
+    opcode TEXT NOT NULL,
+    text TEXT NOT NULL,
+    l_json TEXT NOT NULL,
+    r_json TEXT NOT NULL,
+    d_json TEXT NOT NULL,
+    PRIMARY KEY(function_ea,block_serial,ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_flow_opcode ON micro_flow_instructions(opcode);
+
+CREATE TABLE IF NOT EXISTS propagation_runs (
+    run_id TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_propagation_runs_created ON propagation_runs(created_at);
+
+CREATE TABLE IF NOT EXISTS propagation_nodes (
+    node_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    identity_json TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(node_id,source_snapshot_hash)
+);
+CREATE TRIGGER IF NOT EXISTS propagation_nodes_no_update BEFORE UPDATE ON propagation_nodes
+BEGIN SELECT RAISE(ABORT, 'propagation nodes are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS propagation_nodes_no_delete BEFORE DELETE ON propagation_nodes
+BEGIN SELECT RAISE(ABORT, 'propagation nodes are immutable'); END;
+
+CREATE TABLE IF NOT EXISTS propagation_edges (
+    edge_id TEXT PRIMARY KEY,
+    source_node TEXT NOT NULL,
+    target_node TEXT NOT NULL,
+    family TEXT NOT NULL CHECK(family IN ('reference','parameter','return')),
+    direction TEXT NOT NULL CHECK(direction IN ('forward','reverse','both')),
+    confidence TEXT NOT NULL CHECK(confidence IN ('observed','confirmed','hypothesis')),
+    transform_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_propagation_edges_source ON propagation_edges(source_node,family);
+CREATE INDEX IF NOT EXISTS idx_propagation_edges_target ON propagation_edges(target_node,family);
+CREATE TRIGGER IF NOT EXISTS propagation_edges_no_update BEFORE UPDATE ON propagation_edges
+BEGIN SELECT RAISE(ABORT, 'propagation edges are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS propagation_edges_no_delete BEFORE DELETE ON propagation_edges
+BEGIN SELECT RAISE(ABORT, 'propagation edges are immutable'); END;
+
+CREATE TABLE IF NOT EXISTS propagation_constraints (
+    constraint_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES propagation_runs(run_id),
+    proposal_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    constraint_json TEXT NOT NULL,
+    provenance_json TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, proposal_id)
+);
+CREATE INDEX IF NOT EXISTS idx_propagation_constraints_node ON propagation_constraints(node_id);
+CREATE TRIGGER IF NOT EXISTS propagation_constraints_no_update BEFORE UPDATE ON propagation_constraints
+BEGIN SELECT RAISE(ABORT, 'accepted propagation constraints are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS propagation_constraints_no_delete BEFORE DELETE ON propagation_constraints
+BEGIN SELECT RAISE(ABORT, 'accepted propagation constraints are immutable'); END;
+
 CREATE TABLE IF NOT EXISTS memory_bytes (
     address INTEGER PRIMARY KEY,
     value INTEGER NOT NULL CHECK(value >= 0 AND value <= 255),
@@ -307,11 +395,35 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE functions ADD COLUMN thunk_target_ea INTEGER")
     if "is_nullstub" not in function_columns:
         connection.execute("ALTER TABLE functions ADD COLUMN is_nullstub INTEGER NOT NULL DEFAULT 0")
+    flow_columns = {row[1] for row in connection.execute("PRAGMA table_info(micro_flow)")}
+    if "arguments_json" not in flow_columns:
+        connection.execute("ALTER TABLE micro_flow ADD COLUMN arguments_json TEXT NOT NULL DEFAULT '[]'")
+    if "return_json" not in flow_columns:
+        connection.execute("ALTER TABLE micro_flow ADD COLUMN return_json TEXT NOT NULL DEFAULT '{}'")
+    if "locals_json" not in flow_columns:
+        connection.execute("ALTER TABLE micro_flow ADD COLUMN locals_json TEXT NOT NULL DEFAULT '[]'")
     connection.execute(
         "INSERT INTO schema_info(key, value) VALUES('version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(SCHEMA_VERSION),),
     )
+    node_info = connection.execute("PRAGMA table_info(propagation_nodes)").fetchall()
+    node_pk = [row[1] for row in sorted((row for row in node_info if row[5]), key=lambda row: row[5])]
+    if node_pk == ["node_id"]:
+        connection.execute("DROP TRIGGER IF EXISTS propagation_nodes_no_update")
+        connection.execute("DROP TRIGGER IF EXISTS propagation_nodes_no_delete")
+        connection.execute("DROP INDEX IF EXISTS idx_propagation_nodes_snapshot")
+        connection.execute("ALTER TABLE propagation_nodes RENAME TO propagation_nodes_v1")
+        connection.execute("""CREATE TABLE propagation_nodes (
+            node_id TEXT NOT NULL,kind TEXT NOT NULL,identity_json TEXT NOT NULL,
+            source_snapshot_hash TEXT NOT NULL,created_at TEXT NOT NULL,
+            PRIMARY KEY(node_id,source_snapshot_hash))""")
+        connection.execute("INSERT OR IGNORE INTO propagation_nodes SELECT * FROM propagation_nodes_v1")
+        connection.execute("DROP TABLE propagation_nodes_v1")
+        connection.executescript("""CREATE TRIGGER propagation_nodes_no_update BEFORE UPDATE ON propagation_nodes
+            BEGIN SELECT RAISE(ABORT, 'propagation nodes are immutable'); END;
+            CREATE TRIGGER propagation_nodes_no_delete BEFORE DELETE ON propagation_nodes
+            BEGIN SELECT RAISE(ABORT, 'propagation nodes are immutable'); END;""")
     connection.commit()
 
 
@@ -331,6 +443,8 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
         "pseudocode",
         "microcode",
         "micro_instructions",
+        "micro_flow",
+        "micro_flow_instructions",
         "memory_bytes",
         "pointers",
         "search_matches",

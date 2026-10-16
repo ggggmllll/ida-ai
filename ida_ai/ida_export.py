@@ -319,8 +319,8 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
     elif view == "pseudocode":
         add_pseudocode(connection, selected)
         add_pseudocode_comments(connection, selected)
-    elif view == "microcode":
-        return export_microcode(connection, selected)
+    elif view in {"microcode", "micro_flow"}:
+        return export_microcode(connection, selected, flow=view == "micro_flow")
     else:
         raise ValueError(f"unsupported function view: {view}")
     connection.commit()
@@ -723,6 +723,8 @@ def synchronize_function(output: str | Path, idb_path: str | Path, address: int)
                     add_assembly_comments(target, [ea])
                 if target.execute("SELECT 1 FROM microcode WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
                     views["microcode"] = export_views(target, [ea], "microcode")
+                if target.execute("SELECT 1 FROM micro_flow WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
+                    views["micro_flow"] = export_views(target, [ea], "micro_flow")
                 set_metadata(target, {f"function_sync:{ea:X}": utc_now()})
                 target.commit()
                 if not ida_loader.save_database(str(idb_path), 0):
@@ -739,7 +741,7 @@ def synchronize_database(output: str | Path, idb_path: str | Path, all_views: bo
         ida_hexrays.clear_cached_cfuncs()
     with closing(connect(output)) as source:
         selections = {view: [ida_ea(row[0]) for row in source.execute(
-            f"SELECT function_ea FROM {view}")] for view in ("disassembly", "pseudocode", "microcode")}
+            f"SELECT function_ea FROM {view}")] for view in ("disassembly", "pseudocode", "microcode", "micro_flow")}
         with tempfile.TemporaryDirectory(prefix="ida-ai-sync-", dir=Path(output).parent) as directory:
             staging = Path(directory) / "snapshot.sqlite"
             with closing(connect(staging)) as target:

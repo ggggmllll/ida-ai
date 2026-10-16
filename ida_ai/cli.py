@@ -15,6 +15,8 @@ from .db import connect, get_metadata, record_operation, sqlite_ea
 from .jobs import JOB_STATUSES, check_jobs, create_job, history as job_history, list_jobs, resume_job, revise_job, show_job
 from .job_queries import diff_job, find_jobs, impact
 from .type_features import normalize_spec, scan_type_features
+from .propagation import add_edge as add_propagation_edge, add_seed as add_propagation_seed
+from .propagation import accept_propagation, preview_seed, show_node as show_propagation_node
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -131,7 +133,7 @@ def _parser() -> argparse.ArgumentParser:
 
     export = commands.add_parser("export", help="export a function view into SQLite")
     views = export.add_subparsers(dest="view", required=True)
-    for name in ("disassembly", "pseudocode", "microcode"):
+    for name in ("disassembly", "pseudocode", "microcode", "flow"):
         view = views.add_parser(name, help=f"export {name} for selected functions")
         _add_db(view)
         _add_ida(view)
@@ -281,6 +283,34 @@ def _parser() -> argparse.ArgumentParser:
                            help="use existing SQLite microcode without launching IDA")
     type_scan.add_argument("--limit", type=int, default=1000, help="maximum returned candidate locations; 0 means unlimited")
     type_scan.add_argument("--min-score", type=float, help="override the specification score threshold")
+
+    type_propagate = commands.add_parser("type-propagate", help="seed, link, preview, accept, and inspect bounded type-constraint propagation")
+    type_actions = type_propagate.add_subparsers(dest="propagation_action", required=True)
+    type_seed = type_actions.add_parser("seed", help="record an evidence-backed confirmed or observed constraint")
+    _add_db(type_seed)
+    _add_ida(type_seed)
+    type_seed.add_argument("--spec", required=True, type=Path, help="UTF-8 JSON seed specification")
+    type_seed.add_argument("--no-refresh", action="store_true", help="use current MMAT_LVARS flow snapshot")
+    type_link = type_actions.add_parser("link", help="record an immutable evidence-backed relationship edge")
+    _add_db(type_link)
+    _add_ida(type_link)
+    type_link.add_argument("--spec", required=True, type=Path, help="UTF-8 JSON relationship specification")
+    type_preview = type_actions.add_parser("preview", help="preview bounded propagation from a stored seed")
+    _add_db(type_preview)
+    type_preview.add_argument("--seed-id", required=True)
+    type_preview.add_argument("--family", action="append", choices=("reference", "parameter", "return"))
+    type_preview.add_argument("--max-hops", type=int, default=6)
+    type_preview.add_argument("--max-nodes", type=int, default=500)
+    type_preview.add_argument("--max-edges", type=int, default=2000)
+    type_preview.add_argument("--max-alternatives", type=int, default=8)
+    type_accept = type_actions.add_parser("accept", help="accept selected proposals after snapshot and conflict checks")
+    _add_db(type_accept)
+    type_accept.add_argument("--run-id", required=True)
+    type_accept.add_argument("--proposal", action="append", required=True)
+    type_accept.add_argument("--job", type=int, help="append accepted proposals as job evidence")
+    type_node = type_actions.add_parser("node", help="inspect evidence, accepted constraints, and relationship edges for a node")
+    _add_db(type_node)
+    type_node.add_argument("--node", required=True)
     return parser
 
 
@@ -436,8 +466,43 @@ def _run(args: argparse.Namespace) -> dict:
                            "function_addresses": [f"0x{address:X}" for address in addresses],
                            "refreshed": not args.no_refresh}
         return result
-    if args.timeout < 0:
-        raise ValueError("timeout must be non-negative")
+    if args.command == "type-propagate":
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite database does not exist: {args.db}")
+        if args.propagation_action in {"seed", "link"}:
+            if args.timeout < 0:
+                raise ValueError("timeout must be non-negative")
+            try:
+                spec = json.loads(args.spec.read_text(encoding="utf-8"))
+            except OSError as exc:
+                raise FileNotFoundError(f"propagation specification cannot be read: {args.spec}") from exc
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"propagation specification must be valid JSON: {exc.msg}") from exc
+            refresh = None
+            if args.propagation_action == "seed" and not args.no_refresh:
+                with closing(connect(args.db)) as connection:
+                    addresses = select_function_addresses(connection, all_functions=True)
+                refresh = run_ida("export_view", args.db, view="micro_flow", addresses=addresses,
+                                  idat=args.idat, timeout=args.timeout)
+            with closing(connect(args.db)) as connection:
+                result = (add_propagation_seed(connection, spec) if args.propagation_action == "seed"
+                          else add_propagation_edge(connection, spec))
+            if refresh is not None:
+                result["refresh"] = refresh
+            return result
+        if args.propagation_action == "preview":
+            if min(args.max_hops, args.max_nodes, args.max_edges, args.max_alternatives) < 1:
+                raise ValueError("propagation budgets must be positive")
+            with closing(connect(args.db)) as connection:
+                return preview_seed(connection, args.seed_id, families=args.family, max_hops=args.max_hops,
+                                    max_nodes=args.max_nodes, max_edges=args.max_edges,
+                                    max_alternatives=args.max_alternatives)
+        if args.propagation_action == "accept":
+            with closing(connect(args.db)) as connection:
+                return accept_propagation(connection, args.run_id, args.proposal, job_id=args.job)
+        if args.propagation_action == "node":
+            with closing(connect(args.db)) as connection:
+                return show_propagation_node(connection, args.node)
     options = {"idat": args.idat, "timeout": args.timeout}
     if args.command == "sync":
         result = run_ida("sync", args.db, all_views=args.all_views,
@@ -461,7 +526,11 @@ def _run(args: argparse.Namespace) -> dict:
                 connection, all_functions=args.all_functions, address=args.address,
                 address_range=args.address_range, name=args.name,
             )
-        result = run_ida("export_view", args.db, view=args.view, addresses=addresses, **options)
+        # ``flow`` is the short CLI spelling for the LVARS flow export.  Keep
+        # the persisted/exporter name explicit so callers cannot confuse it
+        # with the ordinary GLBOPT3 microcode artifact.
+        view = "micro_flow" if args.view == "flow" else args.view
+        result = run_ida("export_view", args.db, view=view, addresses=addresses, **options)
         return result
     if args.command == "info":
         location = {"address": parse_int(args.address)} if args.address is not None else {"file_offset": parse_int(args.file_offset)}

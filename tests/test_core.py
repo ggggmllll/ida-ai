@@ -131,6 +131,43 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(tuple(function), (1, None, 0))
             self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], str(SCHEMA_VERSION))
 
+    def test_legacy_flow_and_propagation_nodes_are_migrated(self):
+        old_path = Path(self.temporary.name) / "legacy-flow.sqlite"
+        with closing(sqlite3.connect(old_path)) as connection:
+            connection.execute(
+                "CREATE TABLE micro_flow(function_ea INTEGER PRIMARY KEY,maturity TEXT NOT NULL,backend TEXT NOT NULL,"
+                "status TEXT NOT NULL,error TEXT,decompiler_version TEXT,instruction_count INTEGER NOT NULL DEFAULT 0,"
+                "content_hash TEXT,generated_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE propagation_nodes(node_id TEXT PRIMARY KEY,kind TEXT NOT NULL,identity_json TEXT NOT NULL,"
+                "source_snapshot_hash TEXT NOT NULL,created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO propagation_nodes VALUES('local:0x1000:0','local','{}','snapshot-a','now')"
+            )
+            connection.execute(
+                "CREATE TRIGGER propagation_nodes_no_update BEFORE UPDATE ON propagation_nodes "
+                "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
+            )
+            connection.execute(
+                "CREATE TRIGGER propagation_nodes_no_delete BEFORE DELETE ON propagation_nodes "
+                "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
+            )
+            connection.commit()
+        with closing(connect(old_path)) as connection:
+            flow_columns = {row[1] for row in connection.execute("PRAGMA table_info(micro_flow)")}
+            self.assertTrue({"arguments_json", "return_json", "locals_json"} <= flow_columns)
+            node_info = connection.execute("PRAGMA table_info(propagation_nodes)").fetchall()
+            primary_key = [row[1] for row in sorted((row for row in node_info if row[5]), key=lambda row: row[5])]
+            self.assertEqual(primary_key, ["node_id", "source_snapshot_hash"])
+            self.assertEqual(connection.execute("SELECT count(*) FROM propagation_nodes").fetchone()[0], 1)
+            connection.execute(
+                "INSERT INTO propagation_nodes VALUES('local:0x1000:0','local','{}','snapshot-b','later')"
+            )
+            self.assertEqual(connection.execute("SELECT count(*) FROM propagation_nodes").fetchone()[0], 2)
+            self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], str(SCHEMA_VERSION))
+
     def test_nullstub_classification_is_conservative(self):
         self.assertTrue(is_nullstub_sequence([("endbr64", False), ("nop", False), ("ret", True)]))
         self.assertFalse(is_nullstub_sequence([]))

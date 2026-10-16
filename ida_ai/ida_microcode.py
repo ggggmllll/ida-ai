@@ -100,16 +100,29 @@ def _instruction(insn, depth: int = 0) -> dict:
     }
 
 
-def export_microcode(connection, addresses: list[int]) -> dict:
-    """Replace selected function microcode with structured instructions and status."""
+def _variable(variable, index: int) -> dict:
+    location = "register" if variable.is_reg1() else "stack" if variable.is_stk_var() else "other"
+    return {
+        "local_index": index, "name": str(variable.name), "size": int(variable.width),
+        "location": location,
+        "register": int(variable.get_reg1()) if location == "register" else None,
+        "stack_offset": int(variable.get_stkoff()) if location == "stack" else None,
+    }
+
+
+def export_microcode(connection, addresses: list[int], *, flow: bool = False) -> dict:
+    """Replace selected GLBOPT3 microcode or LVARS flow microcode and status."""
     ready = bool(_maybe(lambda: ida_hexrays.init_hexrays_plugin()))
     now = utc_now()
-    maturity = int(getattr(ida_hexrays, MATURITY, 0))
+    maturity_name = "MMAT_LVARS" if flow else MATURITY
+    maturity = int(getattr(ida_hexrays, maturity_name, 0))
+    summary_table = "micro_flow" if flow else "microcode"
+    rows_table = "micro_flow_instructions" if flow else "micro_instructions"
     version = _maybe(lambda: str(ida_hexrays.get_hexrays_version()))
     statuses: Counter[str] = Counter()
     for function_ea in addresses:
         stored_ea = sqlite_ea(function_ea)
-        connection.execute("DELETE FROM micro_instructions WHERE function_ea=?", (stored_ea,))
+        connection.execute(f"DELETE FROM {rows_table} WHERE function_ea=?", (stored_ea,))
         try:
             if not ready:
                 raise RuntimeError("Hex-Rays decompiler unavailable")
@@ -125,6 +138,15 @@ def export_microcode(connection, addresses: list[int]) -> dict:
             mba = ida_hexrays.gen_microcode(ranges, failure, None, 0, maturity)
             if mba is None:
                 raise RuntimeError(str(_maybe(failure.desc) or "gen_microcode returned None"))
+            arguments = []
+            returned = {}
+            variables = []
+            if flow:
+                variables = [_variable(mba.vars[index], index) for index in range(len(mba.vars))]
+                arguments = [_variable(mba.vars[int(index)], int(index)) for index in mba.argidx]
+                result_index = int(mba.retvaridx)
+                if result_index >= 0:
+                    returned = _variable(mba.vars[result_index], result_index)
             rows = []
             for block_serial in range(int(mba.qty)):
                 block = mba.get_mblock(block_serial)
@@ -140,23 +162,42 @@ def export_microcode(connection, addresses: list[int]) -> dict:
                                  json.dumps(item["d"], sort_keys=True)))
                     insn = insn.next
                     ordinal += 1
-            encoded = json.dumps({"rows": rows, "maturity": MATURITY, "hexrays": version,
+            encoded = json.dumps({"rows": rows, "arguments": arguments, "return": returned,
+                                  "locals": variables,
+                                  "maturity": maturity_name, "hexrays": version,
                                   "ida": ida_kernwin.get_kernel_version()}, sort_keys=True, ensure_ascii=False)
             digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
             connection.executemany(
-                "INSERT INTO micro_instructions(function_ea,block_serial,ordinal,ea,opcode,text,l_json,r_json,d_json) "
+                f"INSERT INTO {rows_table}(function_ea,block_serial,ordinal,ea,opcode,text,l_json,r_json,d_json) "
                 "VALUES(?,?,?,?,?,?,?,?,?)", rows)
-            connection.execute(
-                "INSERT OR REPLACE INTO microcode(function_ea,maturity,backend,status,error,decompiler_version,"
-                "instruction_count,content_hash,generated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (stored_ea, MATURITY, "ida_hexrays", "ok", None, version, len(rows), digest, now))
+            if flow:
+                connection.execute(
+                    "INSERT OR REPLACE INTO micro_flow(function_ea,maturity,backend,status,error,decompiler_version,"
+                    "instruction_count,content_hash,generated_at,arguments_json,return_json,locals_json) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (stored_ea, maturity_name, "ida_hexrays", "ok", None, version, len(rows), digest, now,
+                     json.dumps(arguments, sort_keys=True), json.dumps(returned, sort_keys=True),
+                     json.dumps(variables, sort_keys=True)))
+            else:
+                connection.execute(
+                    "INSERT OR REPLACE INTO microcode(function_ea,maturity,backend,status,error,decompiler_version,"
+                    "instruction_count,content_hash,generated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (stored_ea, maturity_name, "ida_hexrays", "ok", None, version, len(rows), digest, now))
             statuses["ok"] += 1
         except Exception as exc:
-            connection.execute(
-                "INSERT OR REPLACE INTO microcode(function_ea,maturity,backend,status,error,decompiler_version,"
-                "instruction_count,content_hash,generated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (stored_ea, MATURITY, "ida_hexrays", "error", str(exc), version, 0, None, now))
+            if flow:
+                connection.execute(
+                    "INSERT OR REPLACE INTO micro_flow(function_ea,maturity,backend,status,error,decompiler_version,"
+                    "instruction_count,content_hash,generated_at,arguments_json,return_json,locals_json) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (stored_ea, maturity_name, "ida_hexrays", "error", str(exc), version, 0, None, now,
+                     "[]", "{}", "[]"))
+            else:
+                connection.execute(
+                    "INSERT OR REPLACE INTO microcode(function_ea,maturity,backend,status,error,decompiler_version,"
+                    "instruction_count,content_hash,generated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (stored_ea, maturity_name, "ida_hexrays", "error", str(exc), version, 0, None, now))
             statuses["error"] += 1
     connection.commit()
-    return {"view": "microcode", "functions": len(addresses), "statuses": dict(statuses),
-            "maturity": MATURITY}
+    return {"view": summary_table, "functions": len(addresses), "statuses": dict(statuses),
+            "maturity": maturity_name}
