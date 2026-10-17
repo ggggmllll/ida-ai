@@ -320,7 +320,11 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
         add_pseudocode(connection, selected)
         add_pseudocode_comments(connection, selected)
     elif view in {"microcode", "micro_flow"}:
-        return export_microcode(connection, selected, flow=view == "micro_flow")
+        result = export_microcode(connection, selected, flow=view == "micro_flow")
+        if view == "microcode":
+            from .virtual_tables import invalidate_function_virtual_artifacts
+            result["virtual_artifacts_invalidated"] = invalidate_function_virtual_artifacts(connection, selected)
+        return result
     else:
         raise ValueError(f"unsupported function view: {view}")
     connection.commit()
@@ -825,11 +829,11 @@ def scan_data_pointer_slots(
             rows,
         )
 
-    # Preserve a possible Itanium offset-to-top word immediately before the
+    # Preserve possible Itanium offset-to-top words immediately before the
     # two-word metadata prefix of mapped code-pointer runs. Such scalar words
-    # are otherwise discarded by pointer scanning because they are not mapped
-    # addresses. Keep this narrowly scoped; arbitrary data words are not
-    # exposed as pointer observations.
+    # (including zero for a primary table) are otherwise discarded because
+    # they are not mapped addresses. Keep this narrowly scoped; arbitrary
+    # data words are not exposed as pointer observations.
     prefix_words: set[int] = set()
     scalar_prefix_words = 0
     prefix_failures = 0
@@ -872,16 +876,16 @@ def scan_data_pointer_slots(
                 continue
             prefix_words.add(prefix_ea)
             raw_value = int.from_bytes(bytes(prefix_raw), byteorder, signed=False)
-            if raw_value == 0 or ida_segment.getseg(raw_value) is not None:
+            if raw_value != 0 and ida_segment.getseg(raw_value) is not None:
                 continue
             signed_value = raw_value
             sign_bit = 1 << (pointer_size * 8 - 1)
             if signed_value & sign_bit:
                 signed_value -= 1 << (pointer_size * 8)
-            if signed_value == 0 or not -0x10000 <= signed_value <= 0x10000:
+            if not -0x10000 <= signed_value <= 0x10000:
                 continue
             inserted = connection.execute(
-                "INSERT OR IGNORE INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+                "INSERT OR REPLACE INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
                 "VALUES(?,?,NULL,?,?,NULL,NULL,NULL,'scalar',?)",
                 (sqlite_ea(prefix_ea), sqlite_ea(raw_value), pointer_size,
                  entry["source_segment"], now),
@@ -917,15 +921,164 @@ def build_vtables(
     pointer_scan = scan_data_pointer_slots(
         connection, pointer_size=pointer_size, start=start, end=end, max_bytes=max_bytes,
     )
-    from .virtual_tables import build_vtable_index
+    from .virtual_tables import build_vtable_index, store_itanium_rtti_descriptors
 
+    # The first pass finds candidate address points.  Only typeinfo pointers
+    # structurally adjacent to those sequences are used as RTTI roots; the
+    # bounded second pass follows explicit base pointers from those roots.
+    result = build_vtable_index(
+        connection, abi=abi, pointer_size=pointer_size,
+        byteorder="big" if ida_ida.inf_is_be() else "little", start=start, end=end,
+        min_function_slots=min_function_slots, max_slots=max_slots,
+    )
+    descriptor_observations = read_itanium_typeinfos_from_candidates(
+        connection, pointer_size=pointer_size,
+        max_objects=4096, max_bytes=min(max_bytes, 32 << 20), max_bases=128,
+    ) if abi == "itanium" else {"items": [], "coverage": {"status": "unsupported_abi"}}
+    from .virtual_tables import _source_hash
+    base_snapshot_hash = _source_hash(connection, "vtable", include_rtti=False)
+    rtti_result = store_itanium_rtti_descriptors(
+        connection, input_snapshot_hash=base_snapshot_hash,
+        descriptors=descriptor_observations["items"],
+        coverage=descriptor_observations["coverage"],
+    )
     result = build_vtable_index(
         connection, abi=abi, pointer_size=pointer_size,
         byteorder="big" if ida_ida.inf_is_be() else "little", start=start, end=end,
         min_function_slots=min_function_slots, max_slots=max_slots,
     )
     result["pointer_scan"] = pointer_scan
+    result["rtti_scan"] = descriptor_observations["coverage"]
+    result["rtti_run"] = rtti_result
     return result
+
+
+def read_itanium_typeinfos_from_candidates(
+    connection, *, pointer_size: int, max_objects: int = 4096,
+    max_bytes: int = 32 << 20, max_bases: int = 128,
+) -> dict:
+    """Read only bounded Itanium RTTI records reached from table prefixes.
+
+    This runs inside IDA. It deliberately returns partial coverage for unknown
+    descriptors, unmapped data, invalid headers, and exhausted limits.
+    """
+    if pointer_size not in (4, 8):
+        raise ValueError("pointer_size must be 4 or 8")
+    if max_objects < 1 or max_bytes < pointer_size or max_bases < 0:
+        raise ValueError("invalid RTTI scan limits")
+    byteorder = "big" if ida_ida.inf_is_be() else "little"
+    code_entries = connection.execute(
+        "SELECT source_ea,target_kind FROM data_pointer_slots WHERE pointer_size=? "
+        "AND target_kind IN ('function','code') ORDER BY source_ea", (pointer_size,),
+    ).fetchall()
+    roots = set()
+    for code in code_entries:
+        code_ea = ida_ea(code["source_ea"])
+        header_ea = code_ea - pointer_size
+        scalar_ea = code_ea - 2 * pointer_size
+        header = connection.execute(
+            "SELECT target_ea,target_kind FROM data_pointer_slots WHERE source_ea=?",
+            (sqlite_ea(header_ea),),
+        ).fetchone()
+        scalar = connection.execute(
+            "SELECT raw_value,target_kind FROM data_pointer_slots WHERE source_ea=?",
+            (sqlite_ea(scalar_ea),),
+        ).fetchone()
+        if (header is not None and header["target_kind"] == "data" and header["target_ea"] is not None
+                and scalar is not None and scalar["target_kind"] == "scalar"):
+            roots.add(ida_ea(header["target_ea"]))
+
+    descriptor_tokens = (
+        ("__vmi_class_type_infoE", "multiple_or_virtual_inheritance"),
+        ("__si_class_type_infoE", "single_inheritance"),
+        ("__class_type_infoE", "class_type_info"),
+    )
+    queue = sorted(roots)
+    seen: set[int] = set()
+    items = []
+    bytes_read = 0
+    skipped = []
+    while queue and len(seen) < max_objects and bytes_read < max_bytes:
+        typeinfo_ea = queue.pop(0)
+        if typeinfo_ea in seen:
+            continue
+        seen.add(typeinfo_ea)
+        header_len = 2 * pointer_size
+        if ida_segment.getseg(typeinfo_ea) is None or bytes_read + header_len > max_bytes:
+            skipped.append({"typeinfo_ea": typeinfo_ea, "reason": "unmapped_or_byte_budget"})
+            continue
+        header = ida_bytes.get_bytes(typeinfo_ea, header_len)
+        bytes_read += header_len
+        if header is None or len(header) != header_len:
+            skipped.append({"typeinfo_ea": typeinfo_ea, "reason": "unreadable_header"})
+            continue
+        vptr = int.from_bytes(bytes(header[:pointer_size]), byteorder, signed=False)
+        name_ea = int.from_bytes(bytes(header[pointer_size:]), byteorder, signed=False)
+        descriptor_symbol = (ida_name.get_name(vptr - 2 * pointer_size) or "") if vptr >= 2 * pointer_size else ""
+        descriptor_kind = next((kind for token, kind in descriptor_tokens if descriptor_symbol.endswith(token)), None)
+        type_name_symbol = ida_name.get_name(name_ea) or None
+        type_name = None
+        name_budget = min(256, max(0, max_bytes - bytes_read))
+        if name_ea and name_budget and ida_segment.getseg(name_ea) is not None:
+            name_bytes = ida_bytes.get_bytes(name_ea, name_budget)
+            if name_bytes:
+                bytes_read += len(name_bytes)
+                type_name = bytes(name_bytes).split(b"\0", 1)[0].decode("utf-8", errors="replace")
+        wanted = header_len
+        if descriptor_kind == "single_inheritance":
+            wanted += pointer_size
+        elif descriptor_kind == "multiple_or_virtual_inheritance":
+            wanted += 8
+        if descriptor_kind is None:
+            raw = bytes(header)
+            status = "unknown_descriptor_kind"
+        else:
+            if bytes_read + max(0, wanted - header_len) > max_bytes:
+                skipped.append({"typeinfo_ea": typeinfo_ea, "reason": "byte_budget_before_descriptor_header"})
+                raw = bytes(header)
+                status = "byte_budget"
+            else:
+                tail = ida_bytes.get_bytes(typeinfo_ea + header_len, max(0, wanted - header_len))
+                bytes_read += max(0, wanted - header_len)
+                raw = bytes(header) + (bytes(tail) if tail else b"")
+                status = "header_read" if tail is not None or wanted == header_len else "truncated_header"
+                if descriptor_kind == "single_inheritance" and len(raw) >= header_len + pointer_size:
+                    base_ea = int.from_bytes(raw[header_len:header_len + pointer_size], byteorder)
+                    if ida_segment.getseg(base_ea) is not None and base_ea not in seen:
+                        queue.append(base_ea)
+                if descriptor_kind == "multiple_or_virtual_inheritance" and len(raw) >= header_len + 8:
+                    count = int.from_bytes(raw[header_len + 4:header_len + 8], byteorder)
+                    bounded_count = min(count, max_bases)
+                    desired = header_len + 8 + bounded_count * 2 * pointer_size
+                    extra = desired - len(raw)
+                    if extra > 0 and bytes_read + extra <= max_bytes:
+                        more = ida_bytes.get_bytes(typeinfo_ea + len(raw), extra)
+                        bytes_read += extra
+                        if more:
+                            raw += bytes(more)
+                        else:
+                            status = "truncated_base_array"
+                    elif extra > 0:
+                        status = "byte_budget_base_array"
+                    entries_start = header_len + 8
+                    for index in range(min(count, max_bases)):
+                        entry = entries_start + index * 2 * pointer_size
+                        if entry + pointer_size > len(raw):
+                            break
+                        base_ea = int.from_bytes(raw[entry:entry + pointer_size], byteorder)
+                        if ida_segment.getseg(base_ea) is not None and base_ea not in seen:
+                            queue.append(base_ea)
+        items.append({"typeinfo_ea": typeinfo_ea, "descriptor_kind": descriptor_kind,
+            "descriptor_symbol": descriptor_symbol or None, "symbol": ida_name.get_name(typeinfo_ea) or None,
+            "type_name_ea": name_ea, "type_name_symbol": type_name_symbol,
+            "type_name": type_name, "raw_hex": raw.hex(), "read_status": status})
+    if queue:
+        skipped.extend({"typeinfo_ea": ea, "reason": "object_limit_or_byte_budget"} for ea in queue[:256])
+    return {"items": items, "coverage": {"root_count": len(roots), "objects_seen": len(seen),
+        "objects_decoded": len(items), "bytes_read": bytes_read, "max_objects": max_objects,
+        "max_bytes": max_bytes, "max_bases": max_bases, "pointer_size": pointer_size,
+        "byteorder": byteorder, "truncated": bool(queue or skipped),
+        "skipped": skipped, "source": "bounded_typeinfo_objects_reached_from_itanium_address_point_prefixes"}}
 
 
 def synchronize_function(output: str | Path, idb_path: str | Path, address: int) -> dict:
@@ -953,24 +1106,14 @@ def synchronize_function(output: str | Path, idb_path: str | Path, address: int)
                     views["microcode"] = export_views(target, [ea], "microcode")
                 if target.execute("SELECT 1 FROM micro_flow WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
                     views["micro_flow"] = export_views(target, [ea], "micro_flow")
-                stale_calls = [row[0] for row in target.execute(
-                    "SELECT call_id FROM vcall_sites WHERE function_ea=? AND stale=0", (sqlite_ea(ea),))]
-                if stale_calls:
-                    placeholders = ",".join("?" for _ in stale_calls)
-                    target.execute(f"UPDATE vcall_sites SET stale=1 WHERE call_id IN ({placeholders})", stale_calls)
-                    target.execute(f"UPDATE vcall_targets SET stale=1 WHERE call_id IN ({placeholders})", stale_calls)
-                    target.execute(f"UPDATE receiver_flows SET stale=1 WHERE call_id IN ({placeholders})", stale_calls)
-                    run_ids = [row[0] for row in target.execute(
-                        f"SELECT DISTINCT run_id FROM vcall_sites WHERE call_id IN ({placeholders})", stale_calls)]
-                    if run_ids:
-                        run_placeholders = ",".join("?" for _ in run_ids)
-                        target.execute(f"UPDATE vcall_runs SET status='stale' WHERE run_id IN ({run_placeholders})", run_ids)
+                invalidated = views.get("microcode", {}).get("virtual_artifacts_invalidated",
+                    {"vcall_sites": 0, "vptr_writes": 0})
                 set_metadata(target, {f"function_sync:{ea:X}": utc_now()})
                 target.commit()
                 if not ida_loader.save_database(str(idb_path), 0):
                     raise RuntimeError("IDA failed to save locally synchronized database")
                 target.backup(source)
-    return {"function_ea": ea, "views": views, "stale_vcall_sites": len(stale_calls),
+    return {"function_ea": ea, "views": views, "invalidated_virtual_artifacts": invalidated,
             "scope": "function-local views"}
 
 

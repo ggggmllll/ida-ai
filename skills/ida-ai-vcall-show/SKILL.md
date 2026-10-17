@@ -9,6 +9,6 @@ python -m ida_ai vcall-show --db ANALYSIS.sqlite --address ADDRESS
 python -m ida_ai vcall-show --db ANALYSIS.sqlite --call-id VCALL... --include-stale
 ```
 
-This is an offline read. It returns the microcode location, receiver/callee expressions, slot and vptr offsets, definition-chain evidence, saved targets, and receiver flows. `--include-stale` is for historical comparison only.
+This is an offline read. It returns the microcode location, receiver/callee expressions, slot and vptr offsets, definition-chain evidence, saved targets, and receiver flows, including any stored prior vptr-write candidate links. `--include-stale` is for historical comparison only.
 
 The stored `kind` remains `indirect_call`; `status=vtable_pattern_candidate` is a detector result, not a C++ confirmation. Saved target rows retain entry classifications (including thunk, nullstub, and library traits); a library flag does not prove dynamic import, and runtime-stub labels are based on names. Use source hashes and the job's evidence revision when handing the result to another analysis job.

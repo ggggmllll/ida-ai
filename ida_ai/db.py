@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def sqlite_ea(address: int) -> int:
@@ -391,6 +391,34 @@ CREATE TABLE IF NOT EXISTS vtable_evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_vtable_evidence_subject ON vtable_evidence(subject_kind,subject_id,stale);
 
+-- Bounded Itanium RTTI object decoding is a separate, versioned observation.
+-- Keeping it separate lets a vtable run state exactly which bytes were
+-- available without treating an aligned-pointer scan as full memory coverage.
+CREATE TABLE IF NOT EXISTS rtti_runs (
+    rtti_run_id TEXT PRIMARY KEY,
+    input_snapshot_hash TEXT NOT NULL,
+    descriptor_snapshot_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rtti_runs_input ON rtti_runs(input_snapshot_hash,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS rtti_typeinfos (
+    rtti_run_id TEXT NOT NULL REFERENCES rtti_runs(rtti_run_id),
+    typeinfo_ea INTEGER NOT NULL,
+    descriptor_kind TEXT,
+    parse_status TEXT NOT NULL,
+    type_name_ea INTEGER,
+    type_name TEXT,
+    flags INTEGER,
+    base_count INTEGER,
+    bases_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(rtti_run_id,typeinfo_ea)
+);
+CREATE INDEX IF NOT EXISTS idx_rtti_typeinfos_ea ON rtti_typeinfos(typeinfo_ea,rtti_run_id);
+
 CREATE TABLE IF NOT EXISTS vcall_runs (
     run_id TEXT PRIMARY KEY,
     source_snapshot_hash TEXT NOT NULL,
@@ -424,6 +452,36 @@ CREATE TABLE IF NOT EXISTS vcall_sites (
 CREATE INDEX IF NOT EXISTS idx_vcall_sites_ea ON vcall_sites(call_ea,stale);
 CREATE INDEX IF NOT EXISTS idx_vcall_sites_function ON vcall_sites(function_ea,stale);
 CREATE INDEX IF NOT EXISTS idx_vcall_sites_status ON vcall_sites(status,stale);
+
+CREATE TABLE IF NOT EXISTS vptr_write_runs (
+    run_id TEXT PRIMARY KEY,
+    source_snapshot_hash TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    detector_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vptr_write_runs_snapshot ON vptr_write_runs(source_snapshot_hash,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vptr_writes (
+    write_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES vptr_write_runs(run_id),
+    function_ea INTEGER NOT NULL,
+    write_ea INTEGER,
+    block_serial INTEGER,
+    ordinal INTEGER,
+    object_json TEXT NOT NULL DEFAULT '{}',
+    vptr_offset INTEGER,
+    address_point INTEGER,
+    candidate_id TEXT,
+    status TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_vptr_writes_function ON vptr_writes(function_ea,block_serial,ordinal,stale);
+CREATE INDEX IF NOT EXISTS idx_vptr_writes_address_point ON vptr_writes(address_point,stale);
 
 CREATE TABLE IF NOT EXISTS vcall_targets (
     call_id TEXT NOT NULL REFERENCES vcall_sites(call_id),
@@ -658,6 +716,9 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
         connection.execute(f"UPDATE {table} SET stale=1")
     connection.execute("UPDATE vtable_runs SET status='stale' WHERE status NOT IN ('stale','error')")
     connection.execute("UPDATE vcall_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+    connection.execute("UPDATE rtti_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+    connection.execute("UPDATE vptr_write_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+    connection.execute("UPDATE vptr_writes SET stale=1")
 
     tables = (
         "symbols",

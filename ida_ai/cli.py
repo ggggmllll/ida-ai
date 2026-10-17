@@ -18,6 +18,7 @@ from .type_features import normalize_spec, scan_type_features
 from .propagation import add_edge as add_propagation_edge, add_seed as add_propagation_seed
 from .propagation import accept_propagation, preview_seed, show_node as show_propagation_node
 from .virtual_tables import (analyze_vcall, build_vcall_index, build_vtable_index,
+                             build_vptr_write_index, list_vptr_writes,
                              list_vcalls, list_vtables, search_vtables,
                              show_vcall, show_vtable)
 from .runner import run_ida
@@ -372,6 +373,25 @@ def _parser() -> argparse.ArgumentParser:
     vcall_show_selector.add_argument("--call-id")
     vcall_show_selector.add_argument("--address")
     vcall_show_parser.add_argument("--include-stale", action="store_true")
+
+    vptr_write_build = commands.add_parser("vptr-write-build", help="index function-local stores of indexed vtable address points")
+    _add_db(vptr_write_build)
+    _add_ida(vptr_write_build)
+    vptr_write_selection = vptr_write_build.add_mutually_exclusive_group(required=True)
+    vptr_write_selection.add_argument("--all", action="store_true", dest="all_functions")
+    vptr_write_selection.add_argument("--address", help="address inside one function")
+    vptr_write_selection.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"))
+    vptr_write_selection.add_argument("--name", help="exact function or demangled name")
+    vptr_write_build.add_argument("--no-refresh", action="store_true", help="use exported microcode only")
+    vptr_write_build.add_argument("--max-writes", type=int, default=100000)
+
+    vptr_write_list = commands.add_parser("vptr-write-list", help="list current observed vptr stores")
+    _add_db(vptr_write_list)
+    vptr_write_list.add_argument("--function", help="filter by containing function start/address")
+    vptr_write_list.add_argument("--address-point", help="filter by indexed address point")
+    vptr_write_list.add_argument("--limit", type=int, default=100)
+    vptr_write_list.add_argument("--offset", type=int, default=0)
+    vptr_write_list.add_argument("--include-stale", action="store_true")
     return parser
 
 
@@ -604,7 +624,9 @@ def _run(args: argparse.Namespace) -> dict:
             refresh = run_ida("export_view", args.db, view="microcode", addresses=addresses,
                               idat=args.idat, timeout=args.timeout)
         with closing(connect(args.db)) as connection:
+            vptr_writes = build_vptr_write_index(connection, function_eas=addresses)
             result = build_vcall_index(connection, function_eas=addresses, max_calls=args.max_calls)
+        result["vptr_write_index"] = vptr_writes
         result["refresh"] = refresh
         result["scope"] = {"function_count": len(addresses),
                             "function_addresses": [f"0x{address:X}" for address in addresses],
@@ -619,6 +641,37 @@ def _run(args: argparse.Namespace) -> dict:
             return show_vcall(connection, call_id=args.call_id,
                               address=parse_int(args.address) if args.address is not None else None,
                               include_stale=args.include_stale)
+    if args.command == "vptr-write-build":
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite analysis database does not exist: {args.db}")
+        if args.max_writes < 1:
+            raise ValueError("max_writes must be positive")
+        with closing(connect(args.db)) as connection:
+            addresses = select_function_addresses(connection, all_functions=args.all_functions,
+                address=args.address, address_range=args.address_range, name=args.name)
+        refresh = None
+        if not args.no_refresh:
+            refresh = run_ida("export_view", args.db, view="microcode", addresses=addresses,
+                              idat=args.idat, timeout=args.timeout)
+        with closing(connect(args.db)) as connection:
+            result = build_vptr_write_index(connection, function_eas=addresses, max_writes=args.max_writes)
+        result["refresh"] = refresh
+        result["scope"] = {"function_count": len(addresses),
+            "function_addresses": [f"0x{address:X}" for address in addresses],
+            "refreshed": not args.no_refresh}
+        return result
+    if args.command == "vptr-write-list":
+        with closing(connect(args.db)) as connection:
+            function_ea = None
+            if args.function is not None:
+                selected = select_function_addresses(connection, address=args.function)
+                if not selected:
+                    raise ValueError(f"no function contains {args.function}")
+                function_ea = selected[0]
+            return list_vptr_writes(connection,
+                function_ea=function_ea,
+                address_point=parse_int(args.address_point) if args.address_point is not None else None,
+                limit=args.limit, offset=args.offset, include_stale=args.include_stale)
     options = {"idat": args.idat, "timeout": args.timeout}
     if args.command == "sync":
         result = run_ida("sync", args.db, all_views=args.all_views,

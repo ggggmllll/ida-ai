@@ -10,14 +10,19 @@ from ida_ai.cli import _parser, _run
 from ida_ai.db import connect, reset_analysis, set_metadata, sqlite_ea
 from ida_ai.virtual_tables import (
     _trace_vcall_pattern,
+    _source_hash,
     analyze_vcall,
     build_vcall_index,
     build_vtable_index,
+    build_vptr_write_index,
+    invalidate_function_virtual_artifacts,
     list_vcalls,
     list_vtables,
+    parse_itanium_typeinfo_descriptor,
     search_vtables,
     show_vcall,
     show_vtable,
+    store_itanium_rtti_descriptors,
 )
 
 
@@ -178,6 +183,82 @@ class VirtualTableTests(unittest.TestCase):
         rerun = build_vtable_index(self.connection, abi="itanium")
         self.assertTrue(rerun["cached"])
 
+    def test_parse_itanium_vmi_bases_with_signed_offsets_and_flags(self):
+        def word(value: int, width: int) -> bytes:
+            return int(value).to_bytes(width, "little", signed=False)
+
+        negative_offset_flags = ((-0x18 << 8) | 0x3) & ((1 << 64) - 1)
+        raw = (word(0x8000, 8) + word(0x9000, 8) + word(0x2, 4) + word(2, 4)
+               + word(0xA000, 8) + word(negative_offset_flags, 8)
+               + word(0xB000, 8) + word((0x20 << 8) | 0x2, 8))
+        parsed = parse_itanium_typeinfo_descriptor(typeinfo_ea=0x7000,
+            descriptor_kind="multiple_or_virtual_inheritance", raw=raw,
+            pointer_size=8, byteorder="little")
+        self.assertEqual(parsed["parse_status"], "parsed")
+        self.assertEqual(parsed["flags"], 2)
+        self.assertTrue(parsed["evidence"]["vmi_header"]["diamond_shaped"])
+        self.assertEqual([base["typeinfo_ea"] for base in parsed["bases"]], [0xA000, 0xB000])
+        self.assertEqual(parsed["bases"][0]["byte_offset"], -0x18)
+        self.assertTrue(parsed["bases"][0]["is_virtual"])
+        self.assertTrue(parsed["bases"][0]["is_public"])
+        self.assertEqual(parsed["bases"][1]["byte_offset"], 0x20)
+        self.assertFalse(parsed["bases"][1]["is_virtual"])
+
+    def test_itanium_descriptor_missing_and_truncated_bytes_remain_unknown(self):
+        unknown = parse_itanium_typeinfo_descriptor(typeinfo_ea=0x7000,
+            descriptor_kind=None, raw=b"\0" * 16, pointer_size=8, byteorder="little")
+        self.assertEqual(unknown["parse_status"], "unknown_descriptor_kind")
+        truncated = parse_itanium_typeinfo_descriptor(typeinfo_ea=0x7000,
+            descriptor_kind="multiple_or_virtual_inheritance", raw=b"\0" * 20,
+            pointer_size=8, byteorder="little")
+        self.assertEqual(truncated["parse_status"], "truncated_vmi_header")
+
+    def test_store_rtti_descriptor_run_is_versioned_and_append_only(self):
+        raw = (0x8000).to_bytes(8, "little") + (0x9000).to_bytes(8, "little")
+        observation = {"typeinfo_ea": 0x7000, "descriptor_kind": "class_type_info",
+            "descriptor_symbol": "_ZTVN10__cxxabiv117__class_type_infoE",
+            "symbol": "_ZTI3Foo", "type_name_ea": 0x9000, "type_name_symbol": "_ZTS3Foo",
+            "type_name": "3Foo", "raw_hex": raw.hex(), "read_status": "header_read"}
+        coverage = {"pointer_size": 8, "byteorder": "little", "max_bases": 128, "truncated": False}
+        first = store_itanium_rtti_descriptors(self.connection,
+            input_snapshot_hash="snapshot-one", descriptors=[observation], coverage=coverage)
+        second = store_itanium_rtti_descriptors(self.connection,
+            input_snapshot_hash="snapshot-two", descriptors=[observation], coverage=coverage)
+        self.assertNotEqual(first["rtti_run_id"], second["rtti_run_id"])
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM rtti_runs").fetchone()[0], 2)
+        row = self.connection.execute("SELECT parse_status,base_count FROM rtti_typeinfos WHERE rtti_run_id=?",
+            (second["rtti_run_id"],)).fetchone()
+        self.assertEqual(tuple(row), ("parsed_no_bases", 0))
+
+    def test_vtable_snapshot_and_candidate_include_matching_rtti_run(self):
+        self.connection.executemany(
+            "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(sqlite_ea(0x4FF0), 0, None, 8, ".data.rel.ro", None, None, None, "scalar", "now"),
+             (0x4FF8, 0x6000, 0x6000, 8, ".data.rel.ro", ".data.rel.ro", None, "_ZTI3Foo", "data", "now"),
+             (0x6000, 0x7010, 0x7010, 8, ".data.rel.ro", ".data.rel.ro", None,
+              "_ZTVN10__cxxabiv117__class_type_infoE", "data", "now"),
+             (0x6008, 0x8000, 0x8000, 8, ".data.rel.ro", ".rodata", None, "_ZTS3Foo", "data", "now")],
+        )
+        self.connection.executemany("INSERT INTO symbols(address,name,type) VALUES(?,?,NULL)",
+            [(0x4FF0, "_ZTV3Foo"), (0x6000, "_ZTI3Foo"),
+             (0x7000, "_ZTVN10__cxxabiv117__class_type_infoE"), (0x8000, "_ZTS3Foo")])
+        self.connection.commit()
+        base_hash = _source_hash(self.connection, "vtable", include_rtti=False)
+        raw = (0x7010).to_bytes(8, "little") + (0x8000).to_bytes(8, "little")
+        stored = store_itanium_rtti_descriptors(self.connection, input_snapshot_hash=base_hash,
+            descriptors=[{"typeinfo_ea": 0x6000, "descriptor_kind": "class_type_info",
+                "descriptor_symbol": "_ZTVN10__cxxabiv117__class_type_infoE",
+                "symbol": "_ZTI3Foo", "type_name_ea": 0x8000, "type_name_symbol": "_ZTS3Foo",
+                "type_name": "3Foo", "raw_hex": raw.hex(), "read_status": "header_read"}],
+            coverage={"pointer_size": 8, "byteorder": "little", "max_bases": 128, "truncated": False})
+        result = build_vtable_index(self.connection, abi="itanium")
+        candidate = show_vtable(self.connection, address=0x5000)["items"][0]
+        self.assertEqual(candidate["evidence"]["rtti_run_id"], stored["rtti_run_id"])
+        self.assertEqual(candidate["evidence"]["typeinfo_descriptor"]["parse_status"], "parsed_no_bases")
+        self.assertEqual(candidate["evidence"]["class_relationship_status"], "descriptor_has_no_base_edges")
+        self.assertEqual(result["rtti_typeinfo_count"], 1)
+
     def test_vtable_keeps_nonzero_offset_to_top_as_weak_prefix_evidence(self):
         self.connection.executemany(
             "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
@@ -280,10 +361,19 @@ class VirtualTableTests(unittest.TestCase):
         analyzed = analyze_vcall(self.connection, call_id=site["call_id"])
         self.assertEqual(analyzed["resolution"]["resolution_status"], "candidate_set")
         self.assertEqual(len(analyzed["resolution"]["targets"]), 1)
+        self.assertEqual(analyzed["resolution"]["prior_vptr_writes"]["status"], "not_indexed")
         self.assertEqual(analyzed["resolution"]["targets"][0]["target_ea"], 0x1200)
         shown = show_vcall(self.connection, call_id=site["call_id"])
         self.assertEqual(len(shown["targets"]), 1)
         self.assertEqual(shown["targets"][0]["entry_classification"], "thunk")
+
+        build_vptr_write_index(self.connection, function_eas=[0x2000])
+        analyzed = analyze_vcall(self.connection, call_id=site["call_id"])
+        self.assertEqual(analyzed["resolution"]["prior_vptr_writes"]["status"], "no_matching_observed_store")
+        shown = show_vcall(self.connection, call_id=site["call_id"])
+        self.assertEqual(len(shown["receiver_flows"]), 1)
+        self.assertEqual(shown["receiver_flows"][0]["status"], "unknown")
+        self.assertEqual(shown["receiver_flows"][0]["edge"]["kind"], "prior_vptr_write_scan_result")
 
     def test_rebuilding_vtable_index_stales_saved_vcall_targets(self):
         function = self._add_vcall_fixture()
@@ -301,6 +391,63 @@ class VirtualTableTests(unittest.TestCase):
         historical = show_vcall(self.connection, call_id=site["call_id"], include_stale=True)
         self.assertEqual(len(historical["targets"]), 1)
         self.assertTrue(historical["targets"][0]["stale"])
+
+    def test_prior_same_function_vptr_store_is_linked_as_candidate_evidence(self):
+        function = self._add_vcall_fixture()
+        rows = [tuple(row) for row in self.connection.execute(
+            "SELECT * FROM micro_instructions WHERE function_ea=? ORDER BY block_serial,ordinal",
+            (sqlite_ea(function),))]
+        self.connection.execute("DELETE FROM micro_instructions WHERE function_ea=?", (sqlite_ea(function),))
+        store = _insn(function, 0, 0, function - 4, "stx", _number(0x5000),
+            _operand("empty"), _nested("add", _reg(99, register=0), _number(0x10), function - 4))
+        shifted = [tuple([row[0], row[1], row[2] + 1, row[3] + 4, *row[4:]]) for row in rows]
+        self.connection.executemany("INSERT INTO micro_instructions VALUES(?,?,?,?,?,?,?,?,?)", [store, *shifted])
+        self.connection.execute("UPDATE microcode SET instruction_count=? WHERE function_ea=?",
+            (len(shifted) + 1, sqlite_ea(function)))
+        self.connection.commit()
+        build_vtable_index(self.connection, abi="itanium")
+        writes = build_vptr_write_index(self.connection, function_eas=[function])
+        self.assertEqual(writes["write_count"], 1)
+        indexed = self.connection.execute("SELECT * FROM vptr_writes WHERE stale=0").fetchone()
+        self.assertEqual(indexed["address_point"], sqlite_ea(0x5000))
+        build_vcall_index(self.connection, function_eas=[function])
+        call = list_vcalls(self.connection, function_ea=function)["items"][0]
+        analyzed = analyze_vcall(self.connection, call_id=call["call_id"])
+        prior = analyzed["resolution"]["prior_vptr_writes"]
+        self.assertEqual(prior["status"], "candidate")
+        self.assertEqual(prior["items"][0]["order_relation"], "same_block_prior_store")
+        self.assertTrue(analyzed["resolution"]["targets"][0]["matching_prior_vptr_write_candidate"])
+        shown = show_vcall(self.connection, call_id=call["call_id"])
+        self.assertEqual(len(shown["receiver_flows"]), 1)
+        self.assertEqual(shown["receiver_flows"][0]["edge"]["kind"], "observed_prior_vptr_store_candidate")
+
+    def test_vptr_write_cache_retains_partial_status_and_function_refresh_stales_it(self):
+        function = self._add_vcall_fixture()
+        build_vtable_index(self.connection, abi="itanium")
+        first = build_vptr_write_index(self.connection, function_eas=[function, 0xDEAD])
+        self.assertEqual(first["status"], "partial")
+        cached = build_vptr_write_index(self.connection, function_eas=[function, 0xDEAD])
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["status"], "partial")
+        empty_run = build_vptr_write_index(self.connection, function_eas=[function])
+        self.assertEqual(empty_run["write_count"], 0)
+        calls = build_vcall_index(self.connection, function_eas=[function])
+        self.assertEqual(calls["site_count"], 1)
+        self.connection.execute("INSERT INTO vptr_writes(write_id,run_id,function_ea,status,evidence_json,source_snapshot_hash) "
+            "VALUES(?,?,?,?,?,?)", ("fixture-write", empty_run["run_id"], sqlite_ea(function), "test", "{}", "fixture"))
+        self.connection.commit()
+        from ida_ai.jobs import _artifact_fingerprint
+        before = _artifact_fingerprint(self.connection, "vptr:fixture-write")
+        invalidated = invalidate_function_virtual_artifacts(self.connection, [function])
+        self.assertEqual(invalidated["vptr_writes"], 1)
+        self.assertEqual(self.connection.execute("SELECT stale FROM vptr_writes WHERE write_id='fixture-write'").fetchone()[0], 1)
+        self.assertEqual(self.connection.execute("SELECT status FROM vptr_write_runs WHERE run_id=?",
+            (empty_run["run_id"],)).fetchone()[0], "stale")
+        self.assertEqual(self.connection.execute("SELECT status FROM vptr_write_runs WHERE run_id=?",
+            (empty_run["run_id"],)).fetchone()[0], "stale")
+        self.assertEqual(self.connection.execute("SELECT status FROM vcall_runs WHERE run_id=?",
+            (calls["run_id"],)).fetchone()[0], "stale")
+        self.assertNotEqual(before, _artifact_fingerprint(self.connection, "vptr:fixture-write"))
 
     def test_table_slot_classifications_preserve_nullstub_runtime_and_library_traits(self):
         self.connection.executemany(
@@ -397,6 +544,18 @@ class VirtualTableTests(unittest.TestCase):
             search_vtables(self.connection)
         with self.assertRaisesRegex(ValueError, "unsupported ABI"):
             build_vtable_index(self.connection, abi="msvc")
+        function = self._add_vcall_fixture()
+        args = parser.parse_args(["vptr-write-build", "--db", str(self.db_path),
+            "--address", hex(function), "--no-refresh"])
+        self.assertEqual(_run(args)["coverage"]["selected_functions"], 1)
+        args = parser.parse_args(["vptr-write-list", "--db", str(self.db_path),
+            "--function", hex(function)])
+        self.assertEqual(_run(args)["total"], 0)
+        args = parser.parse_args(["vcall-build", "--db", str(self.db_path),
+            "--address", hex(function), "--no-refresh"])
+        result = _run(args)
+        self.assertIn("vptr_write_index", result)
+        self.assertEqual(result["site_count"], 1)
 
 
 if __name__ == "__main__":

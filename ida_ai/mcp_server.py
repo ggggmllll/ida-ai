@@ -14,8 +14,11 @@ from .db import connect
 from .runner import run_ida
 from .selection import parse_int, select_function_addresses
 from .text_search import search_code as _search_code
-from .virtual_tables import (analyze_vcall as _analyze_vcall, list_vcalls as _list_vcalls,
+from .virtual_tables import (analyze_vcall as _analyze_vcall, build_vcall_index as _build_vcall_index,
+                             list_vcalls as _list_vcalls,
                              list_vtables as _list_vtables, search_vtables as _search_vtables,
+                             list_vptr_writes as _list_vptr_writes,
+                             build_vptr_write_index as _build_vptr_write_index,
                              show_vcall as _show_vcall, show_vtable as _show_vtable)
 
 
@@ -38,7 +41,8 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
                 tables = ("functions", "xrefs", "basic_blocks", "disassembly", "pseudocode", "microcode", "micro_instructions",
                           "micro_blocks", "micro_value_refs", "micro_flow", "micro_flow_instructions", "propagation_runs", "propagation_nodes",
                           "propagation_edges", "propagation_constraints", "data_pointer_slots", "vtable_runs",
-                          "vtable_candidates", "vtable_slots", "vcall_runs", "vcall_sites", "vcall_targets",
+                          "vtable_candidates", "vtable_slots", "rtti_runs", "rtti_typeinfos",
+                          "vcall_runs", "vcall_sites", "vcall_targets", "vptr_write_runs", "vptr_writes",
                           "receiver_flows", "symbols", "comments", "jobs", "job_revisions")
                 counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
             return {"metadata": metadata, "counts": counts}
@@ -140,10 +144,83 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
             return _show_vcall(connection, call_id=call_id,
                 address=parse_int(address) if address is not None else None, include_stale=include_stale)
 
+    @app.tool()
+    def vptr_write_list(function_address: str | None = None, address_point: str | None = None,
+                        limit: int = 100, offset: int = 0,
+                        include_stale: bool = False) -> dict:
+        """List indexed function-local stores of known table address points."""
+        with ida_lock, closing(connect(database)) as connection:
+            function_ea = None
+            if function_address is not None:
+                selected = select_function_addresses(connection, address=function_address)
+                if not selected:
+                    raise ValueError(f"no function contains {function_address}")
+                function_ea = selected[0]
+            return _list_vptr_writes(connection,
+                function_ea=function_ea,
+                address_point=parse_int(address_point) if address_point is not None else None,
+                limit=limit, offset=offset, include_stale=include_stale)
+
+    @app.tool()
+    def index_vptr_writes(
+        all_functions: bool = False, address: str | None = None, name: str | None = None,
+        start_address: str | None = None, end_address: str | None = None,
+        max_writes: int = 100000,
+    ) -> dict:
+        """Refresh selected microcode and index exact stores of existing vtable candidates."""
+        selectors = int(all_functions) + int(address is not None) + int(name is not None) + int(
+            start_address is not None or end_address is not None)
+        if selectors != 1:
+            raise ValueError("choose exactly one of all_functions, address, name, or start/end range")
+        if max_writes < 1:
+            raise ValueError("max_writes must be positive")
+        if (start_address is None) != (end_address is None):
+            raise ValueError("provide both start_address and end_address")
+        address_range = [start_address, end_address] if start_address is not None else None
+        with ida_lock:
+            with closing(connect(database)) as connection:
+                addresses = select_function_addresses(connection, all_functions=all_functions,
+                    address=address, address_range=address_range, name=name)
+            refresh = run_ida("export_view", database, idat=idat, timeout=timeout,
+                addresses=addresses, view="microcode")
+            with closing(connect(database)) as connection:
+                result = _build_vptr_write_index(connection, function_eas=addresses, max_writes=max_writes)
+            result["refresh"] = refresh
+            return result
+
+    @app.tool()
+    def index_virtual_calls(
+        all_functions: bool = False, address: str | None = None, name: str | None = None,
+        start_address: str | None = None, end_address: str | None = None,
+        max_calls: int = 100000, max_writes: int = 100000,
+    ) -> dict:
+        """Refresh microcode, then index indirect calls and exact same-function vptr stores."""
+        selectors = int(all_functions) + int(address is not None) + int(name is not None) + int(
+            start_address is not None or end_address is not None)
+        if selectors != 1:
+            raise ValueError("choose exactly one of all_functions, address, name, or start/end range")
+        if max_calls < 1 or max_writes < 1:
+            raise ValueError("max_calls and max_writes must be positive")
+        if (start_address is None) != (end_address is None):
+            raise ValueError("provide both start_address and end_address")
+        address_range = [start_address, end_address] if start_address is not None else None
+        with ida_lock:
+            with closing(connect(database)) as connection:
+                addresses = select_function_addresses(connection, all_functions=all_functions,
+                    address=address, address_range=address_range, name=name)
+            refresh = run_ida("export_view", database, idat=idat, timeout=timeout,
+                addresses=addresses, view="microcode")
+            with closing(connect(database)) as connection:
+                writes = _build_vptr_write_index(connection, function_eas=addresses, max_writes=max_writes)
+                calls = _build_vcall_index(connection, function_eas=addresses, max_calls=max_calls)
+            calls["vptr_write_index"] = writes
+            calls["refresh"] = refresh
+            return calls
+
     @app.resource("ida://database/schema")
     def database_schema() -> str:
         """Describe the core analysis tables available to sql_query."""
-        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs, basic_blocks, cfg_edges, disassembly, instructions, pseudocode, microcode, micro_instructions, micro_blocks, micro_value_refs, micro_flow, micro_flow_instructions, data_pointer_slots, vtable_runs, vtable_candidates, vtable_slots, vtable_evidence, vcall_runs, vcall_sites, vcall_targets, receiver_flows, propagation_runs, propagation_nodes, propagation_edges, propagation_constraints, symbols, comments, type_definitions, type_assignments, memory_bytes, pointers, search_matches, operations, jobs, job_revisions. microcode.relations_json contains relation coverage metadata; query micro_blocks for CFG predecessors/successors and micro_value_refs for direct register value-number definition/use locations. These are not complete SSA or an alias graph. vtable_candidates are heuristic data-sequence candidates, not confirmed C++ classes; vcall_sites distinguish indirect calls from two-load vtable-shaped candidates, and target rows are slot compatibility only until receiver reachability is established. Rows carry source hashes and stale flags. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation remains a bounded evidence graph."""
+        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs, basic_blocks, cfg_edges, disassembly, instructions, pseudocode, microcode, micro_instructions, micro_blocks, micro_value_refs, micro_flow, micro_flow_instructions, data_pointer_slots, vtable_runs, vtable_candidates, vtable_slots, vtable_evidence, rtti_runs, rtti_typeinfos, vcall_runs, vcall_sites, vcall_targets, vptr_write_runs, vptr_writes, receiver_flows, propagation_runs, propagation_nodes, propagation_edges, propagation_constraints, symbols, comments, type_definitions, type_assignments, memory_bytes, pointers, search_matches, operations, jobs, job_revisions. microcode.relations_json contains relation coverage metadata; query micro_blocks for CFG predecessors/successors and micro_value_refs for direct register value-number definition/use locations. These are not complete SSA or an alias graph. vtable_candidates are heuristic data-sequence candidates, not confirmed C++ classes; RTTI base descriptors are structural metadata only; vptr_writes are exact stores of known address points, not proof of object lifetime or constructor identity; vcall_sites are indirect-call/two-load pattern candidates and saved targets remain slot-compatible possibilities with receiver/object reachability unresolved. Prior same-function vptr stores require exact exported identity and CFG order, but aliases, calls, and memory writes can invalidate them. Rows carry source hashes and stale flags. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation remains a bounded evidence graph."""
 
     if unsafe:
         def mutate(kind: str, values: dict) -> dict:

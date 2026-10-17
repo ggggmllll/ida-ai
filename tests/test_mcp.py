@@ -54,7 +54,8 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     names = {item.name for item in tools.tools}
                     self.assertTrue({"database_summary", "sql_query", "search_code", "export_functions",
                                      "vtable_list", "vtable_show", "vtable_search", "vcall_list",
-                                     "analyze_virtual_call", "vcall_show"} <= names)
+                                     "analyze_virtual_call", "vcall_show", "vptr_write_list",
+                                     "index_vptr_writes", "index_virtual_calls"} <= names)
                     self.assertNotIn("set_assembly_comment", names)
                     results = await session.call_tool(
                         "search_code",
@@ -62,6 +63,9 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertFalse(results.isError, results.content[0].text if results.content else "no MCP error payload")
                     self.assertIn("target_func", results.content[0].text)
+                    writes = await session.call_tool("vptr_write_list", {"function_address": "0x1000"})
+                    self.assertFalse(writes.isError, writes.content[0].text if writes.content else "")
+                    self.assertIn('"total": 0', writes.content[0].text)
                     self.assertIn("pseudocode_comment", results.content[0].text)
                     regex_results = await session.call_tool(
                         "search_code",
@@ -76,6 +80,8 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("job_revisions", schema.contents[0].text)
                     self.assertIn("vtable_candidates", schema.contents[0].text)
                     self.assertIn("vcall_sites", schema.contents[0].text)
+                    self.assertIn("vptr_writes", schema.contents[0].text)
+                    self.assertIn("rtti_typeinfos", schema.contents[0].text)
                     denied = await session.call_tool(
                         "sql_query", {"query": "DELETE FROM functions", "limit": 10}
                     )

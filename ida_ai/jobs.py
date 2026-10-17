@@ -35,6 +35,8 @@ def analysis_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
         "functions", "xrefs", "basic_blocks", "cfg_edges", "symbols", "comments",
         "disassembly", "instructions", "pseudocode", "microcode", "micro_instructions",
         "micro_blocks", "micro_value_refs", "micro_flow", "micro_flow_instructions",
+        "vtable_candidates", "vtable_slots", "vcall_sites", "vcall_targets", "vptr_writes",
+        "vtable_runs", "vcall_runs", "vptr_write_runs", "rtti_runs", "rtti_typeinfos",
     ):
         counts[table] = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     view_epochs = {
@@ -64,9 +66,10 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
             "micro_flow": "function_ea",
             "functions": "start_ea", "instructions": "ea"}
     if not separator or table not in keys:
-        if separator and table in ("vtable", "vcall"):
-            artifact_table = "vtable_candidates" if table == "vtable" else "vcall_sites"
-            id_column = "candidate_id" if table == "vtable" else "call_id"
+        if separator and table in ("vtable", "vcall", "vptr"):
+            artifact_table = {"vtable": "vtable_candidates", "vcall": "vcall_sites",
+                "vptr": "vptr_writes"}[table]
+            id_column = {"vtable": "candidate_id", "vcall": "call_id", "vptr": "write_id"}[table]
             row = connection.execute(f"SELECT * FROM {artifact_table} WHERE {id_column}=?", (address,)).fetchone()
             if row is None:
                 return hashlib.sha256(b"missing").hexdigest()
@@ -75,13 +78,57 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
                 data["slots"] = [tuple(slot) for slot in connection.execute(
                     "SELECT slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,entry_classification,is_nullstub,is_library,is_thunk,thunk_target_ea,thunk_chain_json,adjustment_json,evidence_json,source_snapshot_hash,stale "
                     "FROM vtable_slots WHERE candidate_id=? ORDER BY slot_index", (address,))]
-            else:
+            elif table == "vcall":
                 data["targets"] = [tuple(target) for target in connection.execute(
                     "SELECT candidate_id,slot_index,target_ea,thunk_target_ea,status,reason,evidence_json,source_snapshot_hash,stale "
                     "FROM vcall_targets WHERE call_id=? ORDER BY target_id", (address,))]
                 data["flows"] = [tuple(flow) for flow in connection.execute(
                     "SELECT path_order,node_json,edge_json,status,source_snapshot_hash,stale "
                     "FROM receiver_flows WHERE call_id=? ORDER BY path_order", (address,))]
+            else:
+                data["run"] = dict(connection.execute(
+                    "SELECT * FROM vptr_write_runs WHERE run_id=?", (row["run_id"],)).fetchone() or {})
+            return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
+        if separator and table in ("vtable_run", "vcall_run", "vptr_run", "rtti"):
+            try:
+                key = sqlite_ea(parse_int(address)) if table == "rtti" else address
+            except (TypeError, ValueError):
+                return None
+            specs = {
+                "vtable_run": ("vtable_runs", "run_id"),
+                "vcall_run": ("vcall_runs", "run_id"),
+                "vptr_run": ("vptr_write_runs", "run_id"),
+            }
+            if table == "rtti":
+                rows = [dict(item) for item in connection.execute(
+                    "SELECT * FROM rtti_typeinfos WHERE typeinfo_ea=? ORDER BY rtti_run_id", (key,))]
+                for item in rows:
+                    item["run"] = dict(connection.execute(
+                        "SELECT * FROM rtti_runs WHERE rtti_run_id=?", (item["rtti_run_id"],)).fetchone() or {})
+                data = rows
+                if not rows:
+                    return hashlib.sha256(b"missing").hexdigest()
+                return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
+            run_table, id_column = specs[table]
+            run = connection.execute(f"SELECT * FROM {run_table} WHERE {id_column}=?", (key,)).fetchone()
+            if run is None:
+                return hashlib.sha256(b"missing").hexdigest()
+            data = dict(run)
+            if table == "vtable_run":
+                data["candidates"] = [tuple(item) for item in connection.execute(
+                    "SELECT candidate_id,address_point,table_address,table_end,slot_count,status,confidence,evidence_json,stale "
+                    "FROM vtable_candidates WHERE run_id=? ORDER BY candidate_id", (key,))]
+            elif table == "vcall_run":
+                data["sites"] = [tuple(item) for item in connection.execute(
+                    "SELECT call_id,call_ea,function_ea,block_serial,ordinal,status,callee_json,evidence_json,stale "
+                    "FROM vcall_sites WHERE run_id=? ORDER BY call_id", (key,))]
+                data["targets"] = [tuple(item) for item in connection.execute(
+                    "SELECT target_id,candidate_id,slot_index,target_ea,status,reason,evidence_json,stale "
+                    "FROM vcall_targets WHERE call_id IN (SELECT call_id FROM vcall_sites WHERE run_id=?) ORDER BY target_id", (key,))]
+            else:
+                data["writes"] = [tuple(item) for item in connection.execute(
+                    "SELECT write_id,function_ea,write_ea,block_serial,ordinal,object_json,vptr_offset,address_point,candidate_id,status,evidence_json,source_snapshot_hash,stale "
+                    "FROM vptr_writes WHERE run_id=? ORDER BY write_id", (key,))]
             return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
         return None
     try:
