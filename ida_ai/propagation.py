@@ -272,7 +272,7 @@ def _snapshot_hash(connection: sqlite3.Connection) -> str:
         "SELECT start_ea,end_ea FROM functions ORDER BY start_ea,end_ea")]
     flow = [tuple(row) for row in connection.execute(
         "SELECT function_ea,maturity,backend,status,error,decompiler_version,instruction_count,content_hash,"
-        "arguments_json,return_json,locals_json FROM micro_flow ORDER BY function_ea")]
+        "arguments_json,return_json,locals_json,relations_json FROM micro_flow ORDER BY function_ea")]
     encoded = json.dumps({"identity": identity, "functions": functions, "micro_flow": flow},
                          sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

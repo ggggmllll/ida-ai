@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def sqlite_ea(address: int) -> int:
@@ -179,7 +179,8 @@ CREATE TABLE IF NOT EXISTS microcode (
     decompiler_version TEXT,
     instruction_count INTEGER NOT NULL DEFAULT 0,
     content_hash TEXT,
-    generated_at TEXT NOT NULL
+    generated_at TEXT NOT NULL,
+    relations_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS micro_instructions (
     function_ea INTEGER NOT NULL,
@@ -195,6 +196,29 @@ CREATE TABLE IF NOT EXISTS micro_instructions (
 );
 CREATE INDEX IF NOT EXISTS idx_micro_instructions_ea ON micro_instructions(ea);
 CREATE INDEX IF NOT EXISTS idx_micro_instructions_opcode ON micro_instructions(opcode);
+CREATE TABLE IF NOT EXISTS micro_blocks (
+    view_name TEXT NOT NULL CHECK(view_name IN ('microcode','micro_flow')),
+    function_ea INTEGER NOT NULL,
+    block_serial INTEGER NOT NULL,
+    predecessors_json TEXT NOT NULL,
+    successors_json TEXT NOT NULL,
+    instruction_count INTEGER NOT NULL,
+    PRIMARY KEY(view_name,function_ea,block_serial)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_blocks_function ON micro_blocks(function_ea,view_name,block_serial);
+CREATE TABLE IF NOT EXISTS micro_value_refs (
+    view_name TEXT NOT NULL CHECK(view_name IN ('microcode','micro_flow')),
+    function_ea INTEGER NOT NULL,
+    value_number INTEGER NOT NULL,
+    reference_kind TEXT NOT NULL CHECK(reference_kind IN ('definition','use')),
+    block_serial INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    ea INTEGER,
+    operand_path TEXT NOT NULL,
+    PRIMARY KEY(view_name,function_ea,value_number,reference_kind,block_serial,ordinal,operand_path)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_value_refs_number ON micro_value_refs(view_name,value_number,function_ea);
+CREATE INDEX IF NOT EXISTS idx_micro_value_refs_location ON micro_value_refs(view_name,function_ea,block_serial,ordinal);
 
 CREATE TABLE IF NOT EXISTS micro_flow (
     function_ea INTEGER PRIMARY KEY,
@@ -208,7 +232,8 @@ CREATE TABLE IF NOT EXISTS micro_flow (
     generated_at TEXT NOT NULL,
     arguments_json TEXT NOT NULL DEFAULT '[]',
     return_json TEXT NOT NULL DEFAULT '{}',
-    locals_json TEXT NOT NULL DEFAULT '[]'
+    locals_json TEXT NOT NULL DEFAULT '[]',
+    relations_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS micro_flow_instructions (
     function_ea INTEGER NOT NULL,
@@ -554,6 +579,10 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE functions ADD COLUMN thunk_target_ea INTEGER")
     if "is_nullstub" not in function_columns:
         connection.execute("ALTER TABLE functions ADD COLUMN is_nullstub INTEGER NOT NULL DEFAULT 0")
+    for table in ("microcode", "micro_flow"):
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if "relations_json" not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN relations_json TEXT NOT NULL DEFAULT '{{}}'")
     flow_columns = {row[1] for row in connection.execute("PRAGMA table_info(micro_flow)")}
     if "arguments_json" not in flow_columns:
         connection.execute("ALTER TABLE micro_flow ADD COLUMN arguments_json TEXT NOT NULL DEFAULT '[]'")
@@ -610,6 +639,8 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
         "pseudocode",
         "microcode",
         "micro_instructions",
+        "micro_blocks",
+        "micro_value_refs",
         "micro_flow",
         "micro_flow_instructions",
         "memory_bytes",

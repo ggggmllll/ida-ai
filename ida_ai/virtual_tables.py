@@ -19,7 +19,7 @@ from .db import get_metadata, ida_ea, sqlite_ea, utc_now
 
 
 VTABLE_PARSER_VERSION = "1"
-VCALL_DETECTOR_VERSION = "1"
+VCALL_DETECTOR_VERSION = "2"
 SUPPORTED_ABIS = ("itanium",)
 
 
@@ -69,7 +69,7 @@ def _source_hash(connection: sqlite3.Connection, kind: str, function_eas: Iterab
     elif kind == "vcall":
         selected = None if function_eas is None else {sqlite_ea(ea) for ea in function_eas}
         microcode = _rows(connection,
-            "SELECT function_ea,maturity,backend,status,error,decompiler_version,instruction_count,content_hash "
+            "SELECT function_ea,maturity,backend,status,error,decompiler_version,instruction_count,content_hash,relations_json "
             "FROM microcode ORDER BY function_ea")
         if selected is not None:
             microcode = [row for row in microcode if row["function_ea"] in selected]
@@ -431,6 +431,14 @@ def _decode_json(value: str | None) -> dict[str, Any]:
     return result if isinstance(result, dict) else {}
 
 
+def _operand_truncated(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("truncated")) or any(_operand_truncated(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_operand_truncated(child) for child in value)
+    return False
+
+
 def _walk(value: Any) -> Iterable[dict[str, Any]]:
     if not isinstance(value, dict):
         return
@@ -490,32 +498,136 @@ def _instructions_for_function(connection: sqlite3.Connection, function_ea: int)
     return result
 
 
-def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any]) -> dict[str, Any] | None:
+def _microcode_relations_for_function(connection: sqlite3.Connection, function_ea: int,
+                                      summary: sqlite3.Row) -> dict[str, Any]:
+    metadata = _decode_json(summary["relations_json"])
+    cfg_summary = metadata.get("cfg", {})
+    blocks = []
+    for row in connection.execute(
+        "SELECT block_serial,predecessors_json,successors_json,instruction_count FROM micro_blocks "
+        "WHERE view_name='microcode' AND function_ea=? ORDER BY block_serial",
+        (sqlite_ea(function_ea),),
+    ):
+        try:
+            predecessors = json.loads(row["predecessors_json"])
+            successors = json.loads(row["successors_json"])
+        except (TypeError, json.JSONDecodeError):
+            predecessors = successors = None
+        blocks.append({"serial": row["block_serial"], "predecessors": predecessors,
+                       "successors": successors, "instruction_count": row["instruction_count"]})
+    expected_count = cfg_summary.get("block_count")
+    complete = (cfg_summary.get("complete") is True and isinstance(expected_count, int)
+                and expected_count == len(blocks))
+    block_serials = {block["serial"] for block in blocks}
+    predecessor_edges = set()
+    successor_edges = set()
+    for block in blocks:
+        predecessors, successors = block["predecessors"], block["successors"]
+        if not isinstance(predecessors, list) or not isinstance(successors, list):
+            complete = False
+            continue
+        predecessor_edges.update((value, block["serial"]) for value in predecessors)
+        successor_edges.update((block["serial"], value) for value in successors)
+        if any(value not in block_serials for value in [*predecessors, *successors]):
+            complete = False
+    if predecessor_edges != successor_edges:
+        complete = False
+    return {
+        "version": metadata.get("version"), "truncated": metadata.get("truncated"),
+        "cfg": {"complete": complete, "blocks": blocks},
+        "def_use": metadata.get("def_use", {}),
+    }
+
+
+def _microcode_dominators(relations: dict[str, Any] | None) -> dict[int, set[int]] | None:
+    """Return block dominators only for a complete exported micro CFG."""
+    cfg = (relations or {}).get("cfg") or {}
+    if not cfg.get("complete"):
+        return None
+    blocks = cfg.get("blocks") or []
+    serials = {int(block["serial"]) for block in blocks if "serial" in block}
+    if not serials:
+        return None
+    predecessors = {int(block["serial"]): {int(value) for value in block.get("predecessors", [])}
+                    for block in blocks if "serial" in block}
+    roots = [block for block in serials if not predecessors.get(block)]
+    if len(roots) != 1:
+        return None
+    entry = roots[0]
+    all_blocks = set(serials)
+    reachable = {entry}
+    pending = [entry]
+    successors = {int(block["serial"]): {int(value) for value in block.get("successors", [])}
+                  for block in blocks if "serial" in block}
+    while pending:
+        source = pending.pop()
+        for target in successors.get(source, set()) & all_blocks:
+            if target not in reachable:
+                reachable.add(target)
+                pending.append(target)
+    dominators = {block: ({entry} if block == entry else set(all_blocks)) for block in serials}
+    dominators = {block: dominators[block] for block in reachable}
+    changed = True
+    while changed:
+        changed = False
+        for block in sorted(reachable - {entry}):
+            preds = predecessors.get(block, set()) & reachable
+            next_set = {block} if not preds else {block} | set.intersection(
+                *(dominators[pred] for pred in preds))
+            if next_set != dominators[block]:
+                dominators[block] = next_set
+                changed = True
+    return dominators
+
+
+def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any],
+                        relations: dict[str, Any] | None = None) -> dict[str, Any] | None:
     definitions: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for instruction in instructions:
         key = _key(instruction.get("d", {}))
         if key is not None:
             definitions[key].append(instruction)
 
-    def resolve_load(value: dict[str, Any], visited: set[tuple[str, int]]) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    dominators = _microcode_dominators(relations)
+    def_use_chain: list[dict[str, Any]] = []
+
+    def resolve_load(value: dict[str, Any], visited: set[tuple[str, int]],
+                     use_location: tuple[int, int]) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
         key = _key(value)
         if key is None or key in visited:
             return None
         visited.add(key)
-        candidates = [item for item in definitions.get(key, []) if
-            (item["block_serial"] == call["block_serial"] and item["ordinal"] < call["ordinal"])
-            or (item["block_serial"] != call["block_serial"] and call.get("ea") is not None
-                and item.get("ea") is not None and item["ea"] < call["ea"])]
-        if len(candidates) != 1:
-            return None
-        definition = candidates[0]
+        # Only same-block order is a local proof. EA order across microcode
+        # blocks says nothing about path reachability or dominance.
+        candidates = []
+        same_block = [item for item in definitions.get(key, [])
+            if item["block_serial"] == use_location[0] and item["ordinal"] < use_location[1]]
+        if same_block:
+            definition = max(same_block, key=lambda item: item["ordinal"])
+            relationship = "same_block_ordered_candidate"
+        else:
+            # A dominating definition is safe here only when this value
+            # number has exactly one definition in the function. This avoids
+            # overlooking a conditional overwrite from another predecessor.
+            cross_block = definitions.get(key, [])
+            if (len(cross_block) != 1 or dominators is None
+                    or cross_block[0]["block_serial"] == use_location[0]
+                    or cross_block[0]["block_serial"] not in dominators.get(use_location[0], set())):
+                return None
+            definition = cross_block[0]
+            relationship = "unique_definition_in_dominating_block_candidate"
+        def_use_chain.append({"value_number": key[1], "relationship": relationship,
+            "definition": {"block_serial": definition["block_serial"],
+                           "ordinal": definition["ordinal"], "ea": definition.get("ea")},
+            "use": {"block_serial": use_location[0], "ordinal": use_location[1]}})
         if definition["opcode"] == "ldx":
             return definition, [definition]
         if definition["opcode"] == "mov":
             source = definition.get("l", {})
             if _key(source) is None:
                 return None
-            result = resolve_load(source, visited)
+            result = resolve_load(source, visited,
+                (int(definition["block_serial"]), int(definition["ordinal"])))
             if result is None:
                 return None
             load, chain = result
@@ -525,14 +637,16 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
     # In IDA microcode icall stores the indirect callee in r on supported
     # architectures. Nested callee expressions are handled without text parsing.
     callee = call.get("r", {}) if call.get("r", {}).get("kind") != "empty" else call.get("l", {})
-    slot_result = resolve_load(callee, set())
+    call_location = (int(call["block_serial"]), int(call["ordinal"]))
+    slot_result = resolve_load(callee, set(), call_location)
     slot_chain: list[dict[str, Any]] = []
     if slot_result is None:
         if callee.get("kind") == "nested" and isinstance(callee.get("instruction"), dict):
             nested = callee["instruction"]
             if nested.get("opcode") == "ldx":
                 slot_load = {**nested, "opcode": "ldx", "ea": nested.get("ea"), "l": nested.get("l", {}),
-                             "r": nested.get("r", {}), "d": nested.get("d", {})}
+                             "r": nested.get("r", {}), "d": nested.get("d", {}),
+                             "block_serial": call["block_serial"], "ordinal": call["ordinal"]}
                 slot_result = (slot_load, [slot_load])
     if slot_result is None:
         return None
@@ -541,16 +655,26 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
     if slot_address is None or slot_address["offset"] < 0:
         return None
     vptr_value = slot_address["base"]
-    vptr_result = resolve_load(vptr_value, set())
+    vptr_result = resolve_load(vptr_value, set(),
+        (int(slot_load["block_serial"]), int(slot_load["ordinal"]))
+        if "block_serial" in slot_load and "ordinal" in slot_load else call_location)
     if vptr_result is None:
         return None
     vptr_load, vptr_chain = vptr_result
     object_address = _address_expression(vptr_load.get("r", {}))
     if object_address is None:
         return None
+    if (_operand_truncated(callee)
+            or any(_operand_truncated(item.get(root)) for item in [*vptr_chain, *slot_chain]
+                   for root in ("l", "r", "d"))):
+        return None
     receiver = object_address["base"]
     if receiver.get("kind") not in ("register", "local", "stack", "global"):
         return None
+    chain_blocks = {call_location[0]} | {edge["definition"]["block_serial"]
+        for edge in def_use_chain} | {edge["use"]["block_serial"] for edge in def_use_chain}
+    dominance_verified = (dominators is not None
+        and chain_blocks.issubset(dominators.keys()))
     return {
         "receiver": receiver,
         "vptr_offset": object_address["offset"],
@@ -560,9 +684,18 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
         "definition_chain": [{"block_serial": item["block_serial"], "ordinal": item["ordinal"],
             "ea": item.get("ea"), "opcode": item["opcode"], "text": item["text"]}
             for item in [*vptr_chain, *slot_chain]],
+        "definition_use_chain": def_use_chain,
         "callee_operand": callee,
         "basis": "two_dependent_indirect_loads_in_exported_microcode",
-        "control_flow_dominance_verified": False,
+        "same_block_order_checked": True,
+        "cfg_complete": (relations or {}).get("cfg", {}).get("complete"),
+        "operand_tree_truncated": (relations or {}).get("truncated"),
+        "cross_block_reaching_definitions_computed": False,
+        "def_use_coverage": (relations or {}).get("def_use", {}).get("coverage"),
+        "unknown_frontier": ["receiver object identity and dynamic type",
+            "memory aliasing and definitions without exported register value numbers",
+            "cross-block reaching definitions beyond the single-dominating-definition subset"],
+        "control_flow_dominance_verified": dominance_verified,
         "cxx_virtual_call_confirmed": False,
     }
 
@@ -590,16 +723,18 @@ def build_vcall_index(
     failures = []
     sites: list[dict[str, Any]] = []
     for function_ea in selected:
-        summary = connection.execute("SELECT status FROM microcode WHERE function_ea=?", (sqlite_ea(function_ea),)).fetchone()
+        summary = connection.execute("SELECT status,relations_json FROM microcode WHERE function_ea=?",
+            (sqlite_ea(function_ea),)).fetchone()
         if summary is None:
             missing.append(function_ea); continue
         if summary["status"] != "ok":
             failures.append({"function_ea": function_ea, "status": summary["status"]}); continue
         instructions = _instructions_for_function(connection, function_ea)
+        relations = _microcode_relations_for_function(connection, function_ea, summary)
         for instruction in instructions:
             if instruction["opcode"] != "icall":
                 continue
-            pattern = _trace_vcall_pattern(instructions, instruction)
+            pattern = _trace_vcall_pattern(instructions, instruction, relations)
             call_id = _id("VCALL", {"run": run_id, "function": function_ea,
                 "block": instruction["block_serial"], "ordinal": instruction["ordinal"]})
             site = {
@@ -612,7 +747,12 @@ def build_vcall_index(
                 "slot_offset": pattern.get("slot_offset") if pattern else None,
                 "pointer_size": 8 if get_metadata(connection, "bitness", 64) == 64 else 4,
                 "evidence": {"instruction": instruction["text"], "microcode_source": "micro_instructions",
-                    "source_snapshot_hash": snapshot, "pattern": pattern},
+                    "source_snapshot_hash": snapshot, "pattern": pattern,
+                    "microcode_relations": {"version": relations.get("version"),
+                        "cfg_complete": (relations.get("cfg") or {}).get("complete"),
+                        "operand_tree_truncated": relations.get("truncated"),
+                        "cross_block_reaching_definitions": (relations.get("def_use") or {}).get(
+                            "cross_block_reaching_definitions")}},
                 "source_snapshot_hash": snapshot,
             }
             sites.append(site)

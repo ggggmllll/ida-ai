@@ -135,6 +135,15 @@ class DatabaseTests(unittest.TestCase):
         old_path = Path(self.temporary.name) / "legacy-flow.sqlite"
         with closing(sqlite3.connect(old_path)) as connection:
             connection.execute(
+                "CREATE TABLE microcode(function_ea INTEGER PRIMARY KEY,maturity TEXT NOT NULL,backend TEXT NOT NULL,"
+                "status TEXT NOT NULL,error TEXT,decompiler_version TEXT,instruction_count INTEGER NOT NULL DEFAULT 0,"
+                "content_hash TEXT,generated_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO microcode(function_ea,maturity,backend,status,generated_at) "
+                "VALUES(4096,'MMAT_GLBOPT3','legacy','ok','now')"
+            )
+            connection.execute(
                 "CREATE TABLE micro_flow(function_ea INTEGER PRIMARY KEY,maturity TEXT NOT NULL,backend TEXT NOT NULL,"
                 "status TEXT NOT NULL,error TEXT,decompiler_version TEXT,instruction_count INTEGER NOT NULL DEFAULT 0,"
                 "content_hash TEXT,generated_at TEXT NOT NULL)"
@@ -156,8 +165,11 @@ class DatabaseTests(unittest.TestCase):
             )
             connection.commit()
         with closing(connect(old_path)) as connection:
+            microcode_columns = {row[1] for row in connection.execute("PRAGMA table_info(microcode)")}
+            self.assertIn("relations_json", microcode_columns)
+            self.assertEqual(connection.execute("SELECT relations_json FROM microcode WHERE function_ea=4096").fetchone()[0], "{}")
             flow_columns = {row[1] for row in connection.execute("PRAGMA table_info(micro_flow)")}
-            self.assertTrue({"arguments_json", "return_json", "locals_json"} <= flow_columns)
+            self.assertTrue({"arguments_json", "return_json", "locals_json", "relations_json"} <= flow_columns)
             node_info = connection.execute("PRAGMA table_info(propagation_nodes)").fetchall()
             primary_key = [row[1] for row in sorted((row for row in node_info if row[5]), key=lambda row: row[5])]
             self.assertEqual(primary_key, ["node_id", "source_snapshot_hash"])

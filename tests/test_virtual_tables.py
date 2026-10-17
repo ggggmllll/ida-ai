@@ -9,6 +9,7 @@ from pathlib import Path
 from ida_ai.cli import _parser, _run
 from ida_ai.db import connect, reset_analysis, set_metadata, sqlite_ea
 from ida_ai.virtual_tables import (
+    _trace_vcall_pattern,
     analyze_vcall,
     build_vcall_index,
     build_vtable_index,
@@ -93,6 +94,48 @@ class VirtualTableTests(unittest.TestCase):
         self.connection.commit()
         return function
 
+    def _vcall_instructions(self, *, vptr_block: int, use_block: int) -> list[dict]:
+        receiver = _reg(99, register=0)
+        object_plus = _nested("add", receiver, _number(0x10), 0x2000)
+        vptr_plus = _nested("add", _reg(1, register=9), _number(8), 0x2008)
+        return [
+            {"block_serial": vptr_block, "ordinal": 0, "ea": 0x1000, "opcode": "ldx",
+             "text": "load vptr", "l": _reg(50), "r": object_plus, "d": _reg(1, register=9)},
+            {"block_serial": use_block, "ordinal": 0, "ea": 0x2008, "opcode": "ldx",
+             "text": "load slot", "l": _reg(51), "r": vptr_plus, "d": _reg(2, register=10)},
+            {"block_serial": use_block, "ordinal": 1, "ea": 0x2010, "opcode": "icall",
+             "text": "indirect call", "l": _reg(3), "r": _reg(2, register=10),
+             "d": _operand("arglist", callee=0xFFFFFFFFFFFFFFFF, arguments=[])},
+        ]
+
+    def test_vcall_does_not_use_ea_order_across_unrelated_blocks(self):
+        instructions = self._vcall_instructions(vptr_block=1, use_block=0)
+        self.assertIsNone(_trace_vcall_pattern(instructions, instructions[-1], {}))
+
+    def test_vcall_accepts_unique_definition_in_dominating_microcode_block(self):
+        instructions = self._vcall_instructions(vptr_block=0, use_block=1)
+        relations = {"cfg": {"complete": True, "blocks": [
+            {"serial": 0, "predecessors": [], "successors": [1]},
+            {"serial": 1, "predecessors": [0], "successors": []},
+        ]}}
+        pattern = _trace_vcall_pattern(instructions, instructions[-1], relations)
+        self.assertIsNotNone(pattern)
+        self.assertEqual(pattern["vptr_offset"], 0x10)
+        self.assertEqual(pattern["slot_offset"], 8)
+        self.assertTrue(pattern["control_flow_dominance_verified"])
+
+    def test_vcall_rejects_merge_with_a_possible_alternate_vptr_definition(self):
+        instructions = self._vcall_instructions(vptr_block=0, use_block=2)
+        alternate = dict(instructions[0], block_serial=1, ea=0x1100,
+            r=_nested("add", _reg(98, register=1), _number(0x20), 0x1100))
+        instructions.insert(1, alternate)
+        relations = {"cfg": {"complete": True, "blocks": [
+            {"serial": 0, "predecessors": [], "successors": [1, 2]},
+            {"serial": 1, "predecessors": [0], "successors": [2]},
+            {"serial": 2, "predecessors": [0, 1], "successors": []},
+        ]}}
+        self.assertIsNone(_trace_vcall_pattern(instructions, instructions[-1], relations))
+
     def test_vtable_candidate_slots_and_thunk_chain(self):
         result = build_vtable_index(self.connection, abi="itanium")
         self.assertEqual(result["candidate_count"], 2)
@@ -126,6 +169,25 @@ class VirtualTableTests(unittest.TestCase):
         shown = show_vcall(self.connection, call_id=site["call_id"])
         self.assertEqual(len(shown["targets"]), 1)
 
+    def test_vcall_uses_normalized_microcode_cfg_tables(self):
+        function = self._add_vcall_fixture()
+        self.connection.execute("UPDATE microcode SET relations_json=? WHERE function_ea=?",
+            (json.dumps({"version": 2, "truncated": False,
+                "cfg": {"complete": True, "block_count": 1, "edge_count": 0},
+                "def_use": {"coverage": "direct register operands carrying a Hex-Rays value_number"}}),
+             sqlite_ea(function)))
+        self.connection.execute("INSERT INTO micro_blocks VALUES(?,?,?,?,?,?)",
+            ("microcode", sqlite_ea(function), 0, "[]", "[]", 3))
+        self.connection.commit()
+        result = build_vcall_index(self.connection, function_eas=[function])
+        self.assertEqual(result["pattern_candidate_count"], 1)
+        site = list_vcalls(self.connection, function_ea=function)["items"][0]
+        pattern = site["evidence"]["pattern"]
+        self.assertTrue(pattern["cfg_complete"])
+        self.assertTrue(pattern["control_flow_dominance_verified"])
+        self.assertEqual(pattern["definition_use_chain"][0]["relationship"],
+            "same_block_ordered_candidate")
+
     def test_direct_callback_is_not_promoted_to_two_load_pattern(self):
         function = 0x2100
         self.connection.execute("INSERT INTO functions(start_ea,end_ea,name,size) VALUES(?,?,?,?)",
@@ -147,10 +209,17 @@ class VirtualTableTests(unittest.TestCase):
     def test_stale_rows_survive_full_analysis_reset_and_job_fingerprint_changes(self):
         result = build_vtable_index(self.connection, abi="itanium")
         candidate = show_vtable(self.connection, address=0x5000)["items"][0]["candidate_id"]
+        self.connection.execute("INSERT INTO micro_blocks VALUES(?,?,?,?,?,?)",
+            ("microcode", sqlite_ea(0x1000), 0, "[]", "[]", 0))
+        self.connection.execute("INSERT INTO micro_value_refs VALUES(?,?,?,?,?,?,?,?)",
+            ("microcode", sqlite_ea(0x1000), 1, "definition", 0, 0, sqlite_ea(0x1000), "d"))
+        self.connection.commit()
         from ida_ai.jobs import _artifact_fingerprint
         before = _artifact_fingerprint(self.connection, f"vtable:{candidate}")
         reset_analysis(self.connection)
         self.connection.commit()
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM micro_blocks").fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM micro_value_refs").fetchone()[0], 0)
         after = _artifact_fingerprint(self.connection, f"vtable:{candidate}")
         self.assertNotEqual(before, after)
         self.assertEqual(list_vtables(self.connection)["total"], 0)

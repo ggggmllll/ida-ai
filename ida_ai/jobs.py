@@ -34,7 +34,7 @@ def analysis_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
     for table in (
         "functions", "xrefs", "basic_blocks", "cfg_edges", "symbols", "comments",
         "disassembly", "instructions", "pseudocode", "microcode", "micro_instructions",
-        "micro_flow", "micro_flow_instructions",
+        "micro_blocks", "micro_value_refs", "micro_flow", "micro_flow_instructions",
     ):
         counts[table] = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     view_epochs = {
@@ -90,6 +90,16 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
         return None
     row = connection.execute(f"SELECT * FROM {table} WHERE {keys[table]}=?", (ea,)).fetchone()
     data = {key: row[key] for key in row.keys() if key != "generated_at"} if row is not None else None
+    if row is not None and table in ("microcode", "micro_flow"):
+        data["micro_blocks"] = [tuple(item) for item in connection.execute(
+            "SELECT block_serial,predecessors_json,successors_json,instruction_count "
+            "FROM micro_blocks WHERE view_name=? AND function_ea=? ORDER BY block_serial",
+            (table, ea),)]
+        data["micro_value_refs"] = [tuple(item) for item in connection.execute(
+            "SELECT value_number,reference_kind,block_serial,ordinal,ea,operand_path "
+            "FROM micro_value_refs WHERE view_name=? AND function_ea=? "
+            "ORDER BY value_number,reference_kind,block_serial,ordinal,operand_path",
+            (table, ea),)]
     return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
 
 
