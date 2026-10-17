@@ -18,7 +18,7 @@ from typing import Any
 from .db import get_metadata, ida_ea, sqlite_ea, utc_now
 
 
-VTABLE_PARSER_VERSION = "2"
+VTABLE_PARSER_VERSION = "3"
 VCALL_DETECTOR_VERSION = "3"
 SUPPORTED_ABIS = ("itanium",)
 
@@ -93,8 +93,83 @@ def _validate_abi(abi: str, pointer_size: int, byteorder: str) -> None:
         raise ValueError("byteorder must be little or big")
 
 
+def _symbol_name_at(connection: sqlite3.Connection, address: int | None) -> str | None:
+    if address is None:
+        return None
+    row = connection.execute("SELECT name FROM symbols WHERE address=?", (sqlite_ea(address),)).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _resolve_itanium_typeinfo(connection: sqlite3.Connection, typeinfo_ea: int,
+                              pointer_size: int) -> dict[str, Any]:
+    """Resolve only the explicit Itanium RTTI symbols and pointer layout we can observe."""
+
+    fields = connection.execute(
+        "SELECT source_ea,target_ea,target_kind FROM data_pointer_slots WHERE source_ea IN (?,?)",
+        (sqlite_ea(typeinfo_ea), sqlite_ea(typeinfo_ea + pointer_size)),
+    ).fetchall()
+    by_ea = {ida_ea(row["source_ea"]): row for row in fields}
+    vptr = by_ea.get(typeinfo_ea)
+    name_pointer = by_ea.get(typeinfo_ea + pointer_size)
+    vptr_target = ida_ea(vptr["target_ea"]) if vptr is not None and vptr["target_ea"] is not None else None
+    name_target = ida_ea(name_pointer["target_ea"]) if name_pointer is not None and name_pointer["target_ea"] is not None else None
+    vptr_is_data = bool(vptr and vptr["target_kind"] == "data" and vptr_target is not None)
+    name_is_data = bool(name_pointer and name_pointer["target_kind"] == "data" and name_target is not None)
+
+    typeinfo_symbol = _symbol_name_at(connection, typeinfo_ea)
+    type_name_symbol = _symbol_name_at(connection, name_target)
+    typeinfo_vtable_symbol = None
+    typeinfo_vtable_start = None
+    descriptor_kind = None
+    expected_vtable_start = vptr_target - 2 * pointer_size if vptr_target is not None else None
+    if expected_vtable_start is not None and expected_vtable_start >= 0:
+        possible_symbol = _symbol_name_at(connection, expected_vtable_start)
+        if possible_symbol and possible_symbol.startswith("_ZTVN10__cxxabiv1"):
+            typeinfo_vtable_symbol = possible_symbol
+            typeinfo_vtable_start = expected_vtable_start
+            for token, kind in (
+                ("__vmi_class_type_infoE", "multiple_or_virtual_inheritance"),
+                ("__si_class_type_infoE", "single_inheritance"),
+                ("__class_type_infoE", "class_type_info"),
+            ):
+                if possible_symbol.endswith(token):
+                    descriptor_kind = kind
+                    break
+
+    expected_type_name = ("_ZTS" + typeinfo_symbol[4:]
+                          if typeinfo_symbol and typeinfo_symbol.startswith("_ZTI") else None)
+    checks = {
+        "typeinfo_symbol": bool(typeinfo_symbol and typeinfo_symbol.startswith("_ZTI")),
+        "typeinfo_vptr_is_data_pointer": vptr_is_data,
+        "typeinfo_vtable_symbol_matches_abi": typeinfo_vtable_symbol is not None,
+        "recognized_typeinfo_descriptor": descriptor_kind is not None,
+        "type_name_is_data_pointer": name_is_data,
+        "type_name_symbol_matches_typeinfo": bool(expected_type_name and type_name_symbol == expected_type_name),
+    }
+    if all(checks.values()):
+        status = "confirmed_itanium_typeinfo_layout"
+    elif any(checks.values()):
+        status = "candidate_itanium_typeinfo_layout"
+    else:
+        status = "unresolved"
+    return {
+        "status": status,
+        "typeinfo_ea": typeinfo_ea,
+        "typeinfo_symbol": typeinfo_symbol,
+        "vptr_target_ea": vptr_target,
+        "typeinfo_vtable_start_ea": typeinfo_vtable_start,
+        "typeinfo_vtable_symbol": typeinfo_vtable_symbol,
+        "descriptor_kind": descriptor_kind,
+        "type_name_ea": name_target,
+        "type_name_symbol": type_name_symbol,
+        "expected_type_name_symbol": expected_type_name,
+        "checks": checks,
+        "scope_note": "RTTI object/layout evidence only; does not prove class hierarchy, object dynamic type, or call reachability",
+    }
+
+
 def _has_itanium_prefix(connection: sqlite3.Connection, address_point: int, pointer_size: int) -> dict[str, Any] | None:
-    """Return a weak prefix-layout clue; this is not RTTI confirmation."""
+    """Return an Itanium address-point prefix observation and its RTTI evidence."""
 
     if address_point < 2 * pointer_size:
         return None
@@ -118,6 +193,7 @@ def _has_itanium_prefix(connection: sqlite3.Connection, address_point: int, poin
         return None
     if offset_to_top != 0 and abs(offset_to_top) > 0x10000:
         return None
+    typeinfo_evidence = _resolve_itanium_typeinfo(connection, ida_ea(typeinfo_target), pointer_size)
     return {
         "layout": "itanium_address_point_prefix_candidate",
         "offset_to_top_ea": address_point - 2 * pointer_size,
@@ -125,6 +201,7 @@ def _has_itanium_prefix(connection: sqlite3.Connection, address_point: int, poin
         "typeinfo_pointer_ea": address_point - pointer_size,
         "typeinfo_target_ea": ida_ea(typeinfo_target),
         "status": "heuristic_candidate",
+        "typeinfo": typeinfo_evidence,
     }
 
 
@@ -192,12 +269,14 @@ def build_vtable_index(
             address_point = run_start
             candidate_id = _id("VTB", {"run": run_id, "address_point": address_point})
             prefix = _has_itanium_prefix(connection, address_point, pointer_size)
+            typeinfo = (prefix or {}).get("typeinfo", {})
             evidence = {
                 "method": "contiguous_aligned_mapped_function_pointer_sequence",
                 "status": "heuristic_candidate",
                 "function_slot_count": run_function_count,
                 "total_slot_count": len(run_slots),
                 "rtti_confirmed": False,
+                "typeinfo_layout_confirmed": typeinfo.get("status") == "confirmed_itanium_typeinfo_layout",
                 "address_point_prefix": prefix,
                 "address_point_boundary": ("two_word_itanium_prefix_candidate"
                     if prefix is not None else "function_sequence_start_unconfirmed"),
@@ -269,7 +348,13 @@ def build_vtable_index(
         "coverage": {"pointer_observations": sum(item["target_kind"] != "scalar" for item in pointer_rows),
                      "scalar_prefix_observations": sum(item["target_kind"] == "scalar" for item in pointer_rows),
                      "source": "data_pointer_slots",
-                     "rtti_parsed": False, "heuristic_only": True,
+                     "rtti_parsed": False,
+                     "typeinfo_symbol_layouts_checked": sum(
+                         bool((candidate["evidence"].get("address_point_prefix") or {}).get("typeinfo"))
+                         for candidate in candidates),
+                     "typeinfo_layout_confirmed": sum(
+                         bool(candidate["evidence"].get("typeinfo_layout_confirmed")) for candidate in candidates),
+                     "heuristic_only": True,
                      "data_pointer_scan": get_metadata(connection, "data_pointer_scan")},
         "scope": scope,
     }

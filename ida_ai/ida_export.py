@@ -748,6 +748,7 @@ def scan_data_pointer_slots(
         connection.execute("DELETE FROM data_pointer_slots WHERE " + " AND ".join(clauses), values)
 
     scanned_bytes = 0
+    bytes_requested = 0
     rows = []
     skipped = []
     total_entries = 0
@@ -756,12 +757,12 @@ def scan_data_pointer_slots(
     now = utc_now()
     max_chunk = 1 << 20
     for seg, window_start, window_end, seg_name in eligible:
-        if scanned_bytes >= max_bytes:
+        if bytes_requested >= max_bytes:
             truncated = True
             skipped.append({"segment": seg_name, "start": window_start, "end": window_end, "reason": "max_bytes"})
             continue
         segment_start = window_start
-        remaining_budget = max_bytes - scanned_bytes
+        remaining_budget = max_bytes - bytes_requested
         allowed_end = min(window_end, segment_start + remaining_budget)
         if allowed_end < window_end:
             truncated = True
@@ -769,6 +770,7 @@ def scan_data_pointer_slots(
         first_aligned = cursor + ((pointer_size - (cursor % pointer_size)) % pointer_size)
         while cursor < allowed_end:
             primary_end = min(allowed_end, cursor + max_chunk)
+            bytes_requested += primary_end - cursor
             raw = ida_bytes.get_bytes(cursor, primary_end - cursor)
             if raw is None:
                 skipped.append({"segment": seg_name, "start": cursor, "end": primary_end, "reason": "unloaded_or_unreadable"})
@@ -832,6 +834,8 @@ def scan_data_pointer_slots(
     scalar_prefix_words = 0
     prefix_failures = 0
     prefix_bytes_read = 0
+    prefix_budget_skipped = 0
+    prefix_budget_exhausted = False
     code_query = "SELECT source_ea,source_segment FROM data_pointer_slots WHERE pointer_size=? AND target_kind IN ('function','code')"
     code_values: list[object] = [pointer_size]
     if scoped_start is not None:
@@ -855,6 +859,12 @@ def scan_data_pointer_slots(
             prefix_seg = ida_segment.getseg(prefix_ea)
             if prefix_seg is None or (ida_segment.get_segm_name(prefix_seg) or "") != entry["source_segment"]:
                 continue
+            if bytes_requested + pointer_size > max_bytes:
+                truncated = True
+                prefix_budget_skipped += 1
+                prefix_budget_exhausted = True
+                break
+            bytes_requested += pointer_size
             prefix_raw = ida_bytes.get_bytes(prefix_ea, pointer_size)
             prefix_bytes_read += pointer_size
             if prefix_raw is None:
@@ -877,12 +887,18 @@ def scan_data_pointer_slots(
                  entry["source_segment"], now),
             ).rowcount
             scalar_prefix_words += int(inserted > 0)
+        if prefix_budget_exhausted:
+            break
+    if prefix_budget_skipped:
+        skipped.append({"reason": "max_bytes_prefix_probe", "candidate_reads_skipped": prefix_budget_skipped})
     connection.commit()
     result = {
         "pointer_size": pointer_size, "byteorder": byteorder,
         "segments_considered": len(eligible), "scanned_bytes": scanned_bytes,
+        "bytes_requested": bytes_requested, "max_bytes": max_bytes,
         "pointer_entries": total_entries, "scalar_prefix_words": scalar_prefix_words,
         "prefix_bytes_read": prefix_bytes_read, "prefix_read_failures": prefix_failures,
+        "prefix_budget_skipped": prefix_budget_skipped,
         "truncated": truncated, "skipped": skipped,
         "source": "aligned_loaded_pointers_in_readable_non_executable_non_bss_segments",
         "scope": {"start": scoped_start, "end": scoped_end},

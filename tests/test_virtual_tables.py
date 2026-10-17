@@ -192,6 +192,57 @@ class VirtualTableTests(unittest.TestCase):
         self.assertFalse(prefix["status"] == "confirmed")
         self.assertEqual(candidate["slot_count"], 2)
 
+    def test_vtable_resolves_explicit_itanium_typeinfo_layout_without_claiming_class_hierarchy(self):
+        self.connection.executemany(
+            "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(sqlite_ea(0x4FF0), sqlite_ea(0xFFFFFFFFFFFFFFF8), None, 8, ".data.rel.ro", None, None, None, "scalar", "now"),
+             (sqlite_ea(0x4FF8), 0x6000, 0x6000, 8, ".data.rel.ro", ".data.rel.ro", None, "_ZTI3Foo", "data", "now"),
+             (0x6000, 0x7010, 0x7010, 8, ".data.rel.ro", ".data.rel.ro", None, "_ZTVN10__cxxabiv117__class_type_infoE", "data", "now"),
+             (0x6008, 0x8000, 0x8000, 8, ".data.rel.ro", ".rodata", None, "_ZTS3Foo", "data", "now")],
+        )
+        self.connection.executemany(
+            "INSERT INTO symbols(address,name,type) VALUES(?,?,NULL)",
+            [(0x6000, "_ZTI3Foo"), (0x7000, "_ZTVN10__cxxabiv117__class_type_infoE"),
+             (0x8000, "_ZTS3Foo")],
+        )
+        self.connection.commit()
+
+        result = build_vtable_index(self.connection, abi="itanium")
+        candidate = show_vtable(self.connection, address=0x5000)["items"][0]
+        prefix = candidate["evidence"]["address_point_prefix"]
+        typeinfo = prefix["typeinfo"]
+        self.assertEqual(typeinfo["status"], "confirmed_itanium_typeinfo_layout")
+        self.assertEqual(typeinfo["descriptor_kind"], "class_type_info")
+        self.assertEqual(typeinfo["typeinfo_symbol"], "_ZTI3Foo")
+        self.assertEqual(typeinfo["type_name_symbol"], "_ZTS3Foo")
+        self.assertTrue(candidate["evidence"]["typeinfo_layout_confirmed"])
+        self.assertFalse(candidate["evidence"]["rtti_confirmed"])
+        self.assertEqual(result["coverage"]["typeinfo_layout_confirmed"], 1)
+
+    def test_itanium_typeinfo_symbol_mismatch_remains_candidate(self):
+        self.connection.executemany(
+            "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(sqlite_ea(0x4FF0), sqlite_ea(0xFFFFFFFFFFFFFFF8), None, 8, ".data.rel.ro", None, None, None, "scalar", "now"),
+             (sqlite_ea(0x4FF8), 0x6000, 0x6000, 8, ".data.rel.ro", ".data.rel.ro", None, "_ZTI3Foo", "data", "now"),
+             (0x6000, 0x7010, 0x7010, 8, ".data.rel.ro", ".data.rel.ro", None, "_ZTVN10__cxxabiv117__class_type_infoE", "data", "now"),
+             (0x6008, 0x8000, 0x8000, 8, ".data.rel.ro", ".rodata", None, "_ZTS3Bar", "data", "now")],
+        )
+        self.connection.executemany(
+            "INSERT INTO symbols(address,name,type) VALUES(?,?,NULL)",
+            [(0x6000, "_ZTI3Foo"), (0x7000, "_ZTVN10__cxxabiv117__class_type_infoE"),
+             (0x8000, "_ZTS3Bar")],
+        )
+        self.connection.commit()
+
+        build_vtable_index(self.connection, abi="itanium")
+        candidate = show_vtable(self.connection, address=0x5000)["items"][0]
+        typeinfo = candidate["evidence"]["address_point_prefix"]["typeinfo"]
+        self.assertEqual(typeinfo["status"], "candidate_itanium_typeinfo_layout")
+        self.assertFalse(typeinfo["checks"]["type_name_symbol_matches_typeinfo"])
+        self.assertFalse(candidate["evidence"]["typeinfo_layout_confirmed"])
+
     def test_vtable_cache_tracks_scan_coverage_but_ignores_scan_timestamp(self):
         first = build_vtable_index(self.connection, abi="itanium")
         set_metadata(self.connection, {"data_pointer_scan": {
