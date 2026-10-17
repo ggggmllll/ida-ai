@@ -19,7 +19,7 @@ from .db import get_metadata, ida_ea, sqlite_ea, utc_now
 
 
 VTABLE_PARSER_VERSION = "2"
-VCALL_DETECTOR_VERSION = "2"
+VCALL_DETECTOR_VERSION = "3"
 SUPPORTED_ABIS = ("itanium",)
 
 
@@ -496,6 +496,63 @@ def _address_expression(operand: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _operand_identity(operand: dict[str, Any]) -> tuple[Any, int] | None:
+    expression = _address_expression(operand)
+    if expression is None:
+        return None
+    base = expression["base"]
+    key = _key(base)
+    if key is not None:
+        return key, int(expression["offset"])
+    kind = base.get("kind")
+    if kind == "global" and base.get("address") is not None:
+        return ("global", int(base["address"])), int(expression["offset"])
+    if kind == "local" and base.get("local_index") is not None:
+        return ("local", int(base["local_index"])), int(expression["offset"])
+    if kind == "stack" and base.get("stack_offset") is not None:
+        return ("stack", int(base["stack_offset"])), int(expression["offset"])
+    return None
+
+
+def _call_arglist(call: dict[str, Any]) -> dict[str, Any] | None:
+    for root in ("d", "l", "r"):
+        for operand in _walk(call.get(root, {})):
+            if operand.get("kind") == "arglist" and isinstance(operand.get("arguments"), list):
+                return operand
+    return None
+
+
+def _receiver_binding(call: dict[str, Any], receiver: dict[str, Any],
+                      receiver_offset: int) -> dict[str, Any]:
+    arglist = _call_arglist(call)
+    if arglist is None:
+        return {"status": "not_observed", "reason": "icall has no exported argument list"}
+    receiver_identity = _operand_identity(receiver)
+    if receiver_identity is None:
+        return {"status": "unresolved", "reason": "receiver expression has no stable identity"}
+    expected_offset = receiver_identity[1] + int(receiver_offset)
+    matches = []
+    for index, argument in enumerate(arglist["arguments"]):
+        identity = _operand_identity(argument)
+        if identity is not None and identity[0] == receiver_identity[0]:
+            matches.append({"argument_index": index, "argument": argument,
+                            "argument_offset": identity[1],
+                            "receiver_offset": expected_offset,
+                            "offset_delta": identity[1] - expected_offset})
+    if len(matches) == 1:
+        status = ("exact_identity_match" if expected_offset == 0 else "subobject_offset_match")
+        if matches[0]["offset_delta"] != 0:
+            return {"status": "offset_mismatch", "matches": matches,
+                    "argument_count": len(arglist["arguments"])}
+        return {"status": status, "matches": matches,
+                "argument_count": len(arglist["arguments"])}
+    if len(matches) > 1:
+        return {"status": "ambiguous", "matches": matches,
+                "argument_count": len(arglist["arguments"])}
+    return {"status": "mismatch", "matches": [],
+            "argument_count": len(arglist["arguments"])}
+
+
 def _instructions_for_function(connection: sqlite3.Connection, function_ea: int) -> list[dict[str, Any]]:
     result = []
     for row in connection.execute(
@@ -681,12 +738,16 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
     receiver = object_address["base"]
     if receiver.get("kind") not in ("register", "local", "stack", "global"):
         return None
+    receiver_binding = _receiver_binding(call, receiver, object_address["offset"])
     chain_blocks = {call_location[0]} | {edge["definition"]["block_serial"]
         for edge in def_use_chain} | {edge["use"]["block_serial"] for edge in def_use_chain}
     dominance_verified = (dominators is not None
         and chain_blocks.issubset(dominators.keys()))
     return {
         "receiver": receiver,
+        "receiver_binding": receiver_binding,
+        "pattern_status": ("candidate" if receiver_binding["status"] in (
+            "exact_identity_match", "subobject_offset_match") else "receiver_unbound"),
         "vptr_offset": object_address["offset"],
         "slot_offset": slot_address["offset"],
         "vptr_load_ea": vptr_load.get("ea"),
@@ -702,7 +763,8 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
         "operand_tree_truncated": (relations or {}).get("truncated"),
         "cross_block_reaching_definitions_computed": False,
         "def_use_coverage": (relations or {}).get("def_use", {}).get("coverage"),
-        "unknown_frontier": ["receiver object identity and dynamic type",
+        "unknown_frontier": ["the matched argument is the ABI this receiver under this calling convention",
+            "receiver dynamic type and object lifetime",
             "memory aliasing and definitions without exported register value numbers",
             "cross-block reaching definitions beyond the single-dominating-definition subset"],
         "control_flow_dominance_verified": dominance_verified,
@@ -745,16 +807,17 @@ def build_vcall_index(
             if instruction["opcode"] != "icall":
                 continue
             pattern = _trace_vcall_pattern(instructions, instruction, relations)
+            pattern_candidate = bool(pattern and pattern.get("pattern_status") == "candidate")
             call_id = _id("VCALL", {"run": run_id, "function": function_ea,
                 "block": instruction["block_serial"], "ordinal": instruction["ordinal"]})
             site = {
                 "call_id": call_id, "run_id": run_id, "call_ea": instruction["ea"],
                 "function_ea": function_ea, "block_serial": instruction["block_serial"],
                 "ordinal": instruction["ordinal"], "kind": "indirect_call",
-                "status": "vtable_pattern_candidate" if pattern else "indirect_unknown",
+                "status": "vtable_pattern_candidate" if pattern_candidate else "indirect_unknown",
                 "opcode": instruction["opcode"], "receiver": pattern.get("receiver", {}) if pattern else {},
                 "callee": pattern or {"operand_l": instruction["l"], "operand_r": instruction["r"]},
-                "slot_offset": pattern.get("slot_offset") if pattern else None,
+                "slot_offset": pattern.get("slot_offset") if pattern_candidate else None,
                 "pointer_size": 8 if get_metadata(connection, "bitness", 64) == 64 else 4,
                 "evidence": {"instruction": instruction["text"], "microcode_source": "micro_instructions",
                     "source_snapshot_hash": snapshot, "pattern": pattern,

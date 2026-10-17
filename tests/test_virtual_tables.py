@@ -86,7 +86,7 @@ class VirtualTableTests(unittest.TestCase):
             _insn(function, 0, 0, 0x2000, "ldx", _reg(50), object_plus, vptr),
             _insn(function, 0, 1, 0x2008, "ldx", _reg(51), vptr_plus, callee),
             _insn(function, 0, 2, 0x200C, "icall", _reg(3), callee,
-                _operand("arglist", callee=0xFFFFFFFFFFFFFFFF, arguments=[])),
+                _operand("arglist", callee=0xFFFFFFFFFFFFFFFF, arguments=[object_plus])),
         ]
         self.connection.execute("INSERT INTO microcode(function_ea,maturity,backend,status,instruction_count,content_hash,generated_at) VALUES(?,?,?,?,?,?,?)",
             (sqlite_ea(function), "MMAT_GLBOPT3", "test", "ok", len(rows), "virtual-call-fixture", "now"))
@@ -98,14 +98,17 @@ class VirtualTableTests(unittest.TestCase):
         receiver = _reg(99, register=0)
         object_plus = _nested("add", receiver, _number(0x10), 0x2000)
         vptr_plus = _nested("add", _reg(1, register=9), _number(8), 0x2008)
+        slot_ordinal = 1 if vptr_block == use_block else 0
+        call_ordinal = slot_ordinal + 1
         return [
             {"block_serial": vptr_block, "ordinal": 0, "ea": 0x1000, "opcode": "ldx",
              "text": "load vptr", "l": _reg(50), "r": object_plus, "d": _reg(1, register=9)},
-            {"block_serial": use_block, "ordinal": 0, "ea": 0x2008, "opcode": "ldx",
+            {"block_serial": use_block, "ordinal": slot_ordinal, "ea": 0x2008, "opcode": "ldx",
              "text": "load slot", "l": _reg(51), "r": vptr_plus, "d": _reg(2, register=10)},
-            {"block_serial": use_block, "ordinal": 1, "ea": 0x2010, "opcode": "icall",
+            {"block_serial": use_block, "ordinal": call_ordinal, "ea": 0x2010, "opcode": "icall",
              "text": "indirect call", "l": _reg(3), "r": _reg(2, register=10),
-             "d": _operand("arglist", callee=0xFFFFFFFFFFFFFFFF, arguments=[])},
+             "d": _operand("arglist", callee=0xFFFFFFFFFFFFFFFF,
+                           arguments=[_nested("add", receiver, _number(0x10), 0x2010)])},
         ]
 
     def test_vcall_does_not_use_ea_order_across_unrelated_blocks(self):
@@ -123,6 +126,29 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(pattern["vptr_offset"], 0x10)
         self.assertEqual(pattern["slot_offset"], 8)
         self.assertTrue(pattern["control_flow_dominance_verified"])
+
+    def test_vcall_records_receiver_argument_identity(self):
+        instructions = self._vcall_instructions(vptr_block=0, use_block=0)
+        instructions[-1]["d"]["arguments"] = [
+            _nested("add", _reg(99, register=0), _number(0x10), 0x2010)]
+        pattern = _trace_vcall_pattern(instructions, instructions[-1], {})
+        self.assertEqual(pattern["pattern_status"], "candidate")
+        self.assertEqual(pattern["receiver_binding"]["status"], "subobject_offset_match")
+
+    def test_vcall_rejects_receiver_argument_with_different_subobject_offset(self):
+        instructions = self._vcall_instructions(vptr_block=0, use_block=0)
+        adjusted = _nested("add", _reg(99, register=0), _number(8), 0x2010)
+        instructions[-1]["d"]["arguments"] = [adjusted]
+        pattern = _trace_vcall_pattern(instructions, instructions[-1], {})
+        self.assertEqual(pattern["pattern_status"], "receiver_unbound")
+        self.assertEqual(pattern["receiver_binding"]["status"], "offset_mismatch")
+
+    def test_vcall_keeps_unbound_receiver_as_unknown(self):
+        instructions = self._vcall_instructions(vptr_block=0, use_block=0)
+        instructions[-1]["d"]["arguments"] = [_reg(77, register=3)]
+        pattern = _trace_vcall_pattern(instructions, instructions[-1], {})
+        self.assertIsNotNone(pattern)
+        self.assertEqual(pattern["pattern_status"], "receiver_unbound")
 
     def test_vcall_rejects_merge_with_a_possible_alternate_vptr_definition(self):
         instructions = self._vcall_instructions(vptr_block=0, use_block=2)
@@ -164,6 +190,23 @@ class VirtualTableTests(unittest.TestCase):
         prefix = candidate["evidence"]["address_point_prefix"]
         self.assertEqual(prefix["offset_to_top"], -8)
         self.assertFalse(prefix["status"] == "confirmed")
+        self.assertEqual(candidate["slot_count"], 2)
+
+    def test_vtable_cache_tracks_scan_coverage_but_ignores_scan_timestamp(self):
+        first = build_vtable_index(self.connection, abi="itanium")
+        set_metadata(self.connection, {"data_pointer_scan": {
+            "scope": {"start": None, "end": None}, "truncated": False,
+            "scanned_bytes": 1024, "skipped": [], "generated_at": "first"}})
+        self.connection.commit()
+        second = build_vtable_index(self.connection, abi="itanium")
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        set_metadata(self.connection, {"data_pointer_scan": {
+            "scope": {"start": None, "end": None}, "truncated": False,
+            "scanned_bytes": 1024, "skipped": [], "generated_at": "later"}})
+        self.connection.commit()
+        third = build_vtable_index(self.connection, abi="itanium")
+        self.assertEqual(second["run_id"], third["run_id"])
+        self.assertTrue(third["cached"])
 
     def test_vcall_candidate_keeps_receiver_and_partial_resolution(self):
         self._add_vcall_fixture()
