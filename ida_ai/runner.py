@@ -90,7 +90,7 @@ def run_ida(
         if result is not None:
             if result["status"] == "ok" and completed.returncode == 0:
                 value = result["result"]
-                if action in {"init", "sync", "export_view", "mutate", "write"}:
+                if action in {"init", "sync", "export_view", "mutate", "write", "vtable_build"}:
                     # The IDA entrypoint publishes a complete DB snapshot before
                     # recording success. Review evidence only after that commit,
                     # regardless of whether the caller is CLI, MCP, or Python.

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 
 def sqlite_ea(address: int) -> int:
@@ -284,6 +284,148 @@ BEGIN SELECT RAISE(ABORT, 'accepted propagation constraints are immutable'); END
 CREATE TRIGGER IF NOT EXISTS propagation_constraints_no_delete BEFORE DELETE ON propagation_constraints
 BEGIN SELECT RAISE(ABORT, 'accepted propagation constraints are immutable'); END;
 
+-- Virtual-table and virtual-call observations are derived from a particular
+-- IDB/analysis snapshot.  They are append-only by run; ``stale`` keeps old
+-- evidence queryable after a later IDA refresh without presenting it as live.
+CREATE TABLE IF NOT EXISTS vtable_runs (
+    run_id TEXT PRIMARY KEY,
+    source_snapshot_hash TEXT NOT NULL,
+    abi TEXT NOT NULL,
+    architecture TEXT,
+    pointer_size INTEGER NOT NULL,
+    byteorder TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vtable_runs_snapshot ON vtable_runs(source_snapshot_hash,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vtable_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES vtable_runs(run_id),
+    table_address INTEGER NOT NULL,
+    address_point INTEGER NOT NULL,
+    table_end INTEGER,
+    slot_count INTEGER NOT NULL DEFAULT 0,
+    abi TEXT NOT NULL,
+    architecture TEXT,
+    pointer_size INTEGER NOT NULL,
+    byteorder TEXT NOT NULL,
+    discovery_source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confidence REAL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vtable_candidates_address ON vtable_candidates(address_point,table_address);
+CREATE INDEX IF NOT EXISTS idx_vtable_candidates_run ON vtable_candidates(run_id,stale);
+CREATE INDEX IF NOT EXISTS idx_vtable_candidates_status ON vtable_candidates(status,stale);
+
+CREATE TABLE IF NOT EXISTS vtable_slots (
+    candidate_id TEXT NOT NULL REFERENCES vtable_candidates(candidate_id),
+    slot_index INTEGER NOT NULL,
+    byte_offset INTEGER NOT NULL,
+    entry_address INTEGER NOT NULL,
+    raw_value INTEGER,
+    target_ea INTEGER,
+    target_kind TEXT NOT NULL,
+    target_name TEXT,
+    is_thunk INTEGER NOT NULL DEFAULT 0,
+    thunk_target_ea INTEGER,
+    thunk_chain_json TEXT NOT NULL DEFAULT '[]',
+    adjustment_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(candidate_id,slot_index)
+);
+CREATE INDEX IF NOT EXISTS idx_vtable_slots_target ON vtable_slots(target_ea,stale);
+CREATE INDEX IF NOT EXISTS idx_vtable_slots_offset ON vtable_slots(byte_offset,stale);
+
+CREATE TABLE IF NOT EXISTS vtable_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    polarity TEXT NOT NULL CHECK(polarity IN ('support','against','unknown')),
+    source_ea INTEGER,
+    function_ea INTEGER,
+    source_view TEXT,
+    source_hash TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vtable_evidence_subject ON vtable_evidence(subject_kind,subject_id,stale);
+
+CREATE TABLE IF NOT EXISTS vcall_runs (
+    run_id TEXT PRIMARY KEY,
+    source_snapshot_hash TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    detector_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcall_runs_snapshot ON vcall_runs(source_snapshot_hash,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vcall_sites (
+    call_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES vcall_runs(run_id),
+    call_ea INTEGER,
+    function_ea INTEGER NOT NULL,
+    block_serial INTEGER,
+    ordinal INTEGER,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    opcode TEXT NOT NULL,
+    receiver_json TEXT NOT NULL DEFAULT '{}',
+    callee_json TEXT NOT NULL DEFAULT '{}',
+    slot_offset INTEGER,
+    pointer_size INTEGER,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcall_sites_ea ON vcall_sites(call_ea,stale);
+CREATE INDEX IF NOT EXISTS idx_vcall_sites_function ON vcall_sites(function_ea,stale);
+CREATE INDEX IF NOT EXISTS idx_vcall_sites_status ON vcall_sites(status,stale);
+
+CREATE TABLE IF NOT EXISTS vcall_targets (
+    call_id TEXT NOT NULL REFERENCES vcall_sites(call_id),
+    target_id TEXT NOT NULL,
+    candidate_id TEXT,
+    slot_index INTEGER,
+    target_ea INTEGER,
+    thunk_target_ea INTEGER,
+    status TEXT NOT NULL,
+    reason TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(call_id,target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vcall_targets_target ON vcall_targets(target_ea,stale);
+
+CREATE TABLE IF NOT EXISTS receiver_flows (
+    flow_id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL REFERENCES vcall_sites(call_id),
+    path_order INTEGER NOT NULL,
+    node_json TEXT NOT NULL,
+    edge_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receiver_flows_call ON receiver_flows(call_id,path_order,stale);
+
 CREATE TABLE IF NOT EXISTS memory_bytes (
     address INTEGER PRIMARY KEY,
     value INTEGER NOT NULL CHECK(value >= 0 AND value <= 255),
@@ -308,6 +450,23 @@ CREATE TABLE IF NOT EXISTS pointers (
 );
 CREATE INDEX IF NOT EXISTS idx_pointers_target ON pointers(target_address);
 CREATE INDEX IF NOT EXISTS idx_pointers_source_function ON pointers(source_function_ea);
+
+-- Exhaustive aligned pointer observations from loaded non-executable segments.
+-- Kept separate from user-triggered pointer-search results and their cache.
+CREATE TABLE IF NOT EXISTS data_pointer_slots (
+    source_ea INTEGER PRIMARY KEY,
+    raw_value INTEGER NOT NULL,
+    target_ea INTEGER,
+    pointer_size INTEGER NOT NULL,
+    source_segment TEXT NOT NULL,
+    target_segment TEXT,
+    target_function_ea INTEGER,
+    target_name TEXT,
+    target_kind TEXT NOT NULL,
+    generated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_data_pointer_target ON data_pointer_slots(target_ea);
+CREATE INDEX IF NOT EXISTS idx_data_pointer_segment ON data_pointer_slots(source_segment,source_ea);
 
 CREATE TABLE IF NOT EXISTS search_matches (
     search_id TEXT NOT NULL,
@@ -430,6 +589,14 @@ def initialize(connection: sqlite3.Connection) -> None:
 def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = False) -> None:
     """Remove observations that are regenerated by an init export."""
 
+    # Virtual-table/call rows are derived from the observations below.  Keep
+    # their immutable historical runs, but never leave them looking current
+    # while functions, xrefs, or microcode are being rebuilt.
+    for table in ("vtable_candidates", "vtable_slots", "vtable_evidence", "vcall_sites", "vcall_targets", "receiver_flows"):
+        connection.execute(f"UPDATE {table} SET stale=1")
+    connection.execute("UPDATE vtable_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+    connection.execute("UPDATE vcall_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+
     tables = (
         "symbols",
         "comments",
@@ -447,6 +614,7 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
         "micro_flow_instructions",
         "memory_bytes",
         "pointers",
+        "data_pointer_slots",
         "search_matches",
     )
     for table in tables:

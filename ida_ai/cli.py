@@ -17,6 +17,9 @@ from .job_queries import diff_job, find_jobs, impact
 from .type_features import normalize_spec, scan_type_features
 from .propagation import add_edge as add_propagation_edge, add_seed as add_propagation_seed
 from .propagation import accept_propagation, preview_seed, show_node as show_propagation_node
+from .virtual_tables import (analyze_vcall, build_vcall_index, build_vtable_index,
+                             list_vcalls, list_vtables, search_vtables,
+                             show_vcall, show_vtable)
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -311,6 +314,64 @@ def _parser() -> argparse.ArgumentParser:
     type_node = type_actions.add_parser("node", help="inspect evidence, accepted constraints, and relationship edges for a node")
     _add_db(type_node)
     type_node.add_argument("--node", required=True)
+
+    vtable_build = commands.add_parser("vtable-build", help="scan durable data pointers and build heuristic Itanium vtable candidates")
+    _add_db(vtable_build)
+    _add_ida(vtable_build)
+    vtable_build.add_argument("--abi", choices=("itanium",), default="itanium")
+    vtable_build.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"),
+                              help="optional half-open data-address range")
+    vtable_build.add_argument("--no-refresh", action="store_true", help="use existing data_pointer_slots observations")
+    vtable_build.add_argument("--max-bytes", type=int, default=256 << 20)
+    vtable_build.add_argument("--min-function-slots", type=int, default=2)
+    vtable_build.add_argument("--max-slots", type=int, default=512)
+
+    vtable_list = commands.add_parser("vtable-list", help="list current virtual-table candidates")
+    _add_db(vtable_list)
+    vtable_list.add_argument("--abi", choices=("itanium",))
+    vtable_list.add_argument("--status")
+    vtable_list.add_argument("--limit", type=int, default=100)
+    vtable_list.add_argument("--offset", type=int, default=0)
+    vtable_list.add_argument("--include-stale", action="store_true")
+
+    vtable_show = commands.add_parser("vtable-show", help="show one candidate, its slots, and evidence")
+    _add_db(vtable_show)
+    vtable_selector = vtable_show.add_mutually_exclusive_group(required=True)
+    vtable_selector.add_argument("--candidate-id")
+    vtable_selector.add_argument("--address")
+    vtable_show.add_argument("--include-stale", action="store_true")
+
+    vtable_search = commands.add_parser("vtable-search", help="search table candidates by implementations or slot index")
+    _add_db(vtable_search)
+    vtable_search.add_argument("--target", action="append", default=[], help="required slot target EA; repeat to require multiple entries")
+    vtable_search.add_argument("--slot-index", type=int)
+    vtable_search.add_argument("--abi", choices=("itanium",))
+    vtable_search.add_argument("--limit", type=int, default=100)
+    vtable_search.add_argument("--include-stale", action="store_true")
+
+    vcall_build = commands.add_parser("vcall-build", help="refresh microcode and index indirect-call/vtable-pattern candidates")
+    _add_db(vcall_build)
+    _add_ida(vcall_build)
+    vcall_selection = vcall_build.add_mutually_exclusive_group(required=True)
+    vcall_selection.add_argument("--all", action="store_true", dest="all_functions")
+    vcall_selection.add_argument("--address", help="address inside one function")
+    vcall_selection.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"))
+    vcall_selection.add_argument("--name", help="exact function or demangled name")
+    vcall_build.add_argument("--no-refresh", action="store_true", help="use exported microcode only")
+    vcall_build.add_argument("--max-calls", type=int, default=100000)
+
+    vcall_analyze_parser = commands.add_parser("vcall-analyze", help="analyze a call candidate and list compatible indexed slots")
+    _add_db(vcall_analyze_parser)
+    vcall_selector = vcall_analyze_parser.add_mutually_exclusive_group(required=True)
+    vcall_selector.add_argument("--call-id")
+    vcall_selector.add_argument("--address")
+
+    vcall_show_parser = commands.add_parser("vcall-show", help="show an indexed call candidate and its saved resolution")
+    _add_db(vcall_show_parser)
+    vcall_show_selector = vcall_show_parser.add_mutually_exclusive_group(required=True)
+    vcall_show_selector.add_argument("--call-id")
+    vcall_show_selector.add_argument("--address")
+    vcall_show_parser.add_argument("--include-stale", action="store_true")
     return parser
 
 
@@ -503,6 +564,61 @@ def _run(args: argparse.Namespace) -> dict:
         if args.propagation_action == "node":
             with closing(connect(args.db)) as connection:
                 return show_propagation_node(connection, args.node)
+    if args.command == "vtable-build":
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite analysis database does not exist: {args.db}")
+        if args.max_bytes < 1 or args.min_function_slots < 2 or args.max_slots < args.min_function_slots:
+            raise ValueError("invalid vtable scan limits")
+        address_range = parse_range(args.address_range) if args.address_range else (None, None)
+        if args.no_refresh:
+            with closing(connect(args.db)) as connection:
+                return build_vtable_index(connection, abi=args.abi, start=address_range[0], end=address_range[1],
+                                          min_function_slots=args.min_function_slots, max_slots=args.max_slots)
+        return run_ida("vtable_build", args.db, abi=args.abi, start=address_range[0], end=address_range[1],
+                       min_function_slots=args.min_function_slots, max_slots=args.max_slots,
+                       max_bytes=args.max_bytes, **{"idat": args.idat, "timeout": args.timeout})
+    if args.command == "vtable-list":
+        with closing(connect(args.db)) as connection:
+            return list_vtables(connection, abi=args.abi, status=args.status, limit=args.limit,
+                                offset=args.offset, include_stale=args.include_stale)
+    if args.command == "vtable-show":
+        with closing(connect(args.db)) as connection:
+            return show_vtable(connection, candidate_id=args.candidate_id,
+                               address=parse_int(args.address) if args.address is not None else None,
+                               include_stale=args.include_stale)
+    if args.command == "vtable-search":
+        targets = [parse_int(value) for value in args.target]
+        with closing(connect(args.db)) as connection:
+            return search_vtables(connection, target_eas=targets, slot_index=args.slot_index,
+                                  abi=args.abi, limit=args.limit, include_stale=args.include_stale)
+    if args.command == "vcall-build":
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite analysis database does not exist: {args.db}")
+        if args.max_calls < 1:
+            raise ValueError("max_calls must be positive")
+        with closing(connect(args.db)) as connection:
+            addresses = select_function_addresses(connection, all_functions=args.all_functions,
+                address=args.address, address_range=args.address_range, name=args.name)
+        refresh = None
+        if not args.no_refresh:
+            refresh = run_ida("export_view", args.db, view="microcode", addresses=addresses,
+                              idat=args.idat, timeout=args.timeout)
+        with closing(connect(args.db)) as connection:
+            result = build_vcall_index(connection, function_eas=addresses, max_calls=args.max_calls)
+        result["refresh"] = refresh
+        result["scope"] = {"function_count": len(addresses),
+                            "function_addresses": [f"0x{address:X}" for address in addresses],
+                            "refreshed": not args.no_refresh}
+        return result
+    if args.command == "vcall-analyze":
+        with closing(connect(args.db)) as connection:
+            return analyze_vcall(connection, call_id=args.call_id,
+                                 address=parse_int(args.address) if args.address is not None else None)
+    if args.command == "vcall-show":
+        with closing(connect(args.db)) as connection:
+            return show_vcall(connection, call_id=args.call_id,
+                              address=parse_int(args.address) if args.address is not None else None,
+                              include_stale=args.include_stale)
     options = {"idat": args.idat, "timeout": args.timeout}
     if args.command == "sync":
         result = run_ida("sync", args.db, all_views=args.all_views,

@@ -700,6 +700,161 @@ def search_pointers(connection, *, target: int | None = None, start: int | None 
     return {"search_id": search_id, "pointer_size": pointer_size, "count": len(matches), "truncated": truncated, "matches": matches}
 
 
+def scan_data_pointer_slots(
+    connection, *, pointer_size: int, start: int | None = None, end: int | None = None,
+    max_bytes: int = 256 << 20,
+) -> dict:
+    """Persist aligned mapped pointer entries from readable, non-code segments.
+
+    This is a durable input scan for the virtual-table index, not the raw
+    pointer-search feature/cache. BSS and executable segments are excluded.
+    """
+    pointer_size = int(pointer_size)
+    max_bytes = int(max_bytes)
+    if pointer_size not in (4, 8):
+        raise ValueError("pointer_size must be 4 or 8")
+    if max_bytes < pointer_size:
+        raise ValueError("max_bytes must be at least one pointer wide")
+    if start is not None and end is not None and int(end) <= int(start):
+        raise ValueError("end must be greater than start")
+
+    eligible = []
+    for index in range(ida_segment.get_segm_qty()):
+        seg = ida_segment.getnseg(index)
+        if seg is None:
+            continue
+        permission = int(getattr(seg, "perm", 0))
+        seg_class = _text(_safe(lambda seg=seg: ida_segment.get_segm_class(seg))) or ""
+        if not permission & int(getattr(ida_segment, "SEGPERM_READ", 4)):
+            continue
+        if permission & int(getattr(ida_segment, "SEGPERM_EXEC", 1)) or seg_class.upper() == "BSS":
+            continue
+        seg_start, seg_end = int(seg.start_ea), int(seg.end_ea)
+        window_start = max(seg_start, int(start)) if start is not None else seg_start
+        window_end = min(seg_end, int(end)) if end is not None else seg_end
+        if window_end > window_start:
+            eligible.append((seg, window_start, window_end, ida_segment.get_segm_name(seg) or ""))
+
+    scoped_start = int(start) if start is not None else None
+    scoped_end = int(end) if end is not None else None
+    if scoped_start is None and scoped_end is None:
+        connection.execute("DELETE FROM data_pointer_slots")
+    else:
+        clauses, values = [], []
+        if scoped_start is not None:
+            clauses.append("source_ea>=?"); values.append(sqlite_ea(scoped_start))
+        if scoped_end is not None:
+            clauses.append("source_ea<?"); values.append(sqlite_ea(scoped_end))
+        connection.execute("DELETE FROM data_pointer_slots WHERE " + " AND ".join(clauses), values)
+
+    scanned_bytes = 0
+    rows = []
+    skipped = []
+    total_entries = 0
+    truncated = False
+    byteorder = "big" if ida_ida.inf_is_be() else "little"
+    now = utc_now()
+    max_chunk = 1 << 20
+    for seg, window_start, window_end, seg_name in eligible:
+        if scanned_bytes >= max_bytes:
+            truncated = True
+            skipped.append({"segment": seg_name, "start": window_start, "end": window_end, "reason": "max_bytes"})
+            continue
+        segment_start = window_start
+        remaining_budget = max_bytes - scanned_bytes
+        allowed_end = min(window_end, segment_start + remaining_budget)
+        if allowed_end < window_end:
+            truncated = True
+        cursor = segment_start
+        first_aligned = cursor + ((pointer_size - (cursor % pointer_size)) % pointer_size)
+        while cursor < allowed_end:
+            primary_end = min(allowed_end, cursor + max_chunk)
+            raw = ida_bytes.get_bytes(cursor, primary_end - cursor)
+            if raw is None:
+                skipped.append({"segment": seg_name, "start": cursor, "end": primary_end, "reason": "unloaded_or_unreadable"})
+                cursor = primary_end
+                continue
+            data = bytes(raw)
+            scanned_bytes += len(data)
+            position = first_aligned - cursor if first_aligned >= cursor else 0
+            if position % pointer_size:
+                position += pointer_size - (position % pointer_size)
+            while position + pointer_size <= len(data):
+                source_ea = cursor + position
+                if source_ea >= primary_end:
+                    break
+                value = int.from_bytes(data[position:position + pointer_size], byteorder, signed=False)
+                if value == 0:
+                    target_ea, target_func_ea, target_name, target_kind, target_segment = None, None, None, "null", None
+                else:
+                    target_seg = ida_segment.getseg(value)
+                    if target_seg is None:
+                        position += pointer_size
+                        continue
+                    target_func = ida_funcs.get_func(value)
+                    target_name = ida_name.get_name(value) or None
+                    target_segment = ida_segment.get_segm_name(target_seg) or ""
+                    if target_func is not None and int(target_func.start_ea) == value:
+                        target_ea = int(target_func.start_ea)
+                        target_func_ea = int(target_func.start_ea)
+                        target_kind = "function"
+                    elif ida_bytes.is_code(ida_bytes.get_full_flags(value)):
+                        target_ea, target_func_ea, target_kind = value, None, "code"
+                    else:
+                        target_ea, target_func_ea, target_kind = value, None, "data"
+                rows.append((sqlite_ea(source_ea), sqlite_ea(value),
+                    sqlite_ea(target_ea) if target_ea is not None else None,
+                    pointer_size, seg_name, target_segment,
+                    sqlite_ea(target_func_ea) if target_func_ea is not None else None,
+                    target_name, target_kind, now))
+                total_entries += 1
+                position += pointer_size
+            if len(rows) >= 4096:
+                connection.executemany(
+                    "INSERT OR REPLACE INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    rows,
+                )
+                rows.clear()
+            cursor = primary_end
+            first_aligned = cursor + ((pointer_size - (cursor % pointer_size)) % pointer_size)
+    if rows:
+        connection.executemany(
+            "INSERT OR REPLACE INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+    connection.commit()
+    result = {
+        "pointer_size": pointer_size, "byteorder": byteorder,
+        "segments_considered": len(eligible), "scanned_bytes": scanned_bytes,
+        "pointer_entries": total_entries, "truncated": truncated, "skipped": skipped,
+        "source": "aligned_loaded_pointers_in_readable_non_executable_non_bss_segments",
+        "scope": {"start": scoped_start, "end": scoped_end},
+    }
+    set_metadata(connection, {"data_pointer_scan": {**result, "generated_at": now}})
+    connection.commit()
+    return result
+
+
+def build_vtables(
+    connection, *, abi: str, start: int | None = None, end: int | None = None,
+    min_function_slots: int = 2, max_slots: int = 512, max_bytes: int = 256 << 20,
+) -> dict:
+    """Refresh durable data-pointer inputs and build the offline vtable index."""
+    pointer_size = 8 if ida_ida.inf_is_64bit() else 4
+    pointer_scan = scan_data_pointer_slots(
+        connection, pointer_size=pointer_size, start=start, end=end, max_bytes=max_bytes,
+    )
+    from .virtual_tables import build_vtable_index
+
+    result = build_vtable_index(
+        connection, abi=abi, pointer_size=pointer_size,
+        byteorder="big" if ida_ida.inf_is_be() else "little", start=start, end=end,
+        min_function_slots=min_function_slots, max_slots=max_slots,
+    )
+    result["pointer_scan"] = pointer_scan
+    return result
+
+
 def synchronize_function(output: str | Path, idb_path: str | Path, address: int) -> dict:
     """Refresh one function after a function-local decompiler edit."""
     if not ida_auto.auto_wait():
@@ -781,6 +936,7 @@ def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: 
             "max_ea": int(_safe(ida_ida.inf_get_max_ea, 0) or 0),
             "bitness": 64 if ida_ida.inf_is_64bit() else 32,
             "big_endian": bool(ida_ida.inf_is_be()),
+            "architecture": _safe(ida_idp.get_idp_name, None),
             "idb_path": str(Path(idb_path).resolve()),
             "generated_at": utc_now(),
         }

@@ -64,6 +64,25 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
             "micro_flow": "function_ea",
             "functions": "start_ea", "instructions": "ea"}
     if not separator or table not in keys:
+        if separator and table in ("vtable", "vcall"):
+            artifact_table = "vtable_candidates" if table == "vtable" else "vcall_sites"
+            id_column = "candidate_id" if table == "vtable" else "call_id"
+            row = connection.execute(f"SELECT * FROM {artifact_table} WHERE {id_column}=?", (address,)).fetchone()
+            if row is None:
+                return hashlib.sha256(b"missing").hexdigest()
+            data = {key: row[key] for key in row.keys() if key not in ("created_at",)}
+            if table == "vtable":
+                data["slots"] = [tuple(slot) for slot in connection.execute(
+                    "SELECT slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,is_thunk,thunk_target_ea,thunk_chain_json,adjustment_json,evidence_json,source_snapshot_hash,stale "
+                    "FROM vtable_slots WHERE candidate_id=? ORDER BY slot_index", (address,))]
+            else:
+                data["targets"] = [tuple(target) for target in connection.execute(
+                    "SELECT candidate_id,slot_index,target_ea,thunk_target_ea,status,reason,evidence_json,source_snapshot_hash,stale "
+                    "FROM vcall_targets WHERE call_id=? ORDER BY target_id", (address,))]
+                data["flows"] = [tuple(flow) for flow in connection.execute(
+                    "SELECT path_order,node_json,edge_json,status,source_snapshot_hash,stale "
+                    "FROM receiver_flows WHERE call_id=? ORDER BY path_order", (address,))]
+            return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
         return None
     try:
         ea = sqlite_ea(parse_int(address))

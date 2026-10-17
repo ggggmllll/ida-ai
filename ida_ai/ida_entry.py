@@ -62,6 +62,10 @@ def dispatch(request: dict) -> dict:
             return ida_export.synchronize_database(db_path, idb_path, request.get("all_views", False))
         if action == "export_view":
             return ida_export.export_views(connection, request["addresses"], request["view"])
+        if action == "vtable_build":
+            return ida_export.build_vtables(connection, abi=request["abi"], start=request.get("start"),
+                end=request.get("end"), min_function_slots=request.get("min_function_slots", 2),
+                max_slots=request.get("max_slots", 512), max_bytes=request.get("max_bytes", 256 << 20))
         if action == "info":
             if "file_offset" in request:
                 return ida_export.file_offset_info(request["file_offset"])
