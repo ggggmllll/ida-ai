@@ -285,6 +285,23 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(len(shown["targets"]), 1)
         self.assertEqual(shown["targets"][0]["entry_classification"], "thunk")
 
+    def test_rebuilding_vtable_index_stales_saved_vcall_targets(self):
+        function = self._add_vcall_fixture()
+        build_vtable_index(self.connection, abi="itanium")
+        build_vcall_index(self.connection, function_eas=[function])
+        site = list_vcalls(self.connection, function_ea=function)["items"][0]
+        analyze_vcall(self.connection, call_id=site["call_id"])
+        self.assertEqual(len(show_vcall(self.connection, call_id=site["call_id"])["targets"]), 1)
+
+        self.connection.execute(
+            "UPDATE data_pointer_slots SET target_name='changed_symbol' WHERE source_ea=?", (0x5100,))
+        self.connection.commit()
+        build_vtable_index(self.connection, abi="itanium")
+        self.assertEqual(show_vcall(self.connection, call_id=site["call_id"])["targets"], [])
+        historical = show_vcall(self.connection, call_id=site["call_id"], include_stale=True)
+        self.assertEqual(len(historical["targets"]), 1)
+        self.assertTrue(historical["targets"][0]["stale"])
+
     def test_table_slot_classifications_preserve_nullstub_runtime_and_library_traits(self):
         self.connection.executemany(
             "INSERT INTO functions(start_ea,end_ea,name,demangled_name,size,is_library,is_thunk,is_nullstub) "
@@ -309,7 +326,7 @@ class VirtualTableTests(unittest.TestCase):
         build_vtable_index(self.connection, abi="itanium")
         candidate = show_vtable(self.connection, address=0x5200)["items"][0]
         self.assertEqual([slot["entry_classification"] for slot in candidate["slots"]],
-            ["nullstub", "library_function", "import_thunk", "pure_virtual_runtime_named",
+            ["nullstub", "library_function", "library_thunk", "pure_virtual_runtime_named",
              "deleted_virtual_runtime_named", "null_slot"])
         self.assertEqual(candidate["slots"][0]["is_nullstub"], 1)
         self.assertEqual(candidate["slots"][1]["is_library"], 1)

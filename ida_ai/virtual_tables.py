@@ -18,7 +18,7 @@ from typing import Any
 from .db import get_metadata, ida_ea, sqlite_ea, utc_now
 
 
-VTABLE_PARSER_VERSION = "4"
+VTABLE_PARSER_VERSION = "5"
 VCALL_DETECTOR_VERSION = "3"
 SUPPORTED_ABIS = ("itanium",)
 
@@ -56,7 +56,7 @@ def _classify_table_entry(target_kind: str, target_name: str | None, *, is_nulls
     if is_nullstub:
         return "nullstub"
     if is_thunk and is_library:
-        return "import_thunk"
+        return "library_thunk"
     if is_thunk:
         return "thunk"
     if is_library:
@@ -408,6 +408,7 @@ def build_vtable_index(
         connection.execute("UPDATE vtable_candidates SET stale=1 WHERE stale=0")
         connection.execute("UPDATE vtable_slots SET stale=1 WHERE stale=0")
         connection.execute("UPDATE vtable_evidence SET stale=1 WHERE stale=0")
+        connection.execute("UPDATE vcall_targets SET stale=1 WHERE stale=0")
         connection.execute("UPDATE vtable_runs SET status='stale' WHERE status NOT IN ('stale','error')")
         connection.execute(
             "INSERT INTO vtable_runs(run_id,source_snapshot_hash,abi,architecture,pointer_size,byteorder,scope_json,parser_version,status,result_json,created_at) "

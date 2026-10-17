@@ -605,7 +605,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             "WHEN lower(COALESCE(target_name,'')) LIKE '%__cxa_pure_virtual%' OR lower(COALESCE(target_name,'')) LIKE '%_purecall%' THEN 'pure_virtual_runtime_named' "
             "WHEN lower(COALESCE(target_name,'')) LIKE '%__cxa_deleted_virtual%' THEN 'deleted_virtual_runtime_named' "
             "WHEN target_kind='function' AND is_nullstub=1 THEN 'nullstub' "
-            "WHEN target_kind='function' AND is_thunk=1 AND is_library=1 THEN 'import_thunk' "
+            "WHEN target_kind='function' AND is_thunk=1 AND is_library=1 THEN 'library_thunk' "
             "WHEN target_kind='function' AND is_thunk=1 THEN 'thunk' "
             "WHEN target_kind='function' AND is_library=1 THEN 'library_function' "
             "WHEN target_kind='function' THEN 'function' "
