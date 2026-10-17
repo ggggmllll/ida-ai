@@ -11,7 +11,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import Any
 
@@ -75,6 +75,22 @@ def _classify_table_entry(target_kind: str, target_name: str | None, *, is_nulls
 def _identity(connection: sqlite3.Connection) -> dict[str, Any]:
     keys = ("root_filename", "input_path", "imagebase", "bitness", "big_endian")
     return {key: get_metadata(connection, key) for key in keys}
+
+
+def _stale_class_relationships(connection: sqlite3.Connection) -> None:
+    """Keep saved class-relation artifacts from appearing current after input changes."""
+    connection.execute("UPDATE vtable_class_relation_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+    connection.execute("UPDATE vtable_class_relationships SET stale=1 WHERE stale=0")
+
+
+def _current_vtable_candidates(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return candidates whose parent table run still matches current raw observations."""
+    current_hash = _source_hash(connection, "vtable")
+    return _rows(connection,
+        "SELECT c.candidate_id,c.address_point,c.table_address,c.pointer_size,c.abi "
+        "FROM vtable_candidates c JOIN vtable_runs r USING(run_id) "
+        "WHERE c.stale=0 AND r.status='ok' AND r.source_snapshot_hash=? "
+        "ORDER BY c.address_point,c.candidate_id", (current_hash,))
 
 
 def _rows(connection: sqlite3.Connection, query: str, parameters: tuple = ()) -> list[dict[str, Any]]:
@@ -416,6 +432,7 @@ def store_itanium_rtti_descriptors(
         "coverage": coverage,
     }
     with connection:
+        previous_rtti_run_id = get_metadata(connection, "active_rtti_run_id")
         if existing is None:
             connection.execute(
                 "INSERT INTO rtti_runs(rtti_run_id,input_snapshot_hash,descriptor_snapshot_hash,status,result_json,created_at) "
@@ -431,6 +448,8 @@ def store_itanium_rtti_descriptors(
                   item["type_name"], item["flags"], item["base_count"], _json(item["bases"]), _json(item["evidence"]))
                  for item in parsed],
             )
+        if previous_rtti_run_id != rtti_run_id:
+            _stale_class_relationships(connection)
         set_metadata(connection, {"active_rtti_run_id": rtti_run_id})
     return {**result, "cached": existing is not None}
 
@@ -667,6 +686,7 @@ def build_vtable_index(
         "scope": scope,
     }
     with connection:
+        _stale_class_relationships(connection)
         connection.execute("UPDATE vtable_candidates SET stale=1 WHERE stale=0")
         connection.execute("UPDATE vtable_slots SET stale=1 WHERE stale=0")
         connection.execute("UPDATE vtable_evidence SET stale=1 WHERE stale=0")
@@ -1286,18 +1306,42 @@ def _object_view(operand: dict[str, Any], offset: int) -> dict[str, Any] | None:
             "root_kind": root[0], "root_value": root[1], "root_text": operand.get("text")}
 
 
-def _vptr_write_source_snapshot(connection: sqlite3.Connection, function_eas: Iterable[int]) -> str:
-    """Hash the exact microcode and table candidates consumed by a write scan."""
-    selected = sorted(set(int(ea) for ea in function_eas))
-    microcode_hash = _source_hash(connection, "vcall", selected)
-    table_rows = _rows(connection,
-        "SELECT c.candidate_id,c.address_point,c.table_address,c.pointer_size,c.abi "
-        "FROM vtable_candidates c WHERE c.stale=0 ORDER BY c.address_point,c.candidate_id")
-    return _digest({"microcode": microcode_hash, "tables": table_rows})
+def _vptr_write_source_snapshot(
+    connection: sqlite3.Connection, function_eas: Iterable[int], view_name: str = "microcode",
+) -> str:
+    """Hash the exact function view and current address points consumed by a write scan."""
+    if view_name not in ("microcode", "micro_flow"):
+        raise ValueError("view_name must be microcode or micro_flow")
+    selected = sorted(set(sqlite_ea(int(ea)) for ea in function_eas))
+    summary_table = view_name
+    instruction_table = "micro_instructions" if view_name == "microcode" else "micro_flow_instructions"
+    placeholders = ",".join("?" for _ in selected)
+    summaries = []
+    instructions = []
+    blocks = []
+    if selected:
+        summary_columns = ("function_ea,maturity,backend,status,error,decompiler_version,instruction_count,"
+                           "content_hash,relations_json")
+        if view_name == "micro_flow":
+            summary_columns += ",arguments_json,return_json,locals_json"
+        summaries = [tuple(row) for row in connection.execute(
+            f"SELECT {summary_columns} FROM {summary_table} WHERE function_ea IN ({placeholders}) "
+            "ORDER BY function_ea", selected)]
+        instructions = [tuple(row) for row in connection.execute(
+            f"SELECT function_ea,block_serial,ordinal,ea,opcode,text,l_json,r_json,d_json FROM {instruction_table} "
+            f"WHERE function_ea IN ({placeholders}) ORDER BY function_ea,block_serial,ordinal", selected)]
+        blocks = [tuple(row) for row in connection.execute(
+            f"SELECT view_name,function_ea,block_serial,predecessors_json,successors_json,instruction_count "
+            f"FROM micro_blocks WHERE view_name=? AND function_ea IN ({placeholders}) "
+            "ORDER BY function_ea,block_serial", (view_name, *selected))]
+    table_rows = _current_vtable_candidates(connection)
+    return _digest({"identity": _identity(connection), "view_name": view_name, "function_eas": selected,
+        "summaries": summaries, "instructions": instructions, "blocks": blocks, "tables": table_rows})
 
 
 def build_vptr_write_index(
     connection: sqlite3.Connection, *, function_eas: list[int], max_writes: int = 100000,
+    view_name: str = "microcode",
 ) -> dict[str, Any]:
     """Index function-local stores of exact indexed address points.
 
@@ -1307,12 +1351,12 @@ def build_vptr_write_index(
 
     if max_writes < 1:
         raise ValueError("max_writes must be positive")
+    if view_name not in ("microcode", "micro_flow"):
+        raise ValueError("view_name must be microcode or micro_flow")
     selected = sorted(set(int(ea) for ea in function_eas))
-    source_snapshot_hash = _vptr_write_source_snapshot(connection, selected)
-    table_rows = _rows(connection,
-        "SELECT c.candidate_id,c.address_point,c.table_address,c.pointer_size,c.abi "
-        "FROM vtable_candidates c WHERE c.stale=0 ORDER BY c.address_point,c.candidate_id")
-    scope = {"function_eas": selected, "max_writes": max_writes}
+    source_snapshot_hash = _vptr_write_source_snapshot(connection, selected, view_name)
+    table_rows = _current_vtable_candidates(connection)
+    scope = {"function_eas": selected, "max_writes": max_writes, "view_name": view_name}
     run_id = _id("VPWR", {"source": source_snapshot_hash, "scope": scope,
         "detector": VPTR_WRITE_DETECTOR_VERSION})
     existing = connection.execute("SELECT status,result_json FROM vptr_write_runs WHERE run_id=?",
@@ -1332,7 +1376,9 @@ def build_vptr_write_index(
     missing, failures = [], []
     truncated = False
     for function_ea in selected:
-        summary = connection.execute("SELECT status,relations_json FROM microcode WHERE function_ea=?",
+        summary_table = view_name
+        instructions = _instructions_for_function(connection, function_ea, view_name)
+        summary = connection.execute(f"SELECT status,relations_json FROM {summary_table} WHERE function_ea=?",
             (sqlite_ea(function_ea),)).fetchone()
         if summary is None:
             missing.append(function_ea)
@@ -1340,8 +1386,7 @@ def build_vptr_write_index(
         if summary["status"] != "ok":
             failures.append({"function_ea": function_ea, "status": summary["status"]})
             continue
-        instructions = _instructions_for_function(connection, function_ea)
-        relations = _microcode_relations_for_function(connection, function_ea, summary)
+        relations = _microcode_relations_for_function(connection, function_ea, summary, view_name)
         for instruction in instructions:
             if instruction["opcode"] != "stx":
                 continue
@@ -1368,7 +1413,7 @@ def build_vptr_write_index(
                     "evidence": {"instruction": instruction["text"], "store_value": instruction["l"],
                         "store_address": _store_address_operand(instruction), "value_definition_chain": chain,
                         "control_flow_cfg_complete": relations.get("cfg", {}).get("complete"),
-                        "source_snapshot_hash": source_snapshot_hash,
+                        "source_snapshot_hash": source_snapshot_hash, "source_view": view_name,
                         "unknown_frontier": ["memory aliases and non-register stores",
                             "constructor/destructor semantics and object lifetime",
                             "writes reached through calls or external code"]}}
@@ -1386,16 +1431,19 @@ def build_vptr_write_index(
     has_gaps = bool(missing or failures or not table_rows or not selected)
     status = "partial" if truncated or has_gaps else "ok"
     result = {"write_count": len(writes), "coverage": {
-        "selected_functions": len(selected), "functions_missing_microcode": missing,
+        "selected_functions": len(selected), "functions_missing_view": missing,
+        "functions_missing_microcode": missing if view_name == "microcode" else [],
         "functions_with_export_errors": failures, "candidate_limit": max_writes,
         "current_vtable_candidates": len(table_rows),
         "vtable_candidates_available": bool(table_rows),
-        "truncated": truncated, "source_snapshot_hash": source_snapshot_hash}, "scope": scope,
+        "truncated": truncated, "source_snapshot_hash": source_snapshot_hash, "source_view": view_name}, "scope": scope,
         "status": status}
-    affected_call_runs = _runs_intersecting_functions(connection, "vcall_runs", selected)
+    affected_call_runs = (_runs_intersecting_functions(connection, "vcall_runs", selected)
+        if view_name == "microcode" else [])
     now = utc_now()
     with connection:
-        old_runs = _runs_intersecting_functions(connection, "vptr_write_runs", selected)
+        _stale_class_relationships(connection)
+        old_runs = _runs_intersecting_functions(connection, "vptr_write_runs", selected, view_name=view_name)
         if old_runs:
             run_marks = ",".join("?" for _ in old_runs)
             connection.execute(f"UPDATE vptr_writes SET stale=1 WHERE run_id IN ({run_marks})", old_runs)
@@ -1456,13 +1504,16 @@ def _prior_vptr_write_candidates(
         try:
             run_scope = json.loads(run["scope_json"])
             run_functions = [int(ea) for ea in run_scope.get("function_eas", [])]
+            run_view = run_scope.get("view_name", "microcode")
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        if function_ea not in run_functions:
+        # A call's block/ordinal coordinates come from GLBOPT3. LVARS has a
+        # different instruction view and cannot establish order against them.
+        if function_ea not in run_functions or run_view != "microcode":
             continue
         scoped_runs.append(run)
         if run["status"] in ("ok", "partial"):
-            current_hash = _vptr_write_source_snapshot(connection, run_functions)
+            current_hash = _vptr_write_source_snapshot(connection, run_functions, run_view)
             if current_hash == run["source_snapshot_hash"]:
                 current_runs.append(run)
     if current_runs:
@@ -1490,12 +1541,12 @@ def _prior_vptr_write_candidates(
             selected = scope.get("function_eas", [])
         except (TypeError, json.JSONDecodeError):
             continue
-        if function_ea not in selected:
+        if function_ea not in selected or scope.get("view_name", "microcode") != "microcode":
             continue
         selected_key = tuple(sorted(int(ea) for ea in selected))
         current_hash = validated_snapshots.get(selected_key)
         if current_hash is None:
-            current_hash = _vptr_write_source_snapshot(connection, selected_key)
+            current_hash = _vptr_write_source_snapshot(connection, selected_key, "microcode")
             validated_snapshots[selected_key] = current_hash
         if current_hash != row["source_snapshot_hash"]:
             continue
@@ -1535,6 +1586,146 @@ def _prior_vptr_write_candidates(
         ]}
 
 
+def _vptr_write_node(write: sqlite3.Row | dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    """Map an exported LVARS object identity to the existing propagation graph."""
+    function_ea = ida_ea(int(write["function_ea"]))
+    object_view = json.loads(write["object_json"]) if isinstance(write["object_json"], str) else write["object"]
+    identity = object_view.get("identity")
+    if not isinstance(identity, list) or len(identity) != 2:
+        return None, object_view
+    kind, value = identity
+    if kind == "global":
+        node_id = f"global:0x{int(value):X}"
+    elif kind == "local":
+        node_id = f"local:0x{function_ea:X}:{int(value)}"
+    elif kind == "stack":
+        node_id = f"stack:0x{function_ea:X}:{int(value)}"
+    elif kind == "register":
+        node_id = f"value:0x{function_ea:X}:{int(value)}"
+    else:
+        return None, object_view
+    return node_id, object_view
+
+
+def trace_vptr_write_callers(
+    connection: sqlite3.Connection, *, write_id: str, max_hops: int = 12,
+    max_nodes: int = 500, max_edges: int = 4000, max_callers: int = 2000,
+    max_alternatives: int = 4,
+) -> dict[str, Any]:
+    """Trace a current LVARS vptr-store object through the bounded flow graph.
+
+    The trace is a preview of exported value/reference/argument/return edges.
+    It does not establish object lifetime, alias completeness, or runtime reachability.
+    """
+    if min(max_hops, max_nodes, max_edges, max_callers, max_alternatives) < 1:
+        raise ValueError("trace budgets must be positive")
+    row = connection.execute(
+        "SELECT w.*,r.scope_json,r.source_snapshot_hash AS run_source_hash,r.status AS run_status "
+        "FROM vptr_writes w JOIN vptr_write_runs r ON r.run_id=w.run_id WHERE w.write_id=?", (write_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"vptr write not found: {write_id}")
+    scope = json.loads(row["scope_json"])
+    view_name = scope.get("view_name", "microcode")
+    if view_name != "micro_flow":
+        raise ValueError("cross-function vptr tracing requires a micro_flow vptr-write index; rebuild with --view micro_flow")
+    if row["stale"] or row["run_status"] not in ("ok", "partial"):
+        raise ValueError("vptr write is stale; rebuild the selected micro_flow index")
+    function_eas = [int(ea) for ea in scope.get("function_eas", [])]
+    current_hash = _vptr_write_source_snapshot(connection, function_eas, "micro_flow")
+    if current_hash != row["run_source_hash"] or current_hash != row["source_snapshot_hash"]:
+        raise ValueError("vptr write source has changed; rebuild the selected micro_flow index")
+    candidate = connection.execute(
+        "SELECT stale FROM vtable_candidates WHERE candidate_id=?", (row["candidate_id"],),
+    ).fetchone()
+    if candidate is None or candidate["stale"]:
+        raise ValueError("vptr write references a stale or missing table candidate")
+    start_node, object_view = _vptr_write_node(row)
+    if start_node is None:
+        return {"write_id": write_id, "status": "unsupported_object_identity", "paths": [],
+            "object": object_view, "unknown_frontier": ["object root kind is not represented in the LVARS propagation graph"]}
+
+    from .propagation import FAMILIES, _graph, _snapshot_hash
+    snapshot_hash = _snapshot_hash(connection)
+    edges, unresolved, graph_stats = _graph(connection, families=set(FAMILIES), snapshot_hash=snapshot_hash)
+    adjacency: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        adjacency[edge["source"]].append(edge)
+    queue = deque([(start_node, [start_node], [])])
+    per_node_paths: dict[str, int] = defaultdict(int)
+    per_node_paths[start_node] = 1
+    visited_nodes = {start_node}
+    callers: dict[tuple[str, str], dict[str, Any]] = {}
+    truncated = {"max_hops": False, "max_nodes": False, "max_edges": False, "max_callers": False}
+    expanded = 0
+    while queue:
+        node_id, node_path, trace = queue.popleft()
+        if len(trace) >= max_hops:
+            if adjacency.get(node_id):
+                truncated["max_hops"] = True
+            continue
+        source_function = _node_function_id(node_id)
+        for edge in adjacency.get(node_id, []):
+            if expanded >= max_edges:
+                truncated["max_edges"] = True
+                queue.clear()
+                break
+            expanded += 1
+            target = edge["target"]
+            if target in node_path:
+                continue
+            if target not in visited_nodes and len(visited_nodes) >= max_nodes:
+                truncated["max_nodes"] = True
+                queue.clear()
+                break
+            next_trace = trace + [edge]
+            target_function = _node_function_id(target)
+            if (source_function is not None and target_function is not None
+                    and source_function != target_function):
+                key = (target_function, target)
+                if key not in callers:
+                    if len(callers) >= max_callers:
+                        truncated["max_callers"] = True
+                        queue.clear()
+                        break
+                    callers[key] = {"function_ea": target_function, "node_id": target,
+                        "path_nodes": [*node_path, target], "trace": next_trace,
+                        "has_hypothesis_edge": any(item.get("confidence") == "hypothesis"
+                            or item.get("uncertain") for item in next_trace)}
+            if per_node_paths[target] >= max_alternatives:
+                continue
+            per_node_paths[target] += 1
+            visited_nodes.add(target)
+            queue.append((target, [*node_path, target], next_trace))
+
+    relevant_functions = {_node_function_id(item) for item in visited_nodes}
+    relevant_unresolved = [item for item in unresolved
+        if item.get("function_ea") in relevant_functions]
+    status = "partial" if any(truncated.values()) or relevant_unresolved else (
+        "caller_paths_found" if callers else "no_caller_path_within_exported_flow")
+    return {"write_id": write_id, "status": status, "preview_only": True,
+        "source_snapshot_hash": row["run_source_hash"], "propagation_snapshot_hash": snapshot_hash,
+        "source_view": view_name, "start_node": start_node, "object": object_view,
+        "vptr_offset": int(row["vptr_offset"] or 0), "address_point": ida_ea(row["address_point"]),
+        "candidate_id": row["candidate_id"], "caller_path_count": len(callers),
+        "caller_paths": list(callers.values()), "visited_nodes": len(visited_nodes),
+        "expanded_edge_count": expanded, "truncated": truncated,
+        "graph": graph_stats, "unresolved": relevant_unresolved,
+        "unknown_frontier": ["only exported direct-call, value/reference, and return edges are traversed",
+            "unrepresented aliases, indirect callers, escaped pointers, memory reuse, and object lifetime",
+            "a path is not proof that the store dominates or reaches a runtime call"]}
+
+
+def _node_function_id(node_id: str) -> int | None:
+    kind, separator, remainder = node_id.partition(":")
+    if not separator or kind not in {"local", "stack", "arg", "return", "value", "callarg", "callresult"}:
+        return None
+    try:
+        return int(remainder.partition(":")[0], 0)
+    except ValueError:
+        return None
+
+
 def list_vptr_writes(
     connection: sqlite3.Connection, *, function_ea: int | None = None,
     address_point: int | None = None, limit: int = 100, offset: int = 0,
@@ -1568,7 +1759,7 @@ def list_vptr_writes(
 
 
 def _runs_intersecting_functions(
-    connection: sqlite3.Connection, table: str, function_eas: Iterable[int],
+    connection: sqlite3.Connection, table: str, function_eas: Iterable[int], *, view_name: str | None = None,
 ) -> list[str]:
     if table not in ("vcall_runs", "vptr_write_runs"):
         raise ValueError("unsupported virtual-analysis run table")
@@ -1578,7 +1769,10 @@ def _runs_intersecting_functions(
     affected = []
     for row in connection.execute(f"SELECT run_id,scope_json FROM {table} WHERE status NOT IN ('stale','error')"):
         try:
-            run_functions = {int(ea) for ea in json.loads(row["scope_json"]).get("function_eas", [])}
+            run_scope = json.loads(row["scope_json"])
+            if view_name is not None and run_scope.get("view_name", "microcode") != view_name:
+                continue
+            run_functions = {int(ea) for ea in run_scope.get("function_eas", [])}
         except (TypeError, ValueError, json.JSONDecodeError):
             affected.append(row["run_id"])
             continue
@@ -1588,14 +1782,17 @@ def _runs_intersecting_functions(
 
 
 def invalidate_function_virtual_artifacts(
-    connection: sqlite3.Connection, function_eas: Iterable[int],
+    connection: sqlite3.Connection, function_eas: Iterable[int], *, view_name: str = "microcode",
 ) -> dict[str, int]:
     """Stale function-derived call and vptr-write observations after microcode refresh."""
+    if view_name not in ("microcode", "micro_flow"):
+        raise ValueError("view_name must be microcode or micro_flow")
     selected = sorted(set(sqlite_ea(int(ea)) for ea in function_eas))
     if not selected:
         return {"vcall_sites": 0, "vptr_writes": 0}
     with connection:
-        call_runs = _runs_intersecting_functions(connection, "vcall_runs", [ida_ea(ea) for ea in selected])
+        call_runs = (_runs_intersecting_functions(connection, "vcall_runs", [ida_ea(ea) for ea in selected])
+            if view_name == "microcode" else [])
         call_ids = []
         if call_runs:
             run_marks = ",".join("?" for _ in call_runs)
@@ -1610,9 +1807,11 @@ def invalidate_function_virtual_artifacts(
             run_marks = ",".join("?" for _ in call_runs)
             connection.execute(f"UPDATE vcall_runs SET status='stale' WHERE run_id IN ({run_marks})", call_runs)
 
-        write_runs = _runs_intersecting_functions(connection, "vptr_write_runs", [ida_ea(ea) for ea in selected])
+        write_runs = _runs_intersecting_functions(connection, "vptr_write_runs",
+            [ida_ea(ea) for ea in selected], view_name=view_name)
         write_ids = []
         if write_runs:
+            _stale_class_relationships(connection)
             run_marks = ",".join("?" for _ in write_runs)
             write_ids = [row[0] for row in connection.execute(
                 f"SELECT write_id FROM vptr_writes WHERE run_id IN ({run_marks}) AND stale=0", write_runs)]

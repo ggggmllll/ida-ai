@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def sqlite_ea(address: int) -> int:
@@ -419,6 +419,34 @@ CREATE TABLE IF NOT EXISTS rtti_typeinfos (
 );
 CREATE INDEX IF NOT EXISTS idx_rtti_typeinfos_ea ON rtti_typeinfos(typeinfo_ea,rtti_run_id);
 
+CREATE TABLE IF NOT EXISTS vtable_class_relation_runs (
+    run_id TEXT PRIMARY KEY,
+    source_snapshot_hash TEXT NOT NULL,
+    rtti_run_id TEXT,
+    scope_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vtable_class_relation_runs_snapshot
+    ON vtable_class_relation_runs(source_snapshot_hash,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vtable_class_relationships (
+    relation_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES vtable_class_relation_runs(run_id),
+    derived_typeinfo_ea INTEGER NOT NULL,
+    base_typeinfo_ea INTEGER NOT NULL,
+    base_index INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    source_snapshot_hash TEXT NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_vtable_class_relationships_typeinfos
+    ON vtable_class_relationships(derived_typeinfo_ea,base_typeinfo_ea,stale);
+CREATE INDEX IF NOT EXISTS idx_vtable_class_relationships_run
+    ON vtable_class_relationships(run_id,stale);
+
 CREATE TABLE IF NOT EXISTS vcall_runs (
     run_id TEXT PRIMARY KEY,
     source_snapshot_hash TEXT NOT NULL,
@@ -717,6 +745,8 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
     connection.execute("UPDATE vtable_runs SET status='stale' WHERE status NOT IN ('stale','error')")
     connection.execute("UPDATE vcall_runs SET status='stale' WHERE status NOT IN ('stale','error')")
     connection.execute("UPDATE rtti_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+    connection.execute("UPDATE vtable_class_relation_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+    connection.execute("UPDATE vtable_class_relationships SET stale=1")
     connection.execute("UPDATE vptr_write_runs SET status='stale' WHERE status NOT IN ('stale','error')")
     connection.execute("UPDATE vptr_writes SET stale=1")
 

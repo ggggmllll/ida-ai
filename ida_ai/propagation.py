@@ -273,7 +273,15 @@ def _snapshot_hash(connection: sqlite3.Connection) -> str:
     flow = [tuple(row) for row in connection.execute(
         "SELECT function_ea,maturity,backend,status,error,decompiler_version,instruction_count,content_hash,"
         "arguments_json,return_json,locals_json,relations_json FROM micro_flow ORDER BY function_ea")]
-    encoded = json.dumps({"identity": identity, "functions": functions, "micro_flow": flow},
+    virtual_evidence = {
+        "vptr_write_runs": [tuple(row) for row in connection.execute(
+            "SELECT run_id,source_snapshot_hash,status,result_json FROM vptr_write_runs ORDER BY run_id")],
+        "vptr_writes": [tuple(row) for row in connection.execute(
+            "SELECT write_id,run_id,function_ea,write_ea,block_serial,ordinal,object_json,vptr_offset,address_point,"
+            "candidate_id,status,evidence_json,source_snapshot_hash,stale FROM vptr_writes ORDER BY write_id")],
+    }
+    encoded = json.dumps({"identity": identity, "functions": functions, "micro_flow": flow,
+                          "virtual_evidence": virtual_evidence},
                          sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -786,6 +794,48 @@ def add_edge(connection: sqlite3.Connection, edge: dict[str, Any]) -> dict[str, 
     return {**normalized, "edge_id": edge_ids[0], "snapshot_hash": snapshot_hash}
 
 
+def _vptr_seed_binding(
+    connection: sqlite3.Connection, source_ref: str, node_id: str, constraint: dict[str, Any], basis: str,
+) -> dict[str, Any]:
+    table, separator, write_id = source_ref.partition(":")
+    if not separator or table != "vptr" or not write_id:
+        raise ValueError(f"invalid vptr evidence source_ref: {source_ref}")
+    if basis != "hypothesis":
+        raise ValueError("vptr evidence can only seed a hypothesis; it does not establish source-level class identity")
+    row = connection.execute(
+        "SELECT w.*,r.scope_json,r.source_snapshot_hash AS run_source_hash,r.status AS run_status "
+        "FROM vptr_writes w JOIN vptr_write_runs r ON r.run_id=w.run_id WHERE w.write_id=?", (write_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"evidence source is absent: {source_ref}")
+    scope = json.loads(row["scope_json"])
+    if row["stale"] or row["run_status"] not in ("ok", "partial"):
+        raise ValueError(f"evidence source is stale: {source_ref}")
+    if scope.get("view_name", "microcode") != "micro_flow":
+        raise ValueError("vptr seed evidence requires a micro_flow vptr-write row")
+    function_eas = [int(ea) for ea in scope.get("function_eas", [])]
+    from .virtual_tables import _vptr_write_node, _vptr_write_source_snapshot
+    current = _vptr_write_source_snapshot(connection, function_eas, "micro_flow")
+    if current != row["run_source_hash"] or current != row["source_snapshot_hash"]:
+        raise ValueError(f"evidence source has changed: {source_ref}")
+    candidate = connection.execute(
+        "SELECT stale FROM vtable_candidates WHERE candidate_id=?", (row["candidate_id"],),
+    ).fetchone()
+    if candidate is None or candidate["stale"]:
+        raise ValueError(f"evidence source refers to a stale table candidate: {source_ref}")
+    expected_node, object_view = _vptr_write_node(row)
+    if expected_node is None or expected_node != node_id:
+        raise ValueError(f"vptr evidence object identity does not match seed node {node_id}")
+    observed_offset = int(row["vptr_offset"] or 0)
+    if int(constraint.get("offset", 0)) != observed_offset:
+        raise ValueError(f"seed constraint offset must match the observed vptr subobject offset {observed_offset}")
+    return {"write_id": write_id, "node_id": node_id, "function_ea": ida_ea(row["function_ea"]),
+        "write_ea": ida_ea(row["write_ea"]) if row["write_ea"] is not None else None,
+        "object": object_view, "vptr_offset": observed_offset,
+        "address_point": ida_ea(row["address_point"]), "candidate_id": row["candidate_id"],
+        "source_snapshot_hash": current, "source_view": "micro_flow"}
+
+
 def add_seed(connection: sqlite3.Connection, spec: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(spec, dict):
         raise ValueError("seed specification must be a JSON object")
@@ -797,6 +847,9 @@ def add_seed(connection: sqlite3.Connection, spec: dict[str, Any]) -> dict[str, 
     basis = spec.get("basis", "observed")
     if basis not in {"observed", "confirmed", "hypothesis"}:
         raise ValueError("seed basis must be observed, confirmed, or hypothesis")
+    node = _node(spec["node"])
+    node_id = _node_id(node)
+    constraint = _constraint(spec["constraint"])
     evidence = spec.get("evidence")
     if isinstance(evidence, str):
         evidence = [{"source_ref": "analyst:" + evidence, "description": evidence}]
@@ -815,7 +868,17 @@ def add_seed(connection: sqlite3.Connection, spec: dict[str, Any]) -> dict[str, 
             raise ValueError(f"evidence[{index}] requires source_ref and description")
         fingerprint = None
         table, sep, ea_text = source_ref.partition(":")
-        if sep and table in {"microcode", "micro_flow", "pseudocode", "disassembly"}:
+        if sep and table in {"microcode", "micro_flow", "pseudocode", "disassembly", "vptr"}:
+            if table == "vptr":
+                from .jobs import _artifact_fingerprint
+                binding = _vptr_seed_binding(connection, source_ref, node_id, constraint, basis)
+                fingerprint = _artifact_fingerprint(connection, source_ref)
+                if fingerprint is None or fingerprint == hashlib.sha256(b"missing").hexdigest():
+                    raise ValueError(f"evidence source is absent or stale: {source_ref}")
+                artifact_families.add("vptr")
+                normalized_evidence.append({"source_ref": source_ref, "description": description,
+                    "fingerprint": fingerprint, "binding": binding})
+                continue
             try:
                 ea = _integer(ea_text, "evidence address", nonnegative=True)
             except ValueError as exc:
@@ -830,8 +893,6 @@ def add_seed(connection: sqlite3.Connection, spec: dict[str, Any]) -> dict[str, 
         normalized_evidence.append({"source_ref": source_ref, "description": description, "fingerprint": fingerprint})
     if basis == "observed" and not artifact_families:
         raise ValueError("observed seed requires successful IDA microcode or pseudocode evidence")
-    node = _node(spec["node"])
-    node_id = _node_id(node)
     known = connection.execute("SELECT 1 FROM propagation_nodes WHERE node_id=? AND source_snapshot_hash=?",
                                (node_id, snapshot_hash)).fetchone()
     if known is None:
@@ -846,7 +907,7 @@ def add_seed(connection: sqlite3.Connection, spec: dict[str, Any]) -> dict[str, 
                        "VALUES(?,?,?,?,?)", (node_id, node_kind, json.dumps(node, sort_keys=True),
                                                 snapshot_hash, utc_now()))
     seed_id = uuid.uuid4().hex
-    run_spec = {"kind": "seed", "node_id": node_id, "constraint": _constraint(spec["constraint"]),
+    run_spec = {"kind": "seed", "node_id": node_id, "constraint": constraint,
                 "basis": basis, "evidence": normalized_evidence}
     connection.execute("INSERT INTO propagation_runs(run_id,request_hash,snapshot_hash,request_json,result_json,created_at) VALUES(?,?,?,?,?,?)",
                        (seed_id, hashlib.sha256(json.dumps(run_spec, sort_keys=True).encode()).hexdigest(), snapshot_hash,

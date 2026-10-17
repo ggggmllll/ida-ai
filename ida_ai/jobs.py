@@ -66,14 +66,52 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
             "micro_flow": "function_ea",
             "functions": "start_ea", "instructions": "ea"}
     if not separator or table not in keys:
-        if separator and table in ("vtable", "vcall", "vptr"):
+        if separator and table in ("vtable", "vcall", "vptr", "vrel"):
             artifact_table = {"vtable": "vtable_candidates", "vcall": "vcall_sites",
-                "vptr": "vptr_writes"}[table]
-            id_column = {"vtable": "candidate_id", "vcall": "call_id", "vptr": "write_id"}[table]
+                "vptr": "vptr_writes", "vrel": "vtable_class_relationships"}[table]
+            id_column = {"vtable": "candidate_id", "vcall": "call_id", "vptr": "write_id",
+                "vrel": "relation_id"}[table]
             row = connection.execute(f"SELECT * FROM {artifact_table} WHERE {id_column}=?", (address,)).fetchone()
             if row is None:
                 return hashlib.sha256(b"missing").hexdigest()
+            if table == "vptr":
+                if row["stale"]:
+                    return hashlib.sha256(b"missing").hexdigest()
+                run = connection.execute(
+                    "SELECT * FROM vptr_write_runs WHERE run_id=?", (row["run_id"],),
+                ).fetchone()
+                if run is None or run["status"] not in ("ok", "partial"):
+                    return hashlib.sha256(b"missing").hexdigest()
+                try:
+                    scope = json.loads(run["scope_json"])
+                    view_name = scope.get("view_name", "microcode")
+                    functions = [int(ea) for ea in scope.get("function_eas", [])]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return hashlib.sha256(b"missing").hexdigest()
+                from .virtual_tables import _vptr_write_source_snapshot
+                current = _vptr_write_source_snapshot(connection, functions, view_name)
+                if current != run["source_snapshot_hash"] or current != row["source_snapshot_hash"]:
+                    return hashlib.sha256(b"missing").hexdigest()
+                candidate = connection.execute(
+                    "SELECT stale FROM vtable_candidates WHERE candidate_id=?", (row["candidate_id"],),
+                ).fetchone()
+                if candidate is None or candidate["stale"]:
+                    return hashlib.sha256(b"missing").hexdigest()
+            if table == "vrel":
+                if row["stale"]:
+                    return hashlib.sha256(b"missing").hexdigest()
+                run = connection.execute(
+                    "SELECT * FROM vtable_class_relation_runs WHERE run_id=?", (row["run_id"],),
+                ).fetchone()
+                if run is None or run["status"] not in ("ok", "partial"):
+                    return hashlib.sha256(b"missing").hexdigest()
+                from .vtable_types import _class_relationship_source
+                current, _, _ = _class_relationship_source(connection)
+                if current != run["source_snapshot_hash"] or current != row["source_snapshot_hash"]:
+                    return hashlib.sha256(b"missing").hexdigest()
             data = {key: row[key] for key in row.keys() if key not in ("created_at",)}
+            if table == "vrel":
+                data["run"] = dict(run)
             if table == "vtable":
                 data["slots"] = [tuple(slot) for slot in connection.execute(
                     "SELECT slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,entry_classification,is_nullstub,is_library,is_thunk,thunk_target_ea,thunk_chain_json,adjustment_json,evidence_json,source_snapshot_hash,stale "
@@ -85,7 +123,7 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
                 data["flows"] = [tuple(flow) for flow in connection.execute(
                     "SELECT path_order,node_json,edge_json,status,source_snapshot_hash,stale "
                     "FROM receiver_flows WHERE call_id=? ORDER BY path_order", (address,))]
-            else:
+            elif table == "vptr":
                 data["run"] = dict(connection.execute(
                     "SELECT * FROM vptr_write_runs WHERE run_id=?", (row["run_id"],)).fetchone() or {})
             return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()

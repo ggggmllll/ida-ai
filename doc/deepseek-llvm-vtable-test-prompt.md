@@ -1,6 +1,6 @@
 # DeepSeek 虚表与虚调用盲测提示词：LLVM clang.exe
 
-你将执行一次虚表候选、函数内 vptr 写入和虚调用分析的黑盒盲测。实验目标是判断工具在大型、去调试信息的 C++ 二进制上能否提供可复核证据，不能把候选索引或匹配分数写成已证明的类层次或运行时目标。
+你将执行一次虚表候选、函数内 vptr 写入、有限跨函数对象路径、类关系候选和虚调用分析的黑盒盲测。实验目标是判断工具在大型、去调试信息的 C++ 二进制上能否提供可复核证据，不能把候选索引或匹配分数写成已证明的类层次或运行时目标。
 
 ## 目标和实验边界
 
@@ -36,7 +36,7 @@ Get-FileHash -LiteralPath 'D:\IDA Scripts\targets\llvm-project\build-ai-stripped
 
 报告和全部实验产物写入 `D:\IDA Scripts\ida-ai\agent_reports\deepseek-llvm\`；该目录由仓库 `.gitignore` 排除。提交代码仓库时不要强制添加这些本地报告、数据库、IDB 或缓存。
 
-开始前阅读相关 skills：`ida-ai-init`、`ida-ai-sql`、`ida-ai-job-create`、`ida-ai-job-resume`、`ida-ai-job-revise`、`ida-ai-job-show`、`ida-ai-job-check`、`ida-ai-vtable-build`、`ida-ai-vtable-list`、`ida-ai-vtable-show`、`ida-ai-vtable-search`、`ida-ai-vcall-build`、`ida-ai-vcall-analyze`、`ida-ai-vcall-show`、`ida-ai-vptr-write-build`、`ida-ai-vptr-write-list`、`ida-ai-microcode`、`ida-ai-disassembly`、`ida-ai-pseudocode`。CLI 参数以技能和本地 `--help` 为准。
+开始前阅读相关 skills：`ida-ai-init`、`ida-ai-sql`、`ida-ai-job-create`、`ida-ai-job-resume`、`ida-ai-job-revise`、`ida-ai-job-show`、`ida-ai-job-check`、`ida-ai-vtable-build`、`ida-ai-vtable-list`、`ida-ai-vtable-show`、`ida-ai-vtable-search`、`ida-ai-vtable-class-relations`、`ida-ai-vtable-type-preview`、`ida-ai-vtable-type-apply`、`ida-ai-vcall-build`、`ida-ai-vcall-analyze`、`ida-ai-vcall-show`、`ida-ai-vptr-write-build`、`ida-ai-vptr-write-list`、`ida-ai-vptr-write-trace`、`ida-ai-type-propagate`、`ida-ai-microcode`、`ida-ai-disassembly`、`ida-ai-pseudocode`。CLI 参数以技能和本地 `--help` 为准。
 
 ## 有界执行流程
 
@@ -46,9 +46,11 @@ Get-FileHash -LiteralPath 'D:\IDA Scripts\targets\llvm-project\build-ai-stripped
 4. 不要第一轮对整个 clang 导出所有伪代码。选择有代表性的有限范围/函数子集，导出 GLBOPT3 microcode，再运行 `vcall-build`。检查调用点召回覆盖、候选链、receiver argument identity/offset、未知 indirect-call 和失败函数。记录具体 block/ordinal/EA，而不只写函数名。
 5. 在已有当前虚表索引后，对同一批函数运行 `vptr-write-build`，或直接使用会刷新微码并同时索引 vptr 写入与调用的 `vcall-build`。抽样核对 store 的 value 定义链、对象 identity、vptr offset、address point 和 CFG 顺序。`vptr-write` 是精确观察到的存储候选，不等于构造函数或存活对象状态。
 6. 对重点 call 使用 `vcall-analyze` 和 `vcall-show`，检查兼容 slot、prior vptr store candidate、thunk 链、槽位分类、unknown frontier 和 source hash。相同槽偏移只产生兼容候选；同函数先前 store 仍无法排除 alias write、调用副作用、对象生命周期或其他未索引路径。
-7. 所有大范围操作使用明确预算和范围；逐步增加样本，不因“0 个候选”就扩大到无上限。每次至少记录命令参数、扫描范围、时间、DB 快照 hash、missing/error/truncated 数。若一次循环没有新证据，停止该分支并写 handoff，不从头重放。
-8. 不要为美化伪代码应用类型。只在单独决策 revision 记录经独立证据支持的有限修改；修改后同步 IDA 与 SQLite，保存受影响函数的前后 microcode/pseudocode hash，并运行 `job-check`。
-9. 盲测结果冻结之后，才允许创建“源码对照评估”阶段。先固定 ground truth 构建身份和评估规则，再对盲测候选计算 precision/recall、槽位/边界误差、目标集合召回与误增、覆盖/unknown/truncated、证据可回查率、上下文成本和 job resume 后重复分析比例。源码对照差异追加新 job revision，不覆盖初始盲测结论。
+7. 对少量重点 vptr write，先在相关函数导出 LVARS `micro_flow`，以 `vptr-write-build --view micro_flow` 建索引，再用 `vptr-write-trace` 追直接 caller 路径。路径只是沿已导出的参数/引用/返回边的预览；记录 budget、未解析边和 unknown frontier。不得把 LVARS block/ordinal 与 GLBOPT3 的 vcall 程序点比较，也不得据此声称写入支配调用。可用 `type-propagate` 对一个精确绑定的 vptr write 建 hypothesis seed 并预览传播；拒绝把它直接作为 confirmed/observed 类型事实。
+8. 若样本确实有可用 RTTI，运行 `vtable-class-relations` 检查基类描述符如何关联到表候选、vptr store 和 thunk；若关闭 RTTI 导致没有边，记录为“没有可用描述符/未覆盖”，不要把它当作无继承证据。检查关系缓存及 source revision 变化后旧 `vrel` job evidence 是否进入 review。
+9. 用 `vtable-type-preview` 验证一个由独立证据支持的窄类型计划，并记录共享实现警告、地址允许范围和 revision token。只有独立证据充分且影响范围可控时，才可在本次隔离的实验 IDB 上运行 `vtable-type-apply`；若缺乏依据就不要为了测试工具而强行修改，记为未执行。任何应用后都保存逐项结果、重新同步、比较受影响视图 hash 并运行 `job-check`。不要为美化伪代码应用类型。
+10. 所有大范围操作使用明确预算和范围；逐步增加样本，不因“0 个候选”就扩大到无上限。每次至少记录命令参数、扫描范围、时间、DB 快照 hash、missing/error/truncated 数。若一次循环没有新证据，停止该分支并写 handoff，不从头重放。
+11. 盲测结果冻结之后，才允许创建“源码对照评估”阶段。先固定 ground truth 构建身份和评估规则，再对盲测候选计算 precision/recall、槽位/边界误差、目标集合召回与误增、跨函数路径的正确率与未知比例、覆盖/unknown/truncated、证据可回查率、上下文成本和 job resume 后重复分析比例。源码对照差异追加新 job revision，不覆盖初始盲测结论。
 
 ## 交付物
 
@@ -56,8 +58,8 @@ Get-FileHash -LiteralPath 'D:\IDA Scripts\targets\llvm-project\build-ai-stripped
 
 1. `deepseek-llvm-vtable-report.md`：哈希、构建元数据、数据库身份、实际命令、候选/槽位/写入/调用覆盖、预算、错误与限制。
 2. 根 job 与子 job 树、每个 head revision 的事实/假设/决定/拒绝摘要、handoff、开放问题、需复核 claim 和停止条件。
-3. 至少 10 个重点候选的可复查样例：vtable candidate、slot、vptr write、call site 与 analyze 结果之间的关联；每项带 EA、candidate/call/write ID、微码 block/ordinal、hash、slot offset 和 unknown frontier。至少包括 3 个支持案例、3 个可疑误报/被排除案例；若总体规模不足，应报告真实数量和覆盖缺口。
-4. 对构造/析构多次写入、次级表、thunk/nullstub、同实现合并、回调/C ops 数组、普通 indirect call、缺 RTTI 和 external/unknown case 的观察。没有观察到的分类明确写“未覆盖”，不要编造样例。
+3. 至少 10 个重点候选的可复查样例：vtable candidate、slot、vptr write、call site 与 analyze 结果之间的关联；每项带 EA、candidate/call/write ID、微码 block/ordinal、hash、slot offset 和 unknown frontier。若运行跨函数追踪/类型工具，另带 LVARS 节点路径、budget、preview ID、revision token 和应用逐项结果。至少包括 3 个支持案例、3 个可疑误报/被排除案例；若总体规模不足，应报告真实数量和覆盖缺口。
+4. 对构造/析构多次写入、次级表、thunk/nullstub、同实现合并、回调/C ops 数组、普通 indirect call、RTTI 可用性、跨函数未知边和 external/unknown case 的观察。没有观察到的分类明确写“未覆盖”，不要编造样例。
 5. 一个阶段冻结的盲测结论，和单独的源码对照评估结果。不得把调试信息、头文件或源代码推出的知识写入盲测章节。
 6. 完整机器可读产物：命令输出 JSON、SQL 核验、样例清单、job revision export，以及 coverage/统计脚本。最终运行 `job-check` 并用只读 SQL 逐条核对报告引用的 ID 和地址。
 

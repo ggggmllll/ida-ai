@@ -48,7 +48,7 @@ def dispatch(request: dict) -> dict:
             function = ida_export.ida_funcs.get_func(request["values"]["address"])
             if function is not None:
                 result["sync"] = ida_export.synchronize_function(db_path, idb_path, request["values"]["address"])
-        elif mutation in ("register_type", "apply_type", "rename_symbol"):
+        elif mutation in ("register_type", "apply_type", "apply_vtable_type_plan", "rename_symbol"):
             result["sync"] = ida_export.synchronize_database(db_path, idb_path, False)
         return result
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -8,6 +9,9 @@ from pathlib import Path
 
 from ida_ai.cli import _parser, _run
 from ida_ai.db import connect, reset_analysis, set_metadata, sqlite_ea
+from ida_ai.propagation import add_seed, preview_seed
+from ida_ai.vtable_types import (assert_type_application_revision, class_relationships,
+                                 preview_vtable_type_plan, type_application_revision)
 from ida_ai.virtual_tables import (
     _trace_vcall_pattern,
     _source_hash,
@@ -23,6 +27,7 @@ from ida_ai.virtual_tables import (
     show_vcall,
     show_vtable,
     store_itanium_rtti_descriptors,
+    trace_vptr_write_callers,
 )
 
 
@@ -259,6 +264,78 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(candidate["evidence"]["class_relationship_status"], "descriptor_has_no_base_edges")
         self.assertEqual(result["rtti_typeinfo_count"], 1)
 
+    def test_class_relationship_and_type_preview_are_revision_checked(self):
+        self.connection.executemany(
+            "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(0x4FF0, 0, None, 8, ".data.rel.ro", None, None, None, "scalar", "now"),
+             (0x4FF8, 0x6000, 0x6000, 8, ".data.rel.ro", ".rodata", None, "derived typeinfo", "data", "now"),
+             (0x50F0, 0, None, 8, ".data.rel.ro", None, None, None, "scalar", "now"),
+             (0x50F8, 0x6100, 0x6100, 8, ".data.rel.ro", ".rodata", None, "base typeinfo", "data", "now")],
+        )
+        self.connection.commit()
+        input_hash = _source_hash(self.connection, "vtable", include_rtti=False)
+        base_raw = (0x7000).to_bytes(8, "little") + (0x7100).to_bytes(8, "little")
+        derived_raw = base_raw + (0).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        derived_raw += (0x6100).to_bytes(8, "little") + ((0x18 << 8) | 2).to_bytes(8, "little")
+        descriptors = [
+            {"typeinfo_ea": 0x6000, "descriptor_kind": "multiple_or_virtual_inheritance",
+             "symbol": "_ZTI7Derived", "type_name_ea": 0x7100, "type_name": "7Derived",
+             "raw_hex": derived_raw.hex(), "read_status": "descriptor_read"},
+            {"typeinfo_ea": 0x6100, "descriptor_kind": "class_type_info",
+             "symbol": "_ZTI4Base", "type_name_ea": 0x7100, "type_name": "4Base",
+             "raw_hex": base_raw.hex(), "read_status": "descriptor_read"},
+        ]
+        store_itanium_rtti_descriptors(self.connection, input_snapshot_hash=input_hash,
+            descriptors=descriptors,
+            coverage={"pointer_size": 8, "byteorder": "little", "max_bases": 128, "truncated": False})
+        build_vtable_index(self.connection, abi="itanium")
+        relationships = class_relationships(self.connection, limit=0)
+        self.assertEqual(relationships["total"], 1)
+        relation = relationships["items"][0]
+        self.assertEqual(relation["derived_typeinfo_ea"], 0x6000)
+        self.assertEqual(relation["base_typeinfo_ea"], 0x6100)
+        self.assertEqual(relation["inheritance"]["byte_offset"], 0x18)
+        self.assertFalse(relation["table_associations"]["derived_ambiguous"])
+        candidate = self.connection.execute("SELECT candidate_id FROM vtable_candidates "
+            "WHERE address_point=? AND stale=0", (sqlite_ea(0x5000),)).fetchone()[0]
+        preview = preview_vtable_type_plan(self.connection, {
+            "candidate_id": candidate, "relation_id": relation["relation_id"],
+            "type_definition": {"name": "Derived", "declaration": "struct Derived { void *vptr; };"},
+            "assignments": [{"address": "0x5000", "declaration": "void **"}],
+            "rationale": "layout remains a hypothesis"})
+        self.assertTrue(preview["preview_only"])
+        self.assertEqual(preview["plan"]["assignments"][0]["evidence_roles"], ["address_point", "slot_entry"])
+        revision = type_application_revision(self.connection)
+        self.assertEqual(revision, preview["revision_token"])
+        assert_type_application_revision(self.connection, revision)
+        with self.assertRaisesRegex(ValueError, "outside this candidate"):
+            preview_vtable_type_plan(self.connection, {"candidate_id": candidate,
+                "type_definition": {"name": "Bad", "declaration": "struct Bad {};"},
+                "assignments": [{"address": "0x9999", "declaration": "void *"}]})
+        self.connection.execute("INSERT INTO type_definitions(name,declaration,updated_at) VALUES(?,?,?)",
+            ("Changed", "struct Changed {};", "now"))
+        self.connection.commit()
+        with self.assertRaisesRegex(ValueError, "revision is stale"):
+            assert_type_application_revision(self.connection, revision)
+
+        from ida_ai.jobs import _artifact_fingerprint
+        relation_ref = f"vrel:{relation['relation_id']}"
+        self.assertNotEqual(_artifact_fingerprint(self.connection, relation_ref),
+                            hashlib.sha256(b"missing").hexdigest())
+        store_itanium_rtti_descriptors(self.connection, input_snapshot_hash=input_hash,
+            descriptors=descriptors,
+            coverage={"pointer_size": 8, "byteorder": "little", "max_bases": 128, "truncated": True})
+        build_vtable_index(self.connection, abi="itanium")
+        refreshed_relations = class_relationships(self.connection, limit=0)
+        self.assertEqual(refreshed_relations["total"], 1)
+        self.assertNotEqual(refreshed_relations["rtti_run_id"], relationships["rtti_run_id"])
+        self.assertEqual(self.connection.execute(
+            "SELECT stale FROM vtable_class_relationships WHERE relation_id=?", (relation["relation_id"],)
+        ).fetchone()["stale"], 1)
+        self.assertEqual(_artifact_fingerprint(self.connection, relation_ref),
+                         hashlib.sha256(b"missing").hexdigest())
+
     def test_vtable_keeps_nonzero_offset_to_top_as_weak_prefix_evidence(self):
         self.connection.executemany(
             "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
@@ -433,8 +510,12 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(empty_run["write_count"], 0)
         calls = build_vcall_index(self.connection, function_eas=[function])
         self.assertEqual(calls["site_count"], 1)
-        self.connection.execute("INSERT INTO vptr_writes(write_id,run_id,function_ea,status,evidence_json,source_snapshot_hash) "
-            "VALUES(?,?,?,?,?,?)", ("fixture-write", empty_run["run_id"], sqlite_ea(function), "test", "{}", "fixture"))
+        current_candidate = self.connection.execute(
+            "SELECT candidate_id,address_point FROM vtable_candidates WHERE stale=0 ORDER BY address_point LIMIT 1").fetchone()
+        self.connection.execute("INSERT INTO vptr_writes(write_id,run_id,function_ea,address_point,candidate_id,status,evidence_json,source_snapshot_hash) "
+            "VALUES(?,?,?,?,?,?,?,?)", ("fixture-write", empty_run["run_id"], sqlite_ea(function),
+                current_candidate["address_point"], current_candidate["candidate_id"], "test", "{}",
+                empty_run["coverage"]["source_snapshot_hash"]))
         self.connection.commit()
         from ida_ai.jobs import _artifact_fingerprint
         before = _artifact_fingerprint(self.connection, "vptr:fixture-write")
@@ -448,6 +529,78 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("SELECT status FROM vcall_runs WHERE run_id=?",
             (calls["run_id"],)).fetchone()[0], "stale")
         self.assertNotEqual(before, _artifact_fingerprint(self.connection, "vptr:fixture-write"))
+
+    def test_vptr_write_trace_follows_direct_call_argument_flow(self):
+        writer, caller = 0x3000, 0x4000
+        self.connection.executemany(
+            "INSERT INTO functions(start_ea,end_ea,name,size) VALUES(?,?,?,?)",
+            [(sqlite_ea(writer), sqlite_ea(writer + 0x100), "write_vptr", 0x100),
+             (sqlite_ea(caller), sqlite_ea(caller + 0x100), "call_writer", 0x100)],
+        )
+        self.connection.executemany(
+            "INSERT INTO micro_flow(function_ea,maturity,backend,status,instruction_count,content_hash,generated_at,arguments_json,return_json,locals_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(sqlite_ea(writer), "MMAT_LVARS", "test", "ok", 1, "writer-flow", "now",
+              json.dumps([{"local_index": 0, "name": "this", "size": 8}]), "{}", "[]"),
+             (sqlite_ea(caller), "MMAT_LVARS", "test", "ok", 1, "caller-flow", "now", "[]", "{}", "[]")],
+        )
+        store_address = _nested("add", _operand("local", local_index=0, local_offset=0, size=8), _number(0), writer)
+        store = _insn(writer, 0, 0, writer, "stx", _number(0x5000), _operand("empty"), store_address)
+        actual = _operand("local", local_index=1, local_offset=0, size=8)
+        call = _insn(caller, 0, 0, caller, "call", _operand("global", address=writer),
+            _operand("empty"), _operand("arglist", callee=writer, arguments=[actual]))
+        self.connection.executemany("INSERT INTO micro_flow_instructions VALUES(?,?,?,?,?,?,?,?,?)", [store, call])
+        self.connection.commit()
+        build_vtable_index(self.connection, abi="itanium")
+        indexed = build_vptr_write_index(self.connection, function_eas=[writer], view_name="micro_flow")
+        self.assertEqual(indexed["write_count"], 1)
+        write = self.connection.execute("SELECT write_id FROM vptr_writes WHERE run_id=?", (indexed["run_id"],)).fetchone()
+        result = trace_vptr_write_callers(self.connection, write_id=write["write_id"])
+        self.assertEqual(result["status"], "caller_paths_found")
+        self.assertEqual(result["caller_path_count"], 1)
+        self.assertEqual(result["caller_paths"][0]["function_ea"], caller)
+        self.assertTrue(any(edge["family"] == "parameter" for edge in result["caller_paths"][0]["trace"]))
+        seed = add_seed(self.connection, {
+            "node": {"kind": "local", "function": writer, "local_index": 0},
+            "constraint": {"kind": "type", "type_name": "derived_t", "offset": 0},
+            "basis": "hypothesis",
+            "evidence": [{"source_ref": f"vptr:{write['write_id']}", "description": "observed address-point store"}],
+        })
+        seed_evidence = self.connection.execute(
+            "SELECT provenance_json FROM propagation_constraints WHERE constraint_id=?", (seed["seed_id"],),
+        ).fetchone()
+        self.assertEqual(json.loads(seed_evidence[0])["evidence"][0]["binding"]["candidate_id"],
+            self.connection.execute("SELECT candidate_id FROM vptr_writes WHERE write_id=?",
+                (write["write_id"],)).fetchone()[0])
+        preview = preview_seed(self.connection, seed["seed_id"])
+        self.assertIn(f"local:0x{caller:X}:1", {item["node_id"] for item in preview["proposals"]})
+        self.assertFalse(next(item for item in preview["proposals"]
+            if item["node_id"] == f"local:0x{caller:X}:1")["acceptable"])
+        with self.assertRaisesRegex(ValueError, "only seed a hypothesis"):
+            add_seed(self.connection, {"node": {"kind": "local", "function": writer, "local_index": 0},
+                "constraint": {"kind": "type", "type_name": "observed_t", "offset": 0}, "basis": "observed",
+                "evidence": [{"source_ref": f"vptr:{write['write_id']}", "description": "unconfirmed type identity"}]})
+        with self.assertRaisesRegex(ValueError, "does not match seed node"):
+            add_seed(self.connection, {"node": {"kind": "local", "function": writer, "local_index": 9},
+                "constraint": {"kind": "type", "type_name": "wrong_t", "offset": 0}, "basis": "hypothesis",
+                "evidence": [{"source_ref": f"vptr:{write['write_id']}", "description": "wrong binding"}]})
+        with self.assertRaisesRegex(ValueError, "offset must match"):
+            add_seed(self.connection, {"node": {"kind": "local", "function": writer, "local_index": 0},
+                "constraint": {"kind": "type", "type_name": "wrong_t", "offset": 8}, "basis": "hypothesis",
+                "evidence": [{"source_ref": f"vptr:{write['write_id']}", "description": "wrong offset"}]})
+        self.assertEqual(invalidate_function_virtual_artifacts(self.connection, [writer],
+            view_name="micro_flow")["vptr_writes"], 1)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            add_seed(self.connection, {"node": {"kind": "local", "function": writer, "local_index": 0},
+                "constraint": {"kind": "type", "type_name": "stale_t", "offset": 0}, "basis": "hypothesis",
+                "evidence": [{"source_ref": f"vptr:{write['write_id']}", "description": "stale write"}]})
+        microcode_run = build_vptr_write_index(self.connection, function_eas=[writer])
+        self.connection.execute("INSERT INTO vptr_writes(write_id,run_id,function_ea,status,evidence_json,source_snapshot_hash) "
+            "VALUES(?,?,?,?,?,?)", ("microcode-write", microcode_run["run_id"], sqlite_ea(writer),
+                "test", "{}", microcode_run["coverage"]["source_snapshot_hash"]))
+        self.connection.commit()
+        with self.assertRaisesRegex(ValueError, "requires a micro_flow"):
+            trace_vptr_write_callers(self.connection, write_id="microcode-write")
 
     def test_table_slot_classifications_preserve_nullstub_runtime_and_library_traits(self):
         self.connection.executemany(
@@ -548,14 +701,31 @@ class VirtualTableTests(unittest.TestCase):
         args = parser.parse_args(["vptr-write-build", "--db", str(self.db_path),
             "--address", hex(function), "--no-refresh"])
         self.assertEqual(_run(args)["coverage"]["selected_functions"], 1)
+        args = parser.parse_args(["vptr-write-build", "--db", str(self.db_path),
+            "--address", hex(function), "--no-refresh", "--view", "micro_flow"])
+        self.assertEqual(_run(args)["coverage"]["source_view"], "micro_flow")
         args = parser.parse_args(["vptr-write-list", "--db", str(self.db_path),
-            "--function", hex(function)])
+            "--function", hex(function + 0x50)])
         self.assertEqual(_run(args)["total"], 0)
         args = parser.parse_args(["vcall-build", "--db", str(self.db_path),
             "--address", hex(function), "--no-refresh"])
         result = _run(args)
         self.assertIn("vptr_write_index", result)
         self.assertEqual(result["site_count"], 1)
+        relations = parser.parse_args(["vtable-class-relations", "--db", str(self.db_path), "--limit", "0"])
+        self.assertEqual(_run(relations)["total"], 0)
+        build_vtable_index(self.connection, abi="itanium")
+        candidate_id = self.connection.execute("SELECT candidate_id FROM vtable_candidates WHERE stale=0 LIMIT 1").fetchone()[0]
+        spec_path = Path(self.temporary.name) / "vtable-type-plan.json"
+        spec_path.write_text(json.dumps({"candidate_id": candidate_id,
+            "type_definition": {"name": "Demo", "declaration": "struct Demo { void *vptr; };"},
+            "assignments": []}), encoding="utf-8")
+        preview_args = parser.parse_args(["vtable-type-preview", "--db", str(self.db_path), "--spec", str(spec_path)])
+        preview = _run(preview_args)
+        self.assertTrue(preview["preview_only"])
+        apply_args = parser.parse_args(["vtable-type-apply", "--db", str(self.db_path), "--spec", str(spec_path),
+            "--preview-id", preview["preview_id"], "--revision-token", preview["revision_token"]])
+        self.assertEqual(apply_args.command, "vtable-type-apply")
 
 
 if __name__ == "__main__":

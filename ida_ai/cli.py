@@ -21,6 +21,7 @@ from .virtual_tables import (analyze_vcall, build_vcall_index, build_vtable_inde
                              build_vptr_write_index, list_vptr_writes,
                              list_vcalls, list_vtables, search_vtables,
                              show_vcall, show_vtable)
+from .vtable_types import class_relationships, preview_vtable_type_plan
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -350,6 +351,23 @@ def _parser() -> argparse.ArgumentParser:
     vtable_search.add_argument("--limit", type=int, default=100)
     vtable_search.add_argument("--include-stale", action="store_true")
 
+    vtable_relations = commands.add_parser("vtable-class-relations", help="join current RTTI base edges to heuristic vtable candidates")
+    _add_db(vtable_relations)
+    vtable_relations.add_argument("--derived-typeinfo", help="filter by derived typeinfo address")
+    vtable_relations.add_argument("--limit", type=int, default=100)
+    vtable_relations.add_argument("--offset", type=int, default=0)
+
+    vtable_type_preview = commands.add_parser("vtable-type-preview", help="validate a vtable type plan without changing IDA")
+    _add_db(vtable_type_preview)
+    vtable_type_preview.add_argument("--spec", required=True, type=Path, help="UTF-8 JSON type plan")
+
+    vtable_type_apply = commands.add_parser("vtable-type-apply", help="apply a current revision-checked vtable type plan")
+    _add_db(vtable_type_apply)
+    _add_ida(vtable_type_apply)
+    vtable_type_apply.add_argument("--spec", required=True, type=Path, help="UTF-8 JSON type plan")
+    vtable_type_apply.add_argument("--preview-id", required=True)
+    vtable_type_apply.add_argument("--revision-token", required=True)
+
     vcall_build = commands.add_parser("vcall-build", help="refresh microcode and index indirect-call/vtable-pattern candidates")
     _add_db(vcall_build)
     _add_ida(vcall_build)
@@ -382,8 +400,10 @@ def _parser() -> argparse.ArgumentParser:
     vptr_write_selection.add_argument("--address", help="address inside one function")
     vptr_write_selection.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"))
     vptr_write_selection.add_argument("--name", help="exact function or demangled name")
-    vptr_write_build.add_argument("--no-refresh", action="store_true", help="use exported microcode only")
+    vptr_write_build.add_argument("--no-refresh", action="store_true", help="use the selected exported microcode view only")
     vptr_write_build.add_argument("--max-writes", type=int, default=100000)
+    vptr_write_build.add_argument("--view", choices=("microcode", "micro_flow"), default="microcode",
+                                  help="index GLBOPT3 microcode or LVARS microcode")
 
     vptr_write_list = commands.add_parser("vptr-write-list", help="list current observed vptr stores")
     _add_db(vptr_write_list)
@@ -392,6 +412,15 @@ def _parser() -> argparse.ArgumentParser:
     vptr_write_list.add_argument("--limit", type=int, default=100)
     vptr_write_list.add_argument("--offset", type=int, default=0)
     vptr_write_list.add_argument("--include-stale", action="store_true")
+
+    vptr_write_trace = commands.add_parser("vptr-write-trace", help="trace a LVARS vptr store through direct-call arguments")
+    _add_db(vptr_write_trace)
+    vptr_write_trace.add_argument("--write-id", required=True)
+    vptr_write_trace.add_argument("--max-hops", type=int, default=6)
+    vptr_write_trace.add_argument("--max-nodes", type=int, default=500)
+    vptr_write_trace.add_argument("--max-edges", type=int, default=4000)
+    vptr_write_trace.add_argument("--max-callers", type=int, default=2000)
+    vptr_write_trace.add_argument("--max-alternatives", type=int, default=4)
     return parser
 
 
@@ -611,6 +640,36 @@ def _run(args: argparse.Namespace) -> dict:
         with closing(connect(args.db)) as connection:
             return search_vtables(connection, target_eas=targets, slot_index=args.slot_index,
                                   abi=args.abi, limit=args.limit, include_stale=args.include_stale)
+    if args.command == "vtable-class-relations":
+        with closing(connect(args.db)) as connection:
+            return class_relationships(connection,
+                derived_typeinfo_ea=parse_int(args.derived_typeinfo) if args.derived_typeinfo is not None else None,
+                limit=args.limit, offset=args.offset)
+    if args.command == "vtable-type-preview":
+        try:
+            spec = json.loads(args.spec.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise FileNotFoundError(f"type preview specification cannot be read: {args.spec}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"type preview specification must be valid JSON: {exc.msg}") from exc
+        with closing(connect(args.db)) as connection:
+            return preview_vtable_type_plan(connection, spec)
+    if args.command == "vtable-type-apply":
+        try:
+            spec = json.loads(args.spec.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise FileNotFoundError(f"type application specification cannot be read: {args.spec}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"type application specification must be valid JSON: {exc.msg}") from exc
+        with closing(connect(args.db)) as connection:
+            preview = preview_vtable_type_plan(connection, spec)
+        if args.preview_id != preview["preview_id"]:
+            raise ValueError("preview ID does not match the current vtable type plan")
+        if args.revision_token != preview["revision_token"]:
+            raise ValueError("revision token is stale; create a fresh type preview")
+        return run_ida("mutate", args.db, mutation="apply_vtable_type_plan",
+            values={"preview": preview, "expected_revision": args.revision_token},
+            idat=args.idat, timeout=args.timeout)
     if args.command == "vcall-build":
         if not args.db.is_file():
             raise FileNotFoundError(f"SQLite analysis database does not exist: {args.db}")
@@ -651,15 +710,24 @@ def _run(args: argparse.Namespace) -> dict:
                 address=args.address, address_range=args.address_range, name=args.name)
         refresh = None
         if not args.no_refresh:
-            refresh = run_ida("export_view", args.db, view="microcode", addresses=addresses,
+            refresh = run_ida("export_view", args.db, view=args.view, addresses=addresses,
                               idat=args.idat, timeout=args.timeout)
         with closing(connect(args.db)) as connection:
-            result = build_vptr_write_index(connection, function_eas=addresses, max_writes=args.max_writes)
+            result = build_vptr_write_index(connection, function_eas=addresses, max_writes=args.max_writes,
+                                            view_name=args.view)
         result["refresh"] = refresh
         result["scope"] = {"function_count": len(addresses),
             "function_addresses": [f"0x{address:X}" for address in addresses],
             "refreshed": not args.no_refresh}
         return result
+    if args.command == "vptr-write-trace":
+        if min(args.max_hops, args.max_nodes, args.max_edges, args.max_callers, args.max_alternatives) < 1:
+            raise ValueError("trace budgets must be positive")
+        with closing(connect(args.db)) as connection:
+            from .virtual_tables import trace_vptr_write_callers
+            return trace_vptr_write_callers(connection, write_id=args.write_id,
+                max_hops=args.max_hops, max_nodes=args.max_nodes, max_edges=args.max_edges,
+                max_callers=args.max_callers, max_alternatives=args.max_alternatives)
     if args.command == "vptr-write-list":
         with closing(connect(args.db)) as connection:
             function_ea = None

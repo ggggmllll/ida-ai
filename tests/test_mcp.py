@@ -55,7 +55,8 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue({"database_summary", "sql_query", "search_code", "export_functions",
                                      "vtable_list", "vtable_show", "vtable_search", "vcall_list",
                                      "analyze_virtual_call", "vcall_show", "vptr_write_list",
-                                     "index_vptr_writes", "index_virtual_calls"} <= names)
+                                     "index_vptr_writes", "trace_vptr_write_callers", "index_virtual_calls",
+                                     "vtable_class_relationships", "vtable_type_preview"} <= names)
                     self.assertNotIn("set_assembly_comment", names)
                     results = await session.call_tool(
                         "search_code",
@@ -100,6 +101,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("rename_symbol", unsafe)
             self.assertIn("set_pseudocode_comment", unsafe)
             self.assertIn("set_local_variable_type", unsafe)
+            self.assertIn("apply_vtable_type_preview", unsafe)
 
 
 if __name__ == "__main__":

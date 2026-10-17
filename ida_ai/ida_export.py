@@ -321,9 +321,9 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
         add_pseudocode_comments(connection, selected)
     elif view in {"microcode", "micro_flow"}:
         result = export_microcode(connection, selected, flow=view == "micro_flow")
-        if view == "microcode":
-            from .virtual_tables import invalidate_function_virtual_artifacts
-            result["virtual_artifacts_invalidated"] = invalidate_function_virtual_artifacts(connection, selected)
+        from .virtual_tables import invalidate_function_virtual_artifacts
+        result["virtual_artifacts_invalidated"] = invalidate_function_virtual_artifacts(
+            connection, selected, view_name=view)
         return result
     else:
         raise ValueError(f"unsupported function view: {view}")
@@ -342,6 +342,17 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
 
 def apply_mutation(connection, idb_path: str | Path, kind: str, values: dict) -> dict:
     """Apply one typed write in IDA, persist it, and mirror its durable input to SQLite."""
+    if kind in ("register_type", "apply_type", "apply_vtable_type_plan") and values.get("expected_revision") is not None:
+        from .vtable_types import assert_type_application_revision
+        assert_type_application_revision(connection, str(values["expected_revision"]))
+    type_plan = None
+    type_plan_result = None
+    if kind == "apply_vtable_type_plan":
+        from .vtable_types import validate_vtable_type_preview
+        spec, checked_preview = validate_vtable_type_preview(connection, values.get("preview"))
+        type_plan = spec
+        if values.get("expected_revision") != checked_preview["revision_token"]:
+            raise ValueError("expected_revision does not match the checked preview")
     now = utc_now()
     address = int(values.get("address", 0))
     function = ida_funcs.get_func(address) if address else None
@@ -417,6 +428,40 @@ def apply_mutation(connection, idb_path: str | Path, kind: str, values: dict) ->
             "ON CONFLICT(address) DO UPDATE SET declaration=excluded.declaration,updated_at=excluded.updated_at",
             (sqlite_ea(address), declaration, now),
         )
+    elif kind == "apply_vtable_type_plan":
+        definition = type_plan["type_definition"]
+        declaration = str(definition["declaration"]).strip()
+        errors = int(idc.parse_decls(declaration, 0))
+        if errors:
+            raise ValueError(f"IDA rejected type declaration (parse errors: {errors})")
+        connection.execute(
+            "INSERT INTO type_definitions(name,declaration,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET declaration=excluded.declaration,updated_at=excluded.updated_at",
+            (str(definition["name"]), declaration, now),
+        )
+        applied, failed = [], None
+        for assignment in type_plan.get("assignments", []):
+            target_ea = int(assignment["address"])
+            target_declaration = str(assignment["declaration"])
+            try:
+                success = bool(idc.SetType(target_ea, target_declaration))
+            except Exception as exc:
+                failed = {"address": target_ea, "declaration": target_declaration, "error": str(exc)}
+                break
+            if not success:
+                failed = {"address": target_ea, "declaration": target_declaration,
+                    "error": "IDA rejected the type assignment"}
+                break
+            connection.execute(
+                "INSERT INTO type_assignments(address,declaration,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(address) DO UPDATE SET declaration=excluded.declaration,updated_at=excluded.updated_at",
+                (sqlite_ea(target_ea), target_declaration, now),
+            )
+            applied.append({"address": target_ea, "declaration": target_declaration})
+        type_plan_result = {"preview_id": values["preview"]["preview_id"],
+            "status": "partial" if failed else "applied", "registered_type": definition["name"],
+            "assignments_applied": applied, "failure": failed,
+            "atomic": False, "revision_token_consumed": values["expected_revision"]}
     elif kind == "rename_symbol":
         name = str(values["name"])
         if not ida_name.set_name(address, name, ida_name.SN_NOWARN):
@@ -466,7 +511,10 @@ def apply_mutation(connection, idb_path: str | Path, kind: str, values: dict) ->
     if not ida_loader.save_database(str(idb_path), 0):
         raise RuntimeError("IDA failed to save the modified database")
     connection.commit()
-    return {"mutation": kind, "address": address or None, "saved": True}
+    result = {"mutation": kind, "address": address or None, "saved": True}
+    if type_plan_result is not None:
+        result["type_plan"] = type_plan_result
+    return result
 
 
 def _segment_info(seg) -> dict | None:
