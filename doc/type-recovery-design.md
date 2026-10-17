@@ -2,9 +2,9 @@
 
 ## Implementation status
 
-Implemented: structured microcode export at MMAT_GLBOPT3 and JSON utilization-form scanning through `type-scan`. Results are location candidates, with weighted constraint satisfaction, missing observations, conflicts and source hashes. Nested expression scanning and bounded ordered sequences are supported. This is an instruction/expression search, not an object identity classifier.
+Implemented: structured microcode export at MMAT_GLBOPT3 and JSON utilization-form scanning through `type-scan`. Results are location candidates, with weighted constraint satisfaction, missing observations, conflicts and source hashes. Nested expression scanning and bounded ordered sequences are supported. Offset-constrained scans also return a bounded access profile retaining every observed width, direction and sample location at each requested numeric offset, including widths filtered out of the candidate list. This is an instruction/expression search, not an object identity classifier.
 
-Not implemented: logical-object graphs, alias analysis, propagation, layout revision storage, object-level matching and scan acceleration caches. Existing byte-search caches remain separate. The design below describes these future engineering goals; it does not advertise callable tools.
+Not implemented: logical-object graphs, alias analysis, layout revision storage, object-level matching and scan acceleration caches. Existing byte-search caches remain separate. The current access profiles are diagnostic output, not a persisted object/field model: same-offset observations remain separate until alias and base identity are established. The design below describes these future engineering goals; it does not advertise callable tools.
 
 ## Product goal
 

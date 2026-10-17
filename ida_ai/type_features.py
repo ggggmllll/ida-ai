@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
@@ -18,6 +19,7 @@ from .db import ida_ea
 
 DEFAULT_MIN_SCORE = 0.5
 DEFAULT_WINDOW = 8
+ACCESS_PROFILE_SAMPLE_LIMIT = 16
 SUPPORTED_KINDS = {
     "opcode", "memory_access", "operand", "dereference", "mask", "constant",
     "call", "return", "extension", "comparison",
@@ -389,6 +391,94 @@ def _candidate(row: sqlite3.Row, function_name: str, score: dict[str, Any]) -> d
             "opcode": row["opcode"], "text": row["text"], **score}
 
 
+def _requested_access_offsets(spec: dict[str, Any]) -> set[int]:
+    constraints = list(spec["features"])
+    constraints.extend(item for step in spec["sequence"] for item in step)
+    return {int(item["offset"]) for item in constraints
+            if item["kind"] == "memory_access" and "offset" in item}
+
+
+def _width_summary(observations: list[dict[str, Any]], *, include_function: bool) -> dict[str, Any]:
+    by_width: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    unknown_widths = 0
+    for observation in observations:
+        width = observation["width"]
+        if width is None:
+            unknown_widths += 1
+        else:
+            by_width[int(width)].append(observation)
+
+    widths = sorted(by_width)
+    width_counts = []
+    for width in widths:
+        matching = by_width[width]
+        locations = []
+        for observation in matching[:ACCESS_PROFILE_SAMPLE_LIMIT]:
+            location = {key: observation[key] for key in (
+                "block_serial", "ordinal", "operand_path", "ea", "address", "opcode", "direction")}
+            if include_function:
+                location.update(function_ea=observation["function_ea"],
+                                function_address=observation["function_address"],
+                                function_name=observation["function_name"],
+                                microcode_hash=observation["microcode_hash"])
+            locations.append(location)
+        width_counts.append({
+            "width": width,
+            "count": len(matching),
+            "read_count": sum(item["direction"] == "read" for item in matching),
+            "write_count": sum(item["direction"] == "write" for item in matching),
+            "sample_locations": locations,
+            "sample_truncated": len(matching) > ACCESS_PROFILE_SAMPLE_LIMIT,
+        })
+
+    return {
+        "observation_count": len(observations),
+        "observed_widths": widths,
+        "mixed_width": len(widths) > 1,
+        "width_status": ("mixed" if len(widths) > 1 else
+                         "single" if widths and not unknown_widths else
+                         "partially_known" if widths else "unknown"),
+        "unknown_width_count": unknown_widths,
+        "width_candidates": [{"width": item["width"], "observation_count": item["count"],
+                              "read_count": item["read_count"], "write_count": item["write_count"]}
+                             for item in width_counts],
+        "ambiguities": ([{
+            "kind": "mixed_access_width",
+            "widths": widths,
+            "reason": "multiple access widths were observed at this numeric offset; common object and alias are not proven",
+        }] if len(widths) > 1 else []),
+        "width_counts": width_counts,
+    }
+
+
+def _access_profiles(observations: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
+    profiles = []
+    for offset, items in sorted(observations.items()):
+        by_function: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for item in items:
+            by_function[item["function_ea"]].append(item)
+        function_profiles = []
+        for function_ea, function_items in sorted(by_function.items()):
+            first = function_items[0]
+            function_profiles.append({
+                "function_ea": function_ea,
+                "function_address": first["function_address"],
+                "function_name": first["function_name"],
+                "microcode_hash": first["microcode_hash"],
+                **_width_summary(function_items, include_function=False),
+            })
+        profiles.append({
+            "offset": offset,
+            **_width_summary(items, include_function=True),
+            "by_function": function_profiles,
+        })
+    return {
+        "grouping": "same numeric offset relative to the immediate address expression, across selected functions; base identity and aliasing are not proven",
+        "sample_locations_per_width": ACCESS_PROFILE_SAMPLE_LIMIT,
+        "profiles": profiles,
+    }
+
+
 def _row_instruction(row: sqlite3.Row) -> dict:
     return {"ea": ida_ea(row["ea"]) if row["ea"] is not None else None, "opcode": row["opcode"],
             "text": row["text"], "l": json.loads(row["l_json"]), "r": json.loads(row["r_json"]),
@@ -452,10 +542,34 @@ def scan_type_features(connection: sqlite3.Connection, spec: dict[str, Any], *,
         "LEFT JOIN functions f ON f.start_ea=i.function_ea "
         "WHERE m.status='ok' ORDER BY i.function_ea,i.block_serial,i.ordinal")
     grouped: dict[tuple[int, int], list] = {}
+    requested_offsets = _requested_access_offsets(normalized)
+    access_observations: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         if selected is None or ida_ea(row["function_ea"]) in selected:
             for path, instruction in _nodes(_row_instruction(row)):
                 grouped.setdefault((row["function_ea"], row["block_serial"]), []).append((row, path, instruction))
+                if requested_offsets:
+                    fact = _fact(instruction)
+                    if fact["memory"] and fact["offsets"]:
+                        for offset in fact["offsets"]:
+                            if offset not in requested_offsets:
+                                continue
+                            function_value = ida_ea(row["function_ea"])
+                            ea = instruction.get("ea")
+                            access_observations[offset].append({
+                                "function_ea": function_value,
+                                "function_address": f"0x{function_value:X}",
+                                "function_name": row["name"] or "",
+                                "microcode_hash": row["content_hash"],
+                                "block_serial": int(row["block_serial"]),
+                                "ordinal": int(row["ordinal"]),
+                                "operand_path": path,
+                                "ea": ea,
+                                "address": f"0x{ea:X}" if ea is not None else None,
+                                "opcode": fact["opcode"],
+                                "direction": fact["direction"],
+                                "width": fact["memory_width"],
+                            })
     matches = []
     sequence = normalized["sequence"]
     for function_rows in grouped.values():
@@ -509,6 +623,7 @@ def scan_type_features(connection: sqlite3.Connection, spec: dict[str, Any], *,
     exported = {ida_ea(row["function_ea"]) for row in statuses}
     return {"spec": normalized, "candidate_count": len(matches), "total_candidates": total_candidates,
             "truncated": truncated, "matches": matches,
+            "access_profiles": _access_profiles(access_observations),
             "coverage": {"exported_functions": len(statuses), "ok_functions": sum(r["status"] == "ok" for r in statuses),
                          "errors": [{**r, "function_ea": ida_ea(r["function_ea"])} for r in statuses if r["status"] != "ok"],
                          "missing_functions": sorted(selected - exported) if selected is not None else []},

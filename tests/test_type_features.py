@@ -73,6 +73,43 @@ class TypeFeatureTests(unittest.TestCase):
                                      "width": 4}])["candidate_count"], 1)
         self.assertEqual(self.scan([{"kind": "memory_access", "offset": 123}])["candidate_count"], 0)
 
+    def test_access_profile_preserves_mixed_widths_hidden_by_exact_width_filter(self):
+        def at_offset(width, opcode, ea):
+            address = nested(ins("add", reg(9), num(0x68), reg(), ea=ea))
+            if opcode == "ldx":
+                return ins(opcode, reg(848, 2), address, {"kind": "empty", "size": width}, ea=ea)
+            return ins(opcode, num(0, width), reg(848, 2), address, ea=ea)
+
+        self.add(at_offset(4, "ldx", 0x1004), ordinal=0)
+        self.add(at_offset(8, "stx", 0x1008), ordinal=1)
+        result = self.scan([{"kind": "memory_access", "direction": "read", "width": 4,
+                             "offset": 0x68}])
+
+        # The requested width filters the candidate location, but must not erase
+        # contrary-width evidence at the same requested offset.
+        self.assertEqual(result["candidate_count"], 1)
+        profile = result["access_profiles"]["profiles"][0]
+        self.assertEqual(profile["offset"], 0x68)
+        self.assertTrue(profile["mixed_width"])
+        self.assertEqual(profile["observed_widths"], [4, 8])
+        self.assertEqual([(item["width"], item["count"], item["read_count"], item["write_count"])
+                          for item in profile["width_counts"]], [(4, 1, 1, 0), (8, 1, 0, 1)])
+        self.assertEqual(profile["by_function"][0]["observed_widths"], [4, 8])
+        self.assertEqual([item["address"] for item in profile["width_counts"][1]["sample_locations"]],
+                         ["0x1008"])
+        self.assertIn("not proven", result["access_profiles"]["grouping"])
+
+    def test_access_profile_separates_same_offset_across_function_scopes(self):
+        address = nested(ins("add", reg(9), num(0x68), reg()))
+        self.add(ins("ldx", reg(848, 2), address, {"kind": "empty", "size": 4}, ea=0x1004))
+        self.add(ins("ldx", reg(848, 2), address, {"kind": "empty", "size": 8}, ea=0x2004),
+                 function=0x2000)
+        result = self.scan([{"kind": "memory_access", "offset": 0x68}],
+                           function_eas=[0x1000, 0x2000])
+        profile = result["access_profiles"]["profiles"][0]
+        self.assertTrue(profile["mixed_width"])
+        self.assertEqual([item["observed_widths"] for item in profile["by_function"]], [[4], [8]])
+
     def test_weighted_partial_unknown_and_conflict(self):
         self.add(load(address=nested(ins("mul", reg(), num(3), reg()))))
         result = self.scan([{"kind": "memory_access", "width": 1, "weight": 3},

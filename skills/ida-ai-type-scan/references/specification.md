@@ -32,6 +32,10 @@ Top-level fields: optional `name`, non-empty `features`, optional `sequence`, `w
 
 `offset` decomposes add/sub constant address expressions relative to the immediate base. It is not an established struct field offset. Unknown bases/expressions yield missing evidence. Access extent is a lower bound, not exact object size. Same-width uses do not distinguish int/float/pointer, arrays from pointers, unions, or types sharing a prefix.
 
+When a form includes one or more `memory_access` constraints with `offset`, the result also includes an `access_profiles` entry for each requested offset. These profiles survey all successfully exported memory accesses at that numeric offset within the selected function scope, even when a `width` or `direction` constraint excludes them from `matches`. Each profile lists `width_candidates`, observed-width counts, read/write counts, per-function summaries and up to 16 sample locations per width; `sample_truncated` indicates more locations exist. A profile with multiple widths includes a `mixed_access_width` ambiguity. This prevents a width-specific search from hiding other observed widths.
+
+An access profile groups only by numeric offset relative to each instruction's immediate address expression. It does not prove that the observations share a pointer, object, alias, field, or lifetime. `mixed_width: true` means multiple widths occurred at that offset somewhere in the selected scope; it does not itself establish a field conflict or a union. Review function-level groups, sample locations, microcode hashes and scope coverage before treating widths as evidence about one object.
+
 All `features` apply to one expression location. The scanner visits each top-level and nested instruction. Operand/constant/call constraints may also see nested operands within that location; results are overlapping observations, not independent evidence.
 
 Ordered example:
