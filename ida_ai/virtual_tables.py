@@ -18,7 +18,7 @@ from typing import Any
 from .db import get_metadata, ida_ea, sqlite_ea, utc_now
 
 
-VTABLE_PARSER_VERSION = "3"
+VTABLE_PARSER_VERSION = "4"
 VCALL_DETECTOR_VERSION = "3"
 SUPPORTED_ABIS = ("itanium",)
 
@@ -42,6 +42,34 @@ def _address(value: int | None) -> dict[str, int | str] | None:
     return {"ea": value, "hex": f"0x{value:X}"}
 
 
+def _classify_table_entry(target_kind: str, target_name: str | None, *, is_nullstub: bool,
+                          is_thunk: bool, is_library: bool) -> str:
+    """Describe observable slot-entry traits without inferring override semantics."""
+
+    lowered = (target_name or "").casefold()
+    if target_kind == "null":
+        return "null_slot"
+    if "__cxa_pure_virtual" in lowered or "_purecall" in lowered:
+        return "pure_virtual_runtime_named"
+    if "__cxa_deleted_virtual" in lowered:
+        return "deleted_virtual_runtime_named"
+    if is_nullstub:
+        return "nullstub"
+    if is_thunk and is_library:
+        return "import_thunk"
+    if is_thunk:
+        return "thunk"
+    if is_library:
+        return "library_function"
+    if target_kind == "function":
+        return "function"
+    if target_kind == "code":
+        return "unclassified_code"
+    if target_kind == "data":
+        return "data_pointer"
+    return "unknown"
+
+
 def _identity(connection: sqlite3.Connection) -> dict[str, Any]:
     keys = ("root_filename", "input_path", "imagebase", "bitness", "big_endian")
     return {key: get_metadata(connection, key) for key in keys}
@@ -59,7 +87,7 @@ def _source_hash(connection: sqlite3.Connection, kind: str, function_eas: Iterab
     if isinstance(scan_coverage, dict):
         scan_coverage = {key: value for key, value in scan_coverage.items() if key != "generated_at"}
     functions = _rows(connection,
-        "SELECT start_ea,end_ea,name,demangled_name,signature,flags,is_thunk,thunk_target_ea,is_nullstub "
+        "SELECT start_ea,end_ea,name,demangled_name,signature,flags,is_library,is_thunk,thunk_target_ea,is_nullstub "
         "FROM functions ORDER BY start_ea")
     if kind == "vtable":
         payload = {
@@ -256,7 +284,7 @@ def build_vtable_index(
     query += " ORDER BY source_ea"
     pointer_rows = [dict(row) for row in connection.execute(query, parameters)]
     functions = {ida_ea(row["start_ea"]): dict(row) for row in connection.execute(
-        "SELECT start_ea,name,demangled_name,is_thunk,thunk_target_ea,is_nullstub FROM functions")}
+        "SELECT start_ea,name,demangled_name,is_library,is_thunk,thunk_target_ea,is_nullstub FROM functions")}
 
     run_slots: list[dict[str, Any]] = []
     run_start: int | None = None
@@ -270,6 +298,11 @@ def build_vtable_index(
             candidate_id = _id("VTB", {"run": run_id, "address_point": address_point})
             prefix = _has_itanium_prefix(connection, address_point, pointer_size)
             typeinfo = (prefix or {}).get("typeinfo", {})
+            table_symbol = _symbol_name_at(connection, address_point - 2 * pointer_size) if prefix else None
+            typeinfo_symbol = typeinfo.get("typeinfo_symbol")
+            expected_table_symbol = ("_ZTV" + typeinfo_symbol[4:]
+                                     if typeinfo_symbol and typeinfo_symbol.startswith("_ZTI") else None)
+            table_symbol_matches_typeinfo = bool(expected_table_symbol and table_symbol == expected_table_symbol)
             evidence = {
                 "method": "contiguous_aligned_mapped_function_pointer_sequence",
                 "status": "heuristic_candidate",
@@ -277,13 +310,18 @@ def build_vtable_index(
                 "total_slot_count": len(run_slots),
                 "rtti_confirmed": False,
                 "typeinfo_layout_confirmed": typeinfo.get("status") == "confirmed_itanium_typeinfo_layout",
+                "address_point_symbol_match": table_symbol_matches_typeinfo,
+                "table_symbol": table_symbol,
+                "expected_table_symbol": expected_table_symbol,
                 "address_point_prefix": prefix,
-                "address_point_boundary": ("two_word_itanium_prefix_candidate"
+                "address_point_boundary": ("two_word_prefix_with_matching_vtable_symbol"
+                    if table_symbol_matches_typeinfo else "two_word_itanium_prefix_candidate"
                     if prefix is not None else "function_sequence_start_unconfirmed"),
                 "limits": {"max_slots": max_slots, "truncated": len(run_slots) >= max_slots},
             }
             candidates.append({
-                "candidate_id": candidate_id, "table_address": address_point,
+                "candidate_id": candidate_id,
+                "table_address": (address_point - 2 * pointer_size if prefix is not None else address_point),
                 "address_point": address_point,
                 "table_end": run_previous + pointer_size if run_previous is not None else None,
                 "slot_count": len(run_slots), "abi": abi, "architecture": get_metadata(connection, "architecture"),
@@ -296,6 +334,11 @@ def build_vtable_index(
             for index, item in enumerate(run_slots):
                 target = item.get("target_ea")
                 target_func = functions.get(ida_ea(target)) if target is not None else None
+                target_name = ((target_func["demangled_name"] or target_func["name"])
+                               if target_func else item.get("target_name"))
+                is_nullstub = bool(target_func and target_func["is_nullstub"])
+                is_thunk = bool(target_func and target_func["is_thunk"])
+                is_library = bool(target_func and target_func["is_library"])
                 normalized_slots.append({
                     "candidate_id": candidate_id, "slot_index": index,
                     "byte_offset": index * pointer_size,
@@ -303,8 +346,11 @@ def build_vtable_index(
                     "raw_value": ida_ea(item["raw_value"]),
                     "target_ea": ida_ea(target) if target is not None else None,
                     "target_kind": item["target_kind"],
-                    "target_name": (target_func["demangled_name"] or target_func["name"]) if target_func else item.get("target_name"),
-                    "is_thunk": int(bool(target_func and target_func["is_thunk"])),
+                    "target_name": target_name,
+                    "entry_classification": _classify_table_entry(item["target_kind"], target_name,
+                        is_nullstub=is_nullstub, is_thunk=is_thunk, is_library=is_library),
+                    "is_nullstub": int(is_nullstub), "is_library": int(is_library),
+                    "is_thunk": int(is_thunk),
                     "thunk_target_ea": ida_ea(target_func["thunk_target_ea"]) if target_func and target_func["thunk_target_ea"] is not None else None,
                     "thunk_chain_json": _json([ida_ea(target), ida_ea(target_func["thunk_target_ea"])])
                         if target_func and target_func["is_thunk"] and target_func["thunk_target_ea"] is not None else "[]",
@@ -389,8 +435,8 @@ def build_vtable_index(
             )
         for candidate_id, slots in slots_by_candidate:
             connection.executemany(
-                "INSERT INTO vtable_slots(candidate_id,slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,is_thunk,thunk_target_ea,thunk_chain_json,adjustment_json,evidence_json,source_snapshot_hash,stale) "
-                "VALUES(:candidate_id,:slot_index,:byte_offset,:entry_address,:raw_value,:target_ea,:target_kind,:target_name,:is_thunk,:thunk_target_ea,:thunk_chain_json,:adjustment_json,:evidence_json,:source_snapshot_hash,0)",
+                "INSERT INTO vtable_slots(candidate_id,slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,entry_classification,is_nullstub,is_library,is_thunk,thunk_target_ea,thunk_chain_json,adjustment_json,evidence_json,source_snapshot_hash,stale) "
+                "VALUES(:candidate_id,:slot_index,:byte_offset,:entry_address,:raw_value,:target_ea,:target_kind,:target_name,:entry_classification,:is_nullstub,:is_library,:is_thunk,:thunk_target_ea,:thunk_chain_json,:adjustment_json,:evidence_json,:source_snapshot_hash,0)",
                 [{**slot, "entry_address": sqlite_ea(slot["entry_address"]),
                   "raw_value": sqlite_ea(slot["raw_value"]),
                   "target_ea": sqlite_ea(slot["target_ea"]) if slot["target_ea"] is not None else None,
@@ -492,7 +538,8 @@ def search_vtables(
         clauses.append("s.slot_index=?"); parameters.append(slot_index)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     rows = connection.execute(
-        "SELECT c.candidate_id,c.address_point,c.abi,c.status,s.slot_index,s.byte_offset,s.target_ea,s.target_name,s.is_thunk,s.thunk_target_ea "
+        "SELECT c.candidate_id,c.address_point,c.abi,c.status,s.slot_index,s.byte_offset,s.target_ea,s.target_name,"
+        "s.entry_classification,s.is_nullstub,s.is_library,s.is_thunk,s.thunk_target_ea "
         "FROM vtable_candidates c JOIN vtable_slots s USING(candidate_id)" + where +
         " ORDER BY c.address_point,s.slot_index", parameters,
     ).fetchall()
@@ -508,7 +555,9 @@ def search_vtables(
             "address_point_hex": f"0x{ida_ea(row['address_point']):X}", "abi": row["abi"], "status": row["status"], "matching_slots": []})
         item["matching_slots"].append({"slot_index": row["slot_index"], "byte_offset": row["byte_offset"],
             "target_ea": target, "target_ea_hex": f"0x{target:X}" if target is not None else None,
-            "target_name": row["target_name"], "is_thunk": bool(row["is_thunk"]),
+            "target_name": row["target_name"], "entry_classification": row["entry_classification"],
+            "is_nullstub": bool(row["is_nullstub"]), "is_library": bool(row["is_library"]),
+            "is_thunk": bool(row["is_thunk"]),
             "thunk_target_ea": ida_ea(row["thunk_target_ea"]) if row["thunk_target_ea"] is not None else None})
         if target in wanted:
             target_slots[key].add(target)
@@ -1002,7 +1051,8 @@ def _resolve_vcall_targets(connection: sqlite3.Connection, call_id: str) -> dict
         return {"call_id": call_id, "resolution_status": "partial", "targets": [],
             "reason": "slot byte offset is not aligned to the recorded pointer width"}
     rows = connection.execute(
-        "SELECT s.candidate_id,s.slot_index,s.byte_offset,s.target_ea,s.target_name,s.is_thunk,s.thunk_target_ea,c.address_point,c.abi "
+        "SELECT s.candidate_id,s.slot_index,s.byte_offset,s.target_ea,s.target_name,s.entry_classification,"
+        "s.is_nullstub,s.is_library,s.is_thunk,s.thunk_target_ea,c.address_point,c.abi "
         "FROM vtable_slots s JOIN vtable_candidates c USING(candidate_id) "
         "WHERE s.stale=0 AND c.stale=0 AND s.target_ea IS NOT NULL AND s.target_kind IN ('function','code') "
         "AND s.byte_offset=? AND c.pointer_size=? ORDER BY c.address_point,s.slot_index",
@@ -1015,7 +1065,9 @@ def _resolve_vcall_targets(connection: sqlite3.Connection, call_id: str) -> dict
             "address_point_hex": f"0x{ida_ea(row['address_point']):X}", "abi": row["abi"],
             "slot_index": row["slot_index"], "byte_offset": row["byte_offset"],
             "target_ea": target_ea, "target_ea_hex": f"0x{target_ea:X}" if target_ea is not None else None,
-            "target_name": row["target_name"], "is_thunk": bool(row["is_thunk"]),
+            "target_name": row["target_name"], "entry_classification": row["entry_classification"],
+            "is_nullstub": bool(row["is_nullstub"]), "is_library": bool(row["is_library"]),
+            "is_thunk": bool(row["is_thunk"]),
             "thunk_target_ea": ida_ea(row["thunk_target_ea"]) if row["thunk_target_ea"] is not None else None,
             "status": "candidate", "reason": "slot offset matches an indexed table; receiver-to-table reachability is unproven"})
     status = "candidate_set" if targets else "unknown"
@@ -1090,6 +1142,9 @@ def show_vcall(connection: sqlite3.Connection, *, call_id: str | None = None, ad
         item["target_ea"] = ida_ea(item["target_ea"]) if item["target_ea"] is not None else None
         item["thunk_target_ea"] = ida_ea(item["thunk_target_ea"]) if item["thunk_target_ea"] is not None else None
         item["evidence"] = json.loads(item.pop("evidence_json"))
+        item["entry_classification"] = item["evidence"].get("entry_classification", "unknown")
+        item["is_nullstub"] = bool(item["evidence"].get("is_nullstub", False))
+        item["is_library"] = bool(item["evidence"].get("is_library", False))
         targets.append(item)
     flows = []
     for flow in connection.execute("SELECT * FROM receiver_flows WHERE call_id=?" +

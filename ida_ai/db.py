@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def sqlite_ea(address: int) -> int:
@@ -359,6 +359,9 @@ CREATE TABLE IF NOT EXISTS vtable_slots (
     target_ea INTEGER,
     target_kind TEXT NOT NULL,
     target_name TEXT,
+    entry_classification TEXT NOT NULL DEFAULT 'unknown',
+    is_nullstub INTEGER NOT NULL DEFAULT 0,
+    is_library INTEGER NOT NULL DEFAULT 0,
     is_thunk INTEGER NOT NULL DEFAULT 0,
     thunk_target_ea INTEGER,
     thunk_chain_json TEXT NOT NULL DEFAULT '[]',
@@ -579,6 +582,36 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE functions ADD COLUMN thunk_target_ea INTEGER")
     if "is_nullstub" not in function_columns:
         connection.execute("ALTER TABLE functions ADD COLUMN is_nullstub INTEGER NOT NULL DEFAULT 0")
+    vtable_slot_columns = {row[1] for row in connection.execute("PRAGMA table_info(vtable_slots)")}
+    vtable_slot_migration_needed = False
+    if "entry_classification" not in vtable_slot_columns:
+        connection.execute("ALTER TABLE vtable_slots ADD COLUMN entry_classification TEXT NOT NULL DEFAULT 'unknown'")
+        vtable_slot_migration_needed = True
+    if "is_nullstub" not in vtable_slot_columns:
+        connection.execute("ALTER TABLE vtable_slots ADD COLUMN is_nullstub INTEGER NOT NULL DEFAULT 0")
+        vtable_slot_migration_needed = True
+    if "is_library" not in vtable_slot_columns:
+        connection.execute("ALTER TABLE vtable_slots ADD COLUMN is_library INTEGER NOT NULL DEFAULT 0")
+        vtable_slot_migration_needed = True
+    if vtable_slot_migration_needed:
+        connection.execute(
+            "UPDATE vtable_slots SET "
+            "is_nullstub=COALESCE((SELECT is_nullstub FROM functions WHERE functions.start_ea=vtable_slots.target_ea),0), "
+            "is_library=COALESCE((SELECT is_library FROM functions WHERE functions.start_ea=vtable_slots.target_ea),0)"
+        )
+        connection.execute(
+            "UPDATE vtable_slots SET entry_classification=CASE "
+            "WHEN target_kind='null' THEN 'null_slot' "
+            "WHEN lower(COALESCE(target_name,'')) LIKE '%__cxa_pure_virtual%' OR lower(COALESCE(target_name,'')) LIKE '%_purecall%' THEN 'pure_virtual_runtime_named' "
+            "WHEN lower(COALESCE(target_name,'')) LIKE '%__cxa_deleted_virtual%' THEN 'deleted_virtual_runtime_named' "
+            "WHEN target_kind='function' AND is_nullstub=1 THEN 'nullstub' "
+            "WHEN target_kind='function' AND is_thunk=1 AND is_library=1 THEN 'import_thunk' "
+            "WHEN target_kind='function' AND is_thunk=1 THEN 'thunk' "
+            "WHEN target_kind='function' AND is_library=1 THEN 'library_function' "
+            "WHEN target_kind='function' THEN 'function' "
+            "WHEN target_kind='code' THEN 'unclassified_code' "
+            "WHEN target_kind='data' THEN 'data_pointer' ELSE 'unknown' END"
+        )
     for table in ("microcode", "micro_flow"):
         columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
         if "relations_json" not in columns:

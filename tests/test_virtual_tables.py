@@ -169,6 +169,7 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(listing["total"], 2)
         first = show_vtable(self.connection, address=0x5000)["items"][0]
         self.assertEqual([slot["target_ea"] for slot in first["slots"]], [0x1000, 0x1200])
+        self.assertEqual([slot["entry_classification"] for slot in first["slots"]], ["function", "thunk"])
         self.assertTrue(first["slots"][1]["is_thunk"])
         self.assertEqual(first["slots"][1]["thunk_chain"], [0x1200, 0x1300])
         matches = search_vtables(self.connection, target_eas=[0x1000, 0x1200])
@@ -203,7 +204,7 @@ class VirtualTableTests(unittest.TestCase):
         )
         self.connection.executemany(
             "INSERT INTO symbols(address,name,type) VALUES(?,?,NULL)",
-            [(0x6000, "_ZTI3Foo"), (0x7000, "_ZTVN10__cxxabiv117__class_type_infoE"),
+            [(0x4FF0, "_ZTV3Foo"), (0x6000, "_ZTI3Foo"), (0x7000, "_ZTVN10__cxxabiv117__class_type_infoE"),
              (0x8000, "_ZTS3Foo")],
         )
         self.connection.commit()
@@ -217,6 +218,10 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(typeinfo["typeinfo_symbol"], "_ZTI3Foo")
         self.assertEqual(typeinfo["type_name_symbol"], "_ZTS3Foo")
         self.assertTrue(candidate["evidence"]["typeinfo_layout_confirmed"])
+        self.assertTrue(candidate["evidence"]["address_point_symbol_match"])
+        self.assertEqual(candidate["evidence"]["expected_table_symbol"], "_ZTV3Foo")
+        self.assertEqual(candidate["table_address"], 0x4FF0)
+        self.assertEqual(candidate["address_point"], 0x5000)
         self.assertFalse(candidate["evidence"]["rtti_confirmed"])
         self.assertEqual(result["coverage"]["typeinfo_layout_confirmed"], 1)
 
@@ -242,6 +247,8 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(typeinfo["status"], "candidate_itanium_typeinfo_layout")
         self.assertFalse(typeinfo["checks"]["type_name_symbol_matches_typeinfo"])
         self.assertFalse(candidate["evidence"]["typeinfo_layout_confirmed"])
+        self.assertEqual(candidate["table_address"], 0x4FF0)
+        self.assertEqual(candidate["address_point"], 0x5000)
 
     def test_vtable_cache_tracks_scan_coverage_but_ignores_scan_timestamp(self):
         first = build_vtable_index(self.connection, abi="itanium")
@@ -276,6 +283,36 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(analyzed["resolution"]["targets"][0]["target_ea"], 0x1200)
         shown = show_vcall(self.connection, call_id=site["call_id"])
         self.assertEqual(len(shown["targets"]), 1)
+        self.assertEqual(shown["targets"][0]["entry_classification"], "thunk")
+
+    def test_table_slot_classifications_preserve_nullstub_runtime_and_library_traits(self):
+        self.connection.executemany(
+            "INSERT INTO functions(start_ea,end_ea,name,demangled_name,size,is_library,is_thunk,is_nullstub) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            [(0x1400, 0x1410, "empty_stub", "empty_stub", 0x10, 0, 0, 1),
+             (0x1500, 0x1510, "runtime_library", "runtime_library", 0x10, 1, 0, 0),
+             (0x1600, 0x1610, "import_thunk", "import_thunk [thunk]", 0x10, 1, 1, 0),
+             (0x1700, 0x1710, "__cxa_pure_virtual", "__cxa_pure_virtual", 0x10, 1, 0, 0),
+             (0x1800, 0x1810, "__cxa_deleted_virtual", "__cxa_deleted_virtual", 0x10, 1, 0, 0)],
+        )
+        rows = [(0x5200, 0x1400, 0x1400, 8, "rtti", ".text", 0x1400, "empty_stub", "function", "now"),
+                (0x5208, 0x1500, 0x1500, 8, "rtti", ".text", 0x1500, "runtime_library", "function", "now"),
+                (0x5210, 0x1600, 0x1600, 8, "rtti", ".text", 0x1600, "import_thunk", "function", "now"),
+                (0x5218, 0x1700, 0x1700, 8, "rtti", ".text", 0x1700, "__cxa_pure_virtual", "function", "now"),
+                (0x5220, 0x1800, 0x1800, 8, "rtti", ".text", 0x1800, "__cxa_deleted_virtual", "function", "now"),
+                (0x5228, 0, None, 8, "rtti", None, None, None, "null", "now")]
+        self.connection.executemany(
+            "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+        self.connection.commit()
+
+        build_vtable_index(self.connection, abi="itanium")
+        candidate = show_vtable(self.connection, address=0x5200)["items"][0]
+        self.assertEqual([slot["entry_classification"] for slot in candidate["slots"]],
+            ["nullstub", "library_function", "import_thunk", "pure_virtual_runtime_named",
+             "deleted_virtual_runtime_named", "null_slot"])
+        self.assertEqual(candidate["slots"][0]["is_nullstub"], 1)
+        self.assertEqual(candidate["slots"][1]["is_library"], 1)
 
     def test_vcall_uses_normalized_microcode_cfg_tables(self):
         function = self._add_vcall_fixture()

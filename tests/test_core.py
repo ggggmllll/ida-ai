@@ -118,6 +118,17 @@ class DatabaseTests(unittest.TestCase):
             connection.execute(
                 "INSERT INTO functions(start_ea,end_ea,name,size,is_thunk) VALUES(4096,4112,'legacy_thunk',16,1)"
             )
+            connection.execute(
+                "CREATE TABLE vtable_slots(candidate_id TEXT NOT NULL,slot_index INTEGER NOT NULL,byte_offset INTEGER NOT NULL,"
+                "entry_address INTEGER NOT NULL,raw_value INTEGER,target_ea INTEGER,target_kind TEXT NOT NULL,target_name TEXT,"
+                "is_thunk INTEGER NOT NULL DEFAULT 0,thunk_target_ea INTEGER,thunk_chain_json TEXT NOT NULL DEFAULT '[]',"
+                "adjustment_json TEXT NOT NULL DEFAULT '{}',evidence_json TEXT NOT NULL DEFAULT '{}',"
+                "source_snapshot_hash TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(candidate_id,slot_index))"
+            )
+            connection.execute(
+                "INSERT INTO vtable_slots(candidate_id,slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,is_thunk,source_snapshot_hash) "
+                "VALUES('legacy',0,0,8192,4096,4096,'function','legacy_thunk',1,'snapshot')"
+            )
             connection.commit()
         with closing(connect(old_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(xrefs)")}
@@ -129,6 +140,12 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT is_thunk,thunk_target_ea,is_nullstub FROM functions WHERE start_ea=4096"
             ).fetchone()
             self.assertEqual(tuple(function), (1, None, 0))
+            slot_columns = {row[1] for row in connection.execute("PRAGMA table_info(vtable_slots)")}
+            self.assertTrue({"entry_classification", "is_nullstub", "is_library"} <= slot_columns)
+            slot = connection.execute(
+                "SELECT entry_classification,is_nullstub,is_library,is_thunk FROM vtable_slots WHERE candidate_id='legacy'"
+            ).fetchone()
+            self.assertEqual(tuple(slot), ("thunk", 0, 0, 1))
             self.assertEqual(connection.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0], str(SCHEMA_VERSION))
 
     def test_legacy_flow_and_propagation_nodes_are_migrated(self):

@@ -73,7 +73,7 @@ def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> st
             data = {key: row[key] for key in row.keys() if key not in ("created_at",)}
             if table == "vtable":
                 data["slots"] = [tuple(slot) for slot in connection.execute(
-                    "SELECT slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,is_thunk,thunk_target_ea,thunk_chain_json,adjustment_json,evidence_json,source_snapshot_hash,stale "
+                    "SELECT slot_index,byte_offset,entry_address,raw_value,target_ea,target_kind,target_name,entry_classification,is_nullstub,is_library,is_thunk,thunk_target_ea,thunk_chain_json,adjustment_json,evidence_json,source_snapshot_hash,stale "
                     "FROM vtable_slots WHERE candidate_id=? ORDER BY slot_index", (address,))]
             else:
                 data["targets"] = [tuple(target) for target in connection.execute(
