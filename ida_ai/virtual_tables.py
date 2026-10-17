@@ -18,7 +18,7 @@ from typing import Any
 from .db import get_metadata, ida_ea, sqlite_ea, utc_now
 
 
-VTABLE_PARSER_VERSION = "1"
+VTABLE_PARSER_VERSION = "2"
 VCALL_DETECTOR_VERSION = "2"
 SUPPORTED_ABIS = ("itanium",)
 
@@ -55,6 +55,9 @@ def _source_hash(connection: sqlite3.Connection, kind: str, function_eas: Iterab
     """Hash the exact durable inputs used by a virtual-analysis run."""
 
     identity = _identity(connection)
+    scan_coverage = get_metadata(connection, "data_pointer_scan")
+    if isinstance(scan_coverage, dict):
+        scan_coverage = {key: value for key, value in scan_coverage.items() if key != "generated_at"}
     functions = _rows(connection,
         "SELECT start_ea,end_ea,name,demangled_name,signature,flags,is_thunk,thunk_target_ea,is_nullstub "
         "FROM functions ORDER BY start_ea")
@@ -65,6 +68,7 @@ def _source_hash(connection: sqlite3.Connection, kind: str, function_eas: Iterab
             "functions": functions,
             "symbols": _rows(connection, "SELECT address,name,type FROM symbols ORDER BY address"),
             "data_pointer_slots": _rows(connection, "SELECT source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind FROM data_pointer_slots ORDER BY source_ea"),
+            "data_pointer_scan": scan_coverage,
         }
     elif kind == "vcall":
         selected = None if function_eas is None else {sqlite_ea(ea) for ea in function_eas}
@@ -103,6 +107,8 @@ def _has_itanium_prefix(connection: sqlite3.Connection, address_point: int, poin
     offset_row = by_ea.get(address_point - 2 * pointer_size)
     typeinfo_row = by_ea.get(address_point - pointer_size)
     if offset_row is None or typeinfo_row is None:
+        return None
+    if offset_row["target_kind"] in ("function", "code"):
         return None
     offset_to_top = ida_ea(offset_row["raw_value"])
     if offset_to_top & (1 << (pointer_size * 8 - 1)):
@@ -193,6 +199,8 @@ def build_vtable_index(
                 "total_slot_count": len(run_slots),
                 "rtti_confirmed": False,
                 "address_point_prefix": prefix,
+                "address_point_boundary": ("two_word_itanium_prefix_candidate"
+                    if prefix is not None else "function_sequence_start_unconfirmed"),
                 "limits": {"max_slots": max_slots, "truncated": len(run_slots) >= max_slots},
             }
             candidates.append({
@@ -258,7 +266,9 @@ def build_vtable_index(
         "abi": abi, "pointer_size": pointer_size, "byteorder": byteorder,
         "source_snapshot_hash": source_snapshot_hash, "candidate_count": len(candidates),
         "slot_count": sum(len(slots) for _, slots in slots_by_candidate),
-        "coverage": {"pointer_observations": len(pointer_rows), "source": "data_pointer_slots",
+        "coverage": {"pointer_observations": sum(item["target_kind"] != "scalar" for item in pointer_rows),
+                     "scalar_prefix_observations": sum(item["target_kind"] == "scalar" for item in pointer_rows),
+                     "source": "data_pointer_slots",
                      "rtti_parsed": False, "heuristic_only": True,
                      "data_pointer_scan": get_metadata(connection, "data_pointer_scan")},
         "scope": scope,

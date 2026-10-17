@@ -151,6 +151,20 @@ class VirtualTableTests(unittest.TestCase):
         rerun = build_vtable_index(self.connection, abi="itanium")
         self.assertTrue(rerun["cached"])
 
+    def test_vtable_keeps_nonzero_offset_to_top_as_weak_prefix_evidence(self):
+        self.connection.executemany(
+            "INSERT INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(sqlite_ea(0x4FF0), sqlite_ea(0xFFFFFFFFFFFFFFF8), None, 8, ".data.rel.ro", None, None, None, "scalar", "now"),
+             (sqlite_ea(0x4FF8), 0x6000, 0x6000, 8, ".data.rel.ro", ".data.rel.ro", None, "typeinfo", "data", "now")],
+        )
+        self.connection.commit()
+        build_vtable_index(self.connection, abi="itanium")
+        candidate = show_vtable(self.connection, address=0x5000)["items"][0]
+        prefix = candidate["evidence"]["address_point_prefix"]
+        self.assertEqual(prefix["offset_to_top"], -8)
+        self.assertFalse(prefix["status"] == "confirmed")
+
     def test_vcall_candidate_keeps_receiver_and_partial_resolution(self):
         self._add_vcall_fixture()
         build_vtable_index(self.connection, abi="itanium")

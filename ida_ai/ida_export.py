@@ -822,11 +822,68 @@ def scan_data_pointer_slots(
             "INSERT OR REPLACE INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
+
+    # Preserve a possible Itanium offset-to-top word immediately before the
+    # two-word metadata prefix of mapped code-pointer runs. Such scalar words
+    # are otherwise discarded by pointer scanning because they are not mapped
+    # addresses. Keep this narrowly scoped; arbitrary data words are not
+    # exposed as pointer observations.
+    prefix_words: set[int] = set()
+    scalar_prefix_words = 0
+    prefix_failures = 0
+    prefix_bytes_read = 0
+    code_query = "SELECT source_ea,source_segment FROM data_pointer_slots WHERE pointer_size=? AND target_kind IN ('function','code')"
+    code_values: list[object] = [pointer_size]
+    if scoped_start is not None:
+        code_query += " AND source_ea>=?"
+        code_values.append(sqlite_ea(scoped_start))
+    if scoped_end is not None:
+        code_query += " AND source_ea<?"
+        code_values.append(sqlite_ea(scoped_end))
+    code_query += " ORDER BY source_ea"
+    code_entries = connection.execute(code_query, code_values).fetchall()
+    for entry in code_entries:
+        code_ea = ida_ea(entry["source_ea"])
+        for distance in (1, 2):
+            prefix_ea = code_ea - distance * pointer_size
+            if prefix_ea < 0 or prefix_ea in prefix_words:
+                continue
+            if scoped_start is not None and prefix_ea < scoped_start:
+                continue
+            if scoped_end is not None and prefix_ea >= scoped_end:
+                continue
+            prefix_seg = ida_segment.getseg(prefix_ea)
+            if prefix_seg is None or (ida_segment.get_segm_name(prefix_seg) or "") != entry["source_segment"]:
+                continue
+            prefix_raw = ida_bytes.get_bytes(prefix_ea, pointer_size)
+            prefix_bytes_read += pointer_size
+            if prefix_raw is None:
+                prefix_failures += 1
+                continue
+            prefix_words.add(prefix_ea)
+            raw_value = int.from_bytes(bytes(prefix_raw), byteorder, signed=False)
+            if raw_value == 0 or ida_segment.getseg(raw_value) is not None:
+                continue
+            signed_value = raw_value
+            sign_bit = 1 << (pointer_size * 8 - 1)
+            if signed_value & sign_bit:
+                signed_value -= 1 << (pointer_size * 8)
+            if signed_value == 0 or not -0x10000 <= signed_value <= 0x10000:
+                continue
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO data_pointer_slots(source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind,generated_at) "
+                "VALUES(?,?,NULL,?,?,NULL,NULL,NULL,'scalar',?)",
+                (sqlite_ea(prefix_ea), sqlite_ea(raw_value), pointer_size,
+                 entry["source_segment"], now),
+            ).rowcount
+            scalar_prefix_words += int(inserted > 0)
     connection.commit()
     result = {
         "pointer_size": pointer_size, "byteorder": byteorder,
         "segments_considered": len(eligible), "scanned_bytes": scanned_bytes,
-        "pointer_entries": total_entries, "truncated": truncated, "skipped": skipped,
+        "pointer_entries": total_entries, "scalar_prefix_words": scalar_prefix_words,
+        "prefix_bytes_read": prefix_bytes_read, "prefix_read_failures": prefix_failures,
+        "truncated": truncated, "skipped": skipped,
         "source": "aligned_loaded_pointers_in_readable_non_executable_non_bss_segments",
         "scope": {"start": scoped_start, "end": scoped_end},
     }
