@@ -14,6 +14,9 @@ from .db import connect
 from .runner import run_ida
 from .selection import parse_int, select_function_addresses
 from .text_search import search_code as _search_code
+from .virtual_tables import (analyze_vcall as _analyze_vcall, list_vcalls as _list_vcalls,
+                             list_vtables as _list_vtables, search_vtables as _search_vtables,
+                             show_vcall as _show_vcall, show_vtable as _show_vtable)
 
 
 def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int = 0, unsafe: bool = False):
@@ -34,7 +37,9 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
                 metadata = {row["key"]: json.loads(row["value"]) for row in connection.execute("SELECT key,value FROM metadata")}
                 tables = ("functions", "xrefs", "basic_blocks", "disassembly", "pseudocode", "microcode", "micro_instructions",
                           "micro_flow", "micro_flow_instructions", "propagation_runs", "propagation_nodes",
-                          "propagation_edges", "propagation_constraints", "symbols", "comments", "jobs", "job_revisions")
+                          "propagation_edges", "propagation_constraints", "data_pointer_slots", "vtable_runs",
+                          "vtable_candidates", "vtable_slots", "vcall_runs", "vcall_sites", "vcall_targets",
+                          "receiver_flows", "symbols", "comments", "jobs", "job_revisions")
                 counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
             return {"metadata": metadata, "counts": counts}
 
@@ -86,10 +91,59 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
             result = run_ida("export_view", database, idat=idat, timeout=timeout, addresses=addresses, view=view)
             return result
 
+    @app.tool()
+    def vtable_list(abi: str | None = None, limit: int = 100, offset: int = 0,
+                    include_stale: bool = False) -> dict:
+        """List indexed vtable-shaped data candidates; candidates are not class confirmations."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _list_vtables(connection, abi=abi, limit=limit, offset=offset, include_stale=include_stale)
+
+    @app.tool()
+    def vtable_show(candidate_id: str | None = None, address: str | None = None,
+                    include_stale: bool = False) -> dict:
+        """Show one indexed address point, raw slot entries, thunk links, and discovery evidence."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _show_vtable(connection, candidate_id=candidate_id,
+                address=parse_int(address) if address is not None else None, include_stale=include_stale)
+
+    @app.tool()
+    def vtable_search(target_addresses: list[str] | None = None, slot_index: int | None = None,
+                      abi: str | None = None, limit: int = 100,
+                      include_stale: bool = False) -> dict:
+        """Search candidate tables by one or more slot targets and/or a slot index."""
+        targets = [parse_int(item) for item in (target_addresses or [])]
+        with ida_lock, closing(connect(database)) as connection:
+            return _search_vtables(connection, target_eas=targets, slot_index=slot_index,
+                                   abi=abi, limit=limit, include_stale=include_stale)
+
+    @app.tool()
+    def vcall_list(function_address: str | None = None, status: str | None = None,
+                   limit: int = 100, offset: int = 0, include_stale: bool = False) -> dict:
+        """List indexed indirect calls and the subset matching a two-load vtable-shaped pattern."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _list_vcalls(connection,
+                function_ea=parse_int(function_address) if function_address is not None else None,
+                status=status, limit=limit, offset=offset, include_stale=include_stale)
+
+    @app.tool()
+    def analyze_virtual_call(call_id: str | None = None, address: str | None = None) -> dict:
+        """Explain a stored call pattern and list compatible table slots without claiming runtime reachability."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _analyze_vcall(connection, call_id=call_id,
+                address=parse_int(address) if address is not None else None)
+
+    @app.tool()
+    def vcall_show(call_id: str | None = None, address: str | None = None,
+                   include_stale: bool = False) -> dict:
+        """Show a saved call candidate and any previously stored slot resolution."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _show_vcall(connection, call_id=call_id,
+                address=parse_int(address) if address is not None else None, include_stale=include_stale)
+
     @app.resource("ida://database/schema")
     def database_schema() -> str:
         """Describe the core analysis tables available to sql_query."""
-        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs(source_ea,target_ea,xref_type,...), basic_blocks, cfg_edges, disassembly(function_ea,text,status,...), instructions, pseudocode(function_ea,text,status,...), microcode(function_ea,maturity,status,error,content_hash,...), micro_instructions(function_ea,block_serial,ordinal,ea,opcode,text,l_json,r_json,d_json), micro_flow(function_ea,maturity,status,error,content_hash,arguments_json,return_json,locals_json,...), micro_flow_instructions(function_ea,block_serial,ordinal,ea,opcode,text,l_json,r_json,d_json), propagation_runs(run_id,snapshot_hash,request_json,result_json,...), propagation_nodes(node_id,kind,identity_json,source_snapshot_hash,...), propagation_edges(edge_id,source_node,target_node,family,direction,confidence,transform_json,evidence_json,context_json,source_snapshot_hash,...), propagation_constraints(constraint_id,run_id,proposal_id,node_id,constraint_json,provenance_json,source_snapshot_hash,...), symbols(address,name,type), comments(address,function_ea,kind,repeatable,item_preciser,text,updated_at), type_definitions(name,declaration,updated_at), type_assignments(address,declaration,updated_at), memory_bytes, pointers, search_matches, operations. Research job history uses jobs(job_id,parent_job_id,title,objective,status,head_revision_id) and immutable job_revisions(revision_id,job_id,revision_no,parent_revision_id,message,details,changes_json,snapshot_json,analysis_snapshot_json,state_hash). is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation is a bounded preview graph: only explicitly accepted constraints are durable type results; stale snapshots must be re-seeded or re-previewed."""
+        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs, basic_blocks, cfg_edges, disassembly, instructions, pseudocode, microcode, micro_instructions, micro_flow, micro_flow_instructions, data_pointer_slots, vtable_runs, vtable_candidates, vtable_slots, vtable_evidence, vcall_runs, vcall_sites, vcall_targets, receiver_flows, propagation_runs, propagation_nodes, propagation_edges, propagation_constraints, symbols, comments, type_definitions, type_assignments, memory_bytes, pointers, search_matches, operations, jobs, job_revisions. vtable_candidates are heuristic data-sequence candidates, not confirmed C++ classes; vcall_sites distinguish indirect calls from two-load vtable-shaped candidates, and target rows are slot compatibility only until receiver reachability is established. Rows carry source hashes and stale flags. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation remains a bounded evidence graph."""
 
     if unsafe:
         def mutate(kind: str, values: dict) -> dict:

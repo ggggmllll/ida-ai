@@ -52,7 +52,9 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(initialized.serverInfo.name, "ida-ai")
                     tools = await session.list_tools()
                     names = {item.name for item in tools.tools}
-                    self.assertTrue({"database_summary", "sql_query", "search_code", "export_functions"} <= names)
+                    self.assertTrue({"database_summary", "sql_query", "search_code", "export_functions",
+                                     "vtable_list", "vtable_show", "vtable_search", "vcall_list",
+                                     "analyze_virtual_call", "vcall_show"} <= names)
                     self.assertNotIn("set_assembly_comment", names)
                     results = await session.call_tool(
                         "search_code",
@@ -72,6 +74,8 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("thunk_target_ea", schema.contents[0].text)
                     self.assertIn("is_nullstub", schema.contents[0].text)
                     self.assertIn("job_revisions", schema.contents[0].text)
+                    self.assertIn("vtable_candidates", schema.contents[0].text)
+                    self.assertIn("vcall_sites", schema.contents[0].text)
                     denied = await session.call_tool(
                         "sql_query", {"query": "DELETE FROM functions", "limit": 10}
                     )

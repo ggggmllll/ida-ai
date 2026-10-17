@@ -880,12 +880,25 @@ def synchronize_function(output: str | Path, idb_path: str | Path, address: int)
                     views["microcode"] = export_views(target, [ea], "microcode")
                 if target.execute("SELECT 1 FROM micro_flow WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
                     views["micro_flow"] = export_views(target, [ea], "micro_flow")
+                stale_calls = [row[0] for row in target.execute(
+                    "SELECT call_id FROM vcall_sites WHERE function_ea=? AND stale=0", (sqlite_ea(ea),))]
+                if stale_calls:
+                    placeholders = ",".join("?" for _ in stale_calls)
+                    target.execute(f"UPDATE vcall_sites SET stale=1 WHERE call_id IN ({placeholders})", stale_calls)
+                    target.execute(f"UPDATE vcall_targets SET stale=1 WHERE call_id IN ({placeholders})", stale_calls)
+                    target.execute(f"UPDATE receiver_flows SET stale=1 WHERE call_id IN ({placeholders})", stale_calls)
+                    run_ids = [row[0] for row in target.execute(
+                        f"SELECT DISTINCT run_id FROM vcall_sites WHERE call_id IN ({placeholders})", stale_calls)]
+                    if run_ids:
+                        run_placeholders = ",".join("?" for _ in run_ids)
+                        target.execute(f"UPDATE vcall_runs SET status='stale' WHERE run_id IN ({run_placeholders})", run_ids)
                 set_metadata(target, {f"function_sync:{ea:X}": utc_now()})
                 target.commit()
                 if not ida_loader.save_database(str(idb_path), 0):
                     raise RuntimeError("IDA failed to save locally synchronized database")
                 target.backup(source)
-    return {"function_ea": ea, "views": views, "scope": "function-local views"}
+    return {"function_ea": ea, "views": views, "stale_vcall_sites": len(stale_calls),
+            "scope": "function-local views"}
 
 
 def synchronize_database(output: str | Path, idb_path: str | Path, all_views: bool = False) -> dict:

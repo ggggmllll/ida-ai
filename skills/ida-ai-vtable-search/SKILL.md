@@ -1,0 +1,14 @@
+---
+name: ida-ai-vtable-search
+description: Search indexed table candidates by required slot targets or slot index.
+---
+
+```text
+python -m ida_ai vtable-search --db ANALYSIS.sqlite --target ADDRESS --target ADDRESS
+python -m ida_ai vtable-search --db ANALYSIS.sqlite --slot-index N
+python -m ida_ai vtable-search --db ANALYSIS.sqlite --target ADDRESS --abi itanium --limit N
+```
+
+The repeated `--target` values are an AND query: one candidate must contain all requested target entries, in any slots. `--slot-index` restricts the returned matching slot. Use `0x` addresses or decimal values. This command searches the derived vtable index, not the ordinary byte/pointer-search cache.
+
+Results are structural matches. They do not prove that the same receiver can reach every matching table, that the targets are overrides, or that the table belongs to a named class. Inspect each candidate's evidence and use `vcall-analyze` for a call-point-specific query.

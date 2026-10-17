@@ -320,9 +320,10 @@ def list_vtables(
         clauses.append("c.status=?"); parameters.append(status)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     total = connection.execute("SELECT count(*) FROM vtable_candidates c" + where, parameters).fetchone()[0]
+    sql_limit = -1 if limit == 0 else limit
     rows = connection.execute(
         "SELECT c.* FROM vtable_candidates c" + where +
-        " ORDER BY c.address_point,c.candidate_id LIMIT ? OFFSET ?", (*parameters, limit, offset),
+        " ORDER BY c.address_point,c.candidate_id LIMIT ? OFFSET ?", (*parameters, sql_limit, offset),
     ).fetchall()
     items = []
     for row in rows:
@@ -627,10 +628,24 @@ def build_vcall_index(
             "functions_with_export_errors": failures, "candidate_limit": max_calls,
             "truncated": len(sites) >= max_calls}, "scope": scope, "source_snapshot_hash": snapshot}
     with connection:
-        connection.execute("UPDATE vcall_sites SET stale=1 WHERE stale=0")
-        connection.execute("UPDATE vcall_targets SET stale=1 WHERE stale=0")
-        connection.execute("UPDATE receiver_flows SET stale=1 WHERE stale=0")
-        connection.execute("UPDATE vcall_runs SET status='stale' WHERE status NOT IN ('stale','error')")
+        if selected:
+            placeholders = ",".join("?" for _ in selected)
+            stored_selected = [sqlite_ea(ea) for ea in selected]
+            affected_runs = [row[0] for row in connection.execute(
+                f"SELECT DISTINCT run_id FROM vcall_sites WHERE function_ea IN ({placeholders}) AND stale=0",
+                stored_selected)]
+            connection.execute(f"UPDATE vcall_sites SET stale=1 WHERE function_ea IN ({placeholders}) AND stale=0",
+                               stored_selected)
+            connection.execute(f"UPDATE vcall_targets SET stale=1 WHERE call_id IN "
+                f"(SELECT call_id FROM vcall_sites WHERE function_ea IN ({placeholders})) AND stale=0",
+                stored_selected)
+            connection.execute(f"UPDATE receiver_flows SET stale=1 WHERE call_id IN "
+                f"(SELECT call_id FROM vcall_sites WHERE function_ea IN ({placeholders})) AND stale=0",
+                stored_selected)
+            if affected_runs:
+                run_placeholders = ",".join("?" for _ in affected_runs)
+                connection.execute(f"UPDATE vcall_runs SET status='stale' WHERE run_id IN ({run_placeholders})",
+                                   affected_runs)
         connection.execute("INSERT INTO vcall_runs(run_id,source_snapshot_hash,scope_json,detector_version,status,result_json,created_at) VALUES(?,?,?,?,?,?,?)",
             (run_id, snapshot, _json(scope), VCALL_DETECTOR_VERSION, "ok", _json(result), now))
         connection.executemany(
@@ -660,8 +675,9 @@ def list_vcalls(
         clauses.append("status=?"); parameters.append(status)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     total = connection.execute("SELECT count(*) FROM vcall_sites" + where, parameters).fetchone()[0]
+    sql_limit = -1 if limit == 0 else limit
     rows = connection.execute("SELECT * FROM vcall_sites" + where +
-        " ORDER BY function_ea,block_serial,ordinal LIMIT ? OFFSET ?", (*parameters, limit, offset)).fetchall()
+        " ORDER BY function_ea,block_serial,ordinal LIMIT ? OFFSET ?", (*parameters, sql_limit, offset)).fetchall()
     items = []
     for row in rows:
         item = dict(row)
