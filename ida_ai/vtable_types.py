@@ -275,7 +275,22 @@ def preview_vtable_type_plan(connection: sqlite3.Connection, spec: dict[str, Any
     if not isinstance(assignments, list) or len(assignments) > 512:
         raise ValueError("assignments must be a list of at most 512 explicit address/declaration pairs")
     allowed: dict[int, set[str]] = {}
-    allowed.setdefault(ida_ea(candidate["table_address"]), set()).add("table_start")
+    evidence = json.loads(candidate["evidence_json"] or "{}")
+    table_address_status = evidence.get("table_address_status")
+    table_start = ida_ea(candidate["table_address"])
+    if table_address_status is None:
+        if evidence.get("address_point_prefix"):
+            table_address_status = "candidate_from_prefix"
+        else:
+            symbol_ea = ida_ea(candidate["address_point"]) - 2 * int(candidate["pointer_size"])
+            symbol = connection.execute("SELECT name FROM symbols WHERE address=?", (sqlite_ea(symbol_ea),)).fetchone()
+            if symbol is not None and str(symbol[0]).startswith("_ZTV"):
+                table_address_status = "candidate_from_ztv_symbol"
+                table_start = symbol_ea
+            else:
+                table_address_status = "unresolved"
+    if table_address_status != "unresolved":
+        allowed.setdefault(table_start, set()).add("table_start")
     allowed.setdefault(ida_ea(candidate["address_point"]), set()).add("address_point")
     for slot in connection.execute("SELECT * FROM vtable_slots WHERE candidate_id=? AND stale=0 ORDER BY slot_index",
                                    (candidate_id,)):

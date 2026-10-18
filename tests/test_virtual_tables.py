@@ -27,7 +27,7 @@ from ida_ai.virtual_tables import (
     show_vcall,
     show_vtable,
     store_itanium_rtti_descriptors,
-    trace_vptr_write_callers,
+    trace_vptr_object_flows,
 )
 
 
@@ -178,6 +178,9 @@ class VirtualTableTests(unittest.TestCase):
         listing = list_vtables(self.connection, limit=10)
         self.assertEqual(listing["total"], 2)
         first = show_vtable(self.connection, address=0x5000)["items"][0]
+        self.assertIsNone(first["table_address"])
+        self.assertEqual(first["table_address_status"], "unresolved")
+        self.assertEqual(first["candidate_start_address"], 0x5000)
         self.assertEqual([slot["target_ea"] for slot in first["slots"]], [0x1000, 0x1200])
         self.assertEqual([slot["entry_classification"] for slot in first["slots"]], ["function", "thunk"])
         self.assertTrue(first["slots"][1]["is_thunk"])
@@ -187,6 +190,16 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(matches["items"][0]["address_point"], 0x5000)
         rerun = build_vtable_index(self.connection, abi="itanium")
         self.assertTrue(rerun["cached"])
+
+    def test_vtable_uses_ztv_symbol_for_boundary_when_prefix_was_not_exported(self):
+        self.connection.execute("INSERT INTO symbols(address,name,type) VALUES(?,?,NULL)",
+            (0x4FF0, "_ZTV3Foo"))
+        self.connection.commit()
+        build_vtable_index(self.connection, abi="itanium")
+        candidate = show_vtable(self.connection, address=0x5000)["items"][0]
+        self.assertEqual(candidate["table_address"], 0x4FF0)
+        self.assertEqual(candidate["table_address_status"], "candidate_from_ztv_symbol")
+        self.assertEqual(candidate["evidence"]["table_start_symbol"], "_ZTV3Foo")
 
     def test_parse_itanium_vmi_bases_with_signed_offsets_and_flags(self):
         def word(value: int, width: int) -> bytes:
@@ -438,6 +451,8 @@ class VirtualTableTests(unittest.TestCase):
         analyzed = analyze_vcall(self.connection, call_id=site["call_id"])
         self.assertEqual(analyzed["resolution"]["resolution_status"], "candidate_set")
         self.assertEqual(len(analyzed["resolution"]["targets"]), 1)
+        self.assertEqual(analyzed["resolution"]["candidate_counts"]["compatible_table_slot_rows"], 1)
+        self.assertEqual(analyzed["resolution"]["candidate_counts"]["compatible_distinct_target_eas"], 1)
         self.assertEqual(analyzed["resolution"]["prior_vptr_writes"]["status"], "not_indexed")
         self.assertEqual(analyzed["resolution"]["targets"][0]["target_ea"], 0x1200)
         shown = show_vcall(self.connection, call_id=site["call_id"])
@@ -451,6 +466,19 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(len(shown["receiver_flows"]), 1)
         self.assertEqual(shown["receiver_flows"][0]["status"], "unknown")
         self.assertEqual(shown["receiver_flows"][0]["edge"]["kind"], "prior_vptr_write_scan_result")
+
+    def test_vcall_unknown_reason_is_reported_with_run_counts(self):
+        function = self._add_vcall_fixture()
+        self.connection.execute("UPDATE micro_instructions SET r_json=? WHERE function_ea=? AND opcode='icall'",
+            (json.dumps({"kind": "register", "value_number": 2, "register": 10,
+                "size": 8, "truncated": True}), sqlite_ea(function)))
+        self.connection.commit()
+        build_vtable_index(self.connection, abi="itanium")
+        result = build_vcall_index(self.connection, function_eas=[function])
+        self.assertEqual(result["pattern_candidate_count"], 0)
+        self.assertEqual(result["unknown_reason_counts"], {"operand_tree_truncated": 1})
+        site = list_vcalls(self.connection, function_ea=function)["items"][0]
+        self.assertEqual(site["evidence"]["unknown_reason"]["code"], "operand_tree_truncated")
 
     def test_rebuilding_vtable_index_stales_saved_vcall_targets(self):
         function = self._add_vcall_fixture()
@@ -494,6 +522,7 @@ class VirtualTableTests(unittest.TestCase):
         self.assertEqual(prior["status"], "candidate")
         self.assertEqual(prior["items"][0]["order_relation"], "same_block_prior_store")
         self.assertTrue(analyzed["resolution"]["targets"][0]["matching_prior_vptr_write_candidate"])
+        self.assertEqual(analyzed["resolution"]["candidate_counts"]["prior_store_narrowed_table_slot_rows"], 1)
         shown = show_vcall(self.connection, call_id=call["call_id"])
         self.assertEqual(len(shown["receiver_flows"]), 1)
         self.assertEqual(shown["receiver_flows"][0]["edge"]["kind"], "observed_prior_vptr_store_candidate")
@@ -555,11 +584,12 @@ class VirtualTableTests(unittest.TestCase):
         indexed = build_vptr_write_index(self.connection, function_eas=[writer], view_name="micro_flow")
         self.assertEqual(indexed["write_count"], 1)
         write = self.connection.execute("SELECT write_id FROM vptr_writes WHERE run_id=?", (indexed["run_id"],)).fetchone()
-        result = trace_vptr_write_callers(self.connection, write_id=write["write_id"])
-        self.assertEqual(result["status"], "caller_paths_found")
-        self.assertEqual(result["caller_path_count"], 1)
-        self.assertEqual(result["caller_paths"][0]["function_ea"], caller)
-        self.assertTrue(any(edge["family"] == "parameter" for edge in result["caller_paths"][0]["trace"]))
+        result = trace_vptr_object_flows(self.connection, write_id=write["write_id"])
+        self.assertEqual(result["status"], "object_flow_paths_found")
+        self.assertEqual(result["object_flow_path_count"], 1)
+        self.assertEqual(result["object_flow_paths"][0]["function_ea"], caller)
+        self.assertTrue(any(edge["family"] == "parameter" for edge in result["object_flow_paths"][0]["trace"]))
+        self.assertNotIn("caller_paths", result)
         seed = add_seed(self.connection, {
             "node": {"kind": "local", "function": writer, "local_index": 0},
             "constraint": {"kind": "type", "type_name": "derived_t", "offset": 0},
@@ -600,7 +630,7 @@ class VirtualTableTests(unittest.TestCase):
                 "test", "{}", microcode_run["coverage"]["source_snapshot_hash"]))
         self.connection.commit()
         with self.assertRaisesRegex(ValueError, "requires a micro_flow"):
-            trace_vptr_write_callers(self.connection, write_id="microcode-write")
+            trace_vptr_object_flows(self.connection, write_id="microcode-write")
 
     def test_table_slot_classifications_preserve_nullstub_runtime_and_library_traits(self):
         self.connection.executemany(

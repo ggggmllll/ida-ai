@@ -55,7 +55,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue({"database_summary", "sql_query", "search_code", "export_functions",
                                      "vtable_list", "vtable_show", "vtable_search", "vcall_list",
                                      "analyze_virtual_call", "vcall_show", "vptr_write_list",
-                                     "index_vptr_writes", "trace_vptr_write_callers", "index_virtual_calls",
+                                     "index_vptr_writes", "trace_vptr_object_flows", "trace_vptr_write_callers", "index_virtual_calls",
                                      "vtable_class_relationships", "vtable_type_preview"} <= names)
                     self.assertNotIn("set_assembly_comment", names)
                     results = await session.call_tool(

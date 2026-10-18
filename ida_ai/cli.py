@@ -20,7 +20,7 @@ from .propagation import accept_propagation, preview_seed, show_node as show_pro
 from .virtual_tables import (analyze_vcall, build_vcall_index, build_vtable_index,
                              build_vptr_write_index, list_vptr_writes,
                              list_vcalls, list_vtables, search_vtables,
-                             show_vcall, show_vtable)
+                             show_vcall, show_vtable, trace_vptr_object_flows)
 from .vtable_types import class_relationships, preview_vtable_type_plan
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
@@ -413,13 +413,14 @@ def _parser() -> argparse.ArgumentParser:
     vptr_write_list.add_argument("--offset", type=int, default=0)
     vptr_write_list.add_argument("--include-stale", action="store_true")
 
-    vptr_write_trace = commands.add_parser("vptr-write-trace", help="trace a LVARS vptr store through direct-call arguments")
+    vptr_write_trace = commands.add_parser("vptr-write-trace", help="trace LVARS object flow from a vptr store")
     _add_db(vptr_write_trace)
     vptr_write_trace.add_argument("--write-id", required=True)
     vptr_write_trace.add_argument("--max-hops", type=int, default=6)
     vptr_write_trace.add_argument("--max-nodes", type=int, default=500)
     vptr_write_trace.add_argument("--max-edges", type=int, default=4000)
-    vptr_write_trace.add_argument("--max-callers", type=int, default=2000)
+    vptr_write_trace.add_argument("--max-paths", "--max-callers", dest="max_paths", type=int, default=2000,
+                                  help="maximum object-flow paths (the --max-callers spelling is deprecated)")
     vptr_write_trace.add_argument("--max-alternatives", type=int, default=4)
     return parser
 
@@ -721,13 +722,12 @@ def _run(args: argparse.Namespace) -> dict:
             "refreshed": not args.no_refresh}
         return result
     if args.command == "vptr-write-trace":
-        if min(args.max_hops, args.max_nodes, args.max_edges, args.max_callers, args.max_alternatives) < 1:
+        if min(args.max_hops, args.max_nodes, args.max_edges, args.max_paths, args.max_alternatives) < 1:
             raise ValueError("trace budgets must be positive")
         with closing(connect(args.db)) as connection:
-            from .virtual_tables import trace_vptr_write_callers
-            return trace_vptr_write_callers(connection, write_id=args.write_id,
+            return trace_vptr_object_flows(connection, write_id=args.write_id,
                 max_hops=args.max_hops, max_nodes=args.max_nodes, max_edges=args.max_edges,
-                max_callers=args.max_callers, max_alternatives=args.max_alternatives)
+                max_paths=args.max_paths, max_alternatives=args.max_alternatives)
     if args.command == "vptr-write-list":
         with closing(connect(args.db)) as connection:
             function_ea = None

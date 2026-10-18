@@ -18,8 +18,8 @@ from typing import Any
 from .db import get_metadata, ida_ea, set_metadata, sqlite_ea, utc_now
 
 
-VTABLE_PARSER_VERSION = "6"
-VCALL_DETECTOR_VERSION = "3"
+VTABLE_PARSER_VERSION = "7"
+VCALL_DETECTOR_VERSION = "4"
 VPTR_WRITE_DETECTOR_VERSION = "1"
 SUPPORTED_ABIS = ("itanium",)
 MAX_RTTI_BASES = 128
@@ -158,6 +158,48 @@ def _symbol_name_at(connection: sqlite3.Connection, address: int | None) -> str 
         return None
     row = connection.execute("SELECT name FROM symbols WHERE address=?", (sqlite_ea(address),)).fetchone()
     return str(row[0]) if row is not None else None
+
+
+def _present_vtable_candidate(connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """Render table-start semantics without promoting an address-point fallback."""
+    item = dict(row)
+    row_keys = set(row.keys())
+    raw_candidate_start = ida_ea(item["table_address"])
+    address_point = ida_ea(item["address_point"])
+    evidence = json.loads(item.pop("evidence_json")) if "evidence_json" in row_keys else item.get("evidence", {})
+    status = evidence.get("table_address_status")
+    basis = evidence.get("table_address_basis")
+    if status not in {"candidate_from_prefix", "candidate_from_ztv_symbol", "unresolved"}:
+        if status is not None:
+            status = "unresolved"
+        else:
+            prefix = evidence.get("address_point_prefix")
+            if prefix:
+                status, basis = "candidate_from_prefix", "itanium_prefix_candidate"
+            else:
+                symbol_ea = address_point - 2 * int(item["pointer_size"])
+                symbol = _symbol_name_at(connection, symbol_ea)
+                if symbol and symbol.startswith("_ZTV"):
+                    status, basis = "candidate_from_ztv_symbol", "ztv_symbol_at_two_word_prefix"
+                    raw_candidate_start = symbol_ea
+                else:
+                    status, basis = "unresolved", "address_point_fallback_unresolved"
+    if status in {"candidate_from_prefix", "candidate_from_ztv_symbol"}:
+        raw_candidate_start = address_point - 2 * int(item["pointer_size"])
+    if status == "unresolved":
+        item["candidate_start_address"] = raw_candidate_start
+        item["candidate_start_address_hex"] = f"0x{raw_candidate_start:X}"
+        item["table_address"] = None
+        item["table_address_hex"] = None
+    else:
+        item["table_address"] = raw_candidate_start
+        item["table_address_hex"] = f"0x{raw_candidate_start:X}"
+    item["address_point"] = address_point
+    item["address_point_hex"] = f"0x{address_point:X}"
+    item["table_address_status"] = status
+    item["table_address_basis"] = basis
+    item["evidence"] = evidence
+    return item
 
 
 def _resolve_itanium_typeinfo(connection: sqlite3.Connection, typeinfo_ea: int,
@@ -560,11 +602,17 @@ def build_vtable_index(
             prefix = _has_itanium_prefix(connection, address_point, pointer_size)
             typeinfo = (prefix or {}).get("typeinfo") or {}
             typeinfo_descriptor = rtti_by_ea.get(typeinfo.get("typeinfo_ea"))
-            table_symbol = _symbol_name_at(connection, address_point - 2 * pointer_size) if prefix else None
+            boundary_symbol = _symbol_name_at(connection, address_point - 2 * pointer_size)
+            table_symbol = boundary_symbol if prefix else None
+            ztv_boundary_symbol = (boundary_symbol if isinstance(boundary_symbol, str)
+                and boundary_symbol.startswith("_ZTV") else None)
             typeinfo_symbol = typeinfo.get("typeinfo_symbol")
             expected_table_symbol = ("_ZTV" + typeinfo_symbol[4:]
                                      if typeinfo_symbol and typeinfo_symbol.startswith("_ZTI") else None)
             table_symbol_matches_typeinfo = bool(expected_table_symbol and table_symbol == expected_table_symbol)
+            table_address_basis = ("itanium_prefix_candidate" if prefix is not None else
+                "ztv_symbol_at_two_word_prefix" if ztv_boundary_symbol is not None else
+                "address_point_fallback_unresolved")
             evidence = {
                 "method": "contiguous_aligned_mapped_function_pointer_sequence",
                 "status": "heuristic_candidate",
@@ -574,11 +622,16 @@ def build_vtable_index(
                 "typeinfo_layout_confirmed": typeinfo.get("status") == "confirmed_itanium_typeinfo_layout",
                 "address_point_symbol_match": table_symbol_matches_typeinfo,
                 "table_symbol": table_symbol,
+                "table_start_symbol": ztv_boundary_symbol,
+                "table_address_basis": table_address_basis,
+                "table_address_status": ("candidate_from_prefix" if prefix is not None else
+                    "candidate_from_ztv_symbol" if ztv_boundary_symbol is not None else "unresolved"),
                 "expected_table_symbol": expected_table_symbol,
                 "address_point_prefix": prefix,
                 "address_point_boundary": ("two_word_prefix_with_matching_vtable_symbol"
                     if table_symbol_matches_typeinfo else "two_word_itanium_prefix_candidate"
-                    if prefix is not None else "function_sequence_start_unconfirmed"),
+                    if prefix is not None else "ztv_symbol_at_two_word_prefix"
+                    if ztv_boundary_symbol is not None else "function_sequence_start_unconfirmed"),
                 "rtti_run_id": rtti_run_id,
                 "typeinfo_descriptor": typeinfo_descriptor,
                 "class_relationship_evidence": (typeinfo_descriptor or {}).get("bases", []),
@@ -595,7 +648,8 @@ def build_vtable_index(
             }
             candidates.append({
                 "candidate_id": candidate_id,
-                "table_address": (address_point - 2 * pointer_size if prefix is not None else address_point),
+                "table_address": (address_point - 2 * pointer_size
+                    if prefix is not None or ztv_boundary_symbol is not None else address_point),
                 "address_point": address_point,
                 "table_end": run_previous + pointer_size if run_previous is not None else None,
                 "slot_count": len(run_slots), "abi": abi, "architecture": get_metadata(connection, "architecture"),
@@ -681,6 +735,15 @@ def build_vtable_index(
                          for candidate in candidates),
                      "typeinfo_layout_confirmed": sum(
                          bool(candidate["evidence"].get("typeinfo_layout_confirmed")) for candidate in candidates),
+                     "table_address_from_prefix": sum(
+                         candidate["evidence"]["table_address_status"] == "candidate_from_prefix"
+                         for candidate in candidates),
+                     "table_address_from_ztv_symbol": sum(
+                         candidate["evidence"]["table_address_status"] == "candidate_from_ztv_symbol"
+                         for candidate in candidates),
+                     "table_address_unresolved": sum(
+                         candidate["evidence"]["table_address_status"] == "unresolved"
+                         for candidate in candidates),
                      "candidate_tables_remain_heuristic": True,
                      "data_pointer_scan": get_metadata(connection, "data_pointer_scan")},
         "scope": scope,
@@ -754,11 +817,7 @@ def list_vtables(
     ).fetchall()
     items = []
     for row in rows:
-        item = dict(row)
-        item["table_address_hex"] = f"0x{ida_ea(item['table_address']):X}"
-        item["address_point_hex"] = f"0x{ida_ea(item['address_point']):X}"
-        item["evidence"] = json.loads(item.pop("evidence_json"))
-        items.append(item)
+        items.append(_present_vtable_candidate(connection, row))
     return {"count": len(items), "total": total, "truncated": offset + len(items) < total,
             "items": items, "include_stale": include_stale}
 
@@ -777,11 +836,8 @@ def show_vtable(
                               " ORDER BY c.created_at DESC", parameters).fetchall()
     items = []
     for row in rows:
-        item = dict(row)
+        item = _present_vtable_candidate(connection, row)
         candidate = item["candidate_id"]
-        item["table_address_hex"] = f"0x{ida_ea(item['table_address']):X}"
-        item["address_point_hex"] = f"0x{ida_ea(item['address_point']):X}"
-        item["evidence"] = json.loads(item.pop("evidence_json"))
         slots = []
         for slot in connection.execute(
             "SELECT * FROM vtable_slots WHERE candidate_id=?" + ("" if include_stale else " AND stale=0") +
@@ -1001,6 +1057,33 @@ def _instructions_for_function(connection: sqlite3.Connection, function_ea: int,
             "opcode": row[3], "text": row[4], "l": _decode_json(row[5]), "r": _decode_json(row[6]),
             "d": _decode_json(row[7])})
     return result
+
+
+def _unknown_vcall_reason(instruction: dict[str, Any], pattern: dict[str, Any] | None,
+                          relations: dict[str, Any]) -> dict[str, str]:
+    """Classify why a GLBOPT3 indirect call did not become a pattern candidate.
+
+    These are triage labels for selecting the next export; they are not a
+    semantic explanation of the machine code.
+    """
+    operands = (instruction.get("l"), instruction.get("r"), instruction.get("d"))
+    if any(_operand_truncated(item) for item in operands):
+        return {"code": "operand_tree_truncated", "detail": "an operand tree was truncated by the exporter"}
+    if relations.get("truncated"):
+        return {"code": "operand_tree_truncated", "detail": "microcode relation coverage is truncated"}
+    cfg = relations.get("cfg") or {}
+    if cfg.get("complete") is False:
+        return {"code": "cfg_incomplete", "detail": "the exported CFG is incomplete"}
+    def_use = relations.get("def_use") or {}
+    if def_use.get("cross_block_reaching_definitions"):
+        return {"code": "cross_block_multiple_definitions", "detail": "cross-block value definitions are unresolved"}
+    if pattern is not None:
+        binding = pattern.get("receiver_binding") or {}
+        return {"code": "receiver_binding_failed", "detail": binding.get("reason", binding.get("status", "receiver argument binding failed"))}
+    callee = instruction.get("r") or instruction.get("l") or {}
+    if callee.get("kind") == "nested" and (callee.get("instruction") or {}).get("opcode") == "ldx":
+        return {"code": "two_load_chain_unresolved", "detail": "a dependent load chain could not be resolved"}
+    return {"code": "indirect_call_shape_unresolved", "detail": "no complete two-load vtable-shaped chain was observed"}
 
 
 def _microcode_relations_for_function(connection: sqlite3.Connection, function_ea: int,
@@ -1607,17 +1690,17 @@ def _vptr_write_node(write: sqlite3.Row | dict[str, Any]) -> tuple[str | None, d
     return node_id, object_view
 
 
-def trace_vptr_write_callers(
+def trace_vptr_object_flows(
     connection: sqlite3.Connection, *, write_id: str, max_hops: int = 12,
-    max_nodes: int = 500, max_edges: int = 4000, max_callers: int = 2000,
+    max_nodes: int = 500, max_edges: int = 4000, max_paths: int = 2000,
     max_alternatives: int = 4,
 ) -> dict[str, Any]:
-    """Trace a current LVARS vptr-store object through the bounded flow graph.
+    """Trace a current LVARS vptr-store object through bounded object-flow paths.
 
     The trace is a preview of exported value/reference/argument/return edges.
     It does not establish object lifetime, alias completeness, or runtime reachability.
     """
-    if min(max_hops, max_nodes, max_edges, max_callers, max_alternatives) < 1:
+    if min(max_hops, max_nodes, max_edges, max_paths, max_alternatives) < 1:
         raise ValueError("trace budgets must be positive")
     row = connection.execute(
         "SELECT w.*,r.scope_json,r.source_snapshot_hash AS run_source_hash,r.status AS run_status "
@@ -1642,7 +1725,8 @@ def trace_vptr_write_callers(
         raise ValueError("vptr write references a stale or missing table candidate")
     start_node, object_view = _vptr_write_node(row)
     if start_node is None:
-        return {"write_id": write_id, "status": "unsupported_object_identity", "paths": [],
+        return {"write_id": write_id, "status": "unsupported_object_identity",
+            "object_flow_path_count": 0, "object_flow_paths": [],
             "object": object_view, "unknown_frontier": ["object root kind is not represented in the LVARS propagation graph"]}
 
     from .propagation import FAMILIES, _graph, _snapshot_hash
@@ -1655,8 +1739,8 @@ def trace_vptr_write_callers(
     per_node_paths: dict[str, int] = defaultdict(int)
     per_node_paths[start_node] = 1
     visited_nodes = {start_node}
-    callers: dict[tuple[str, str], dict[str, Any]] = {}
-    truncated = {"max_hops": False, "max_nodes": False, "max_edges": False, "max_callers": False}
+    paths: dict[tuple[str, str], dict[str, Any]] = {}
+    truncated = {"max_hops": False, "max_nodes": False, "max_edges": False, "max_paths": False}
     expanded = 0
     while queue:
         node_id, node_path, trace = queue.popleft()
@@ -1683,12 +1767,12 @@ def trace_vptr_write_callers(
             if (source_function is not None and target_function is not None
                     and source_function != target_function):
                 key = (target_function, target)
-                if key not in callers:
-                    if len(callers) >= max_callers:
-                        truncated["max_callers"] = True
+                if key not in paths:
+                    if len(paths) >= max_paths:
+                        truncated["max_paths"] = True
                         queue.clear()
                         break
-                    callers[key] = {"function_ea": target_function, "node_id": target,
+                    paths[key] = {"function_ea": target_function, "node_id": target,
                         "path_nodes": [*node_path, target], "trace": next_trace,
                         "has_hypothesis_edge": any(item.get("confidence") == "hypothesis"
                             or item.get("uncertain") for item in next_trace)}
@@ -1702,18 +1786,33 @@ def trace_vptr_write_callers(
     relevant_unresolved = [item for item in unresolved
         if item.get("function_ea") in relevant_functions]
     status = "partial" if any(truncated.values()) or relevant_unresolved else (
-        "caller_paths_found" if callers else "no_caller_path_within_exported_flow")
+        "object_flow_paths_found" if paths else "no_object_flow_path_within_exported_flow")
     return {"write_id": write_id, "status": status, "preview_only": True,
         "source_snapshot_hash": row["run_source_hash"], "propagation_snapshot_hash": snapshot_hash,
         "source_view": view_name, "start_node": start_node, "object": object_view,
         "vptr_offset": int(row["vptr_offset"] or 0), "address_point": ida_ea(row["address_point"]),
-        "candidate_id": row["candidate_id"], "caller_path_count": len(callers),
-        "caller_paths": list(callers.values()), "visited_nodes": len(visited_nodes),
+        "candidate_id": row["candidate_id"], "object_flow_path_count": len(paths),
+        "object_flow_paths": list(paths.values()), "visited_nodes": len(visited_nodes),
         "expanded_edge_count": expanded, "truncated": truncated,
         "graph": graph_stats, "unresolved": relevant_unresolved,
         "unknown_frontier": ["only exported direct-call, value/reference, and return edges are traversed",
             "unrepresented aliases, indirect callers, escaped pointers, memory reuse, and object lifetime",
+            "a path is object-flow evidence, not proof that a call is an external caller",
             "a path is not proof that the store dominates or reaches a runtime call"]}
+
+
+
+def trace_vptr_write_callers(
+    connection: sqlite3.Connection, *, write_id: str, max_hops: int = 12,
+    max_nodes: int = 500, max_edges: int = 4000, max_callers: int = 2000,
+    max_alternatives: int = 4,
+) -> dict[str, Any]:
+    """Deprecated compatibility API; output uses object-flow terminology."""
+    result = trace_vptr_object_flows(connection, write_id=write_id, max_hops=max_hops,
+        max_nodes=max_nodes, max_edges=max_edges, max_paths=max_callers,
+        max_alternatives=max_alternatives)
+    result["deprecated_tool_alias"] = "trace_vptr_object_flows"
+    return result
 
 
 def _node_function_id(node_id: str) -> int | None:
@@ -1882,14 +1981,22 @@ def build_vcall_index(
                             "cross_block_reaching_definitions")}},
                 "source_snapshot_hash": snapshot,
             }
+            if not pattern_candidate:
+                site["evidence"]["unknown_reason"] = _unknown_vcall_reason(instruction, pattern, relations)
             sites.append(site)
         if truncated:
             break
 
     now = utc_now()
     run_status = "partial" if missing or failures or truncated or not selected else "ok"
+    unknown_reason_counts: dict[str, int] = defaultdict(int)
+    for site in sites:
+        if site["status"] == "indirect_unknown":
+            code = site["evidence"].get("unknown_reason", {}).get("code", "unknown_reason_unavailable")
+            unknown_reason_counts[code] += 1
     result = {"site_count": len(sites), "pattern_candidate_count": sum(s["status"] == "vtable_pattern_candidate" for s in sites),
         "unknown_indirect_count": sum(s["status"] == "indirect_unknown" for s in sites),
+        "unknown_reason_counts": dict(sorted(unknown_reason_counts.items())),
         "coverage": {"selected_functions": len(selected), "functions_missing_microcode": missing,
             "functions_with_export_errors": failures, "candidate_limit": max_calls,
             "truncated": truncated}, "scope": scope, "source_snapshot_hash": snapshot,
@@ -1957,9 +2064,15 @@ def _resolve_vcall_targets(connection: sqlite3.Connection, call_id: str) -> dict
         raise ValueError(f"current virtual-call site not found: {call_id}")
     if site["status"] != "vtable_pattern_candidate" or site["slot_offset"] is None:
         return {"call_id": call_id, "resolution_status": "unknown", "targets": [],
-            "reason": "the indirect call did not produce a complete two-load vtable-shaped pattern"}
+            "reason_code": "pattern_incomplete",
+            "reason": "the indirect call did not produce a complete two-load vtable-shaped pattern",
+            "candidate_counts": {"compatible_table_slot_rows": 0, "compatible_candidate_tables": 0,
+                "compatible_distinct_target_eas": 0, "prior_store_narrowed_table_slot_rows": 0,
+                "prior_store_narrowed_candidate_tables": 0, "prior_store_narrowed_distinct_target_eas": 0,
+                "matching_prior_vptr_write_rows": 0, "counts_are_probabilities": False}}
     if site["slot_offset"] % site["pointer_size"]:
         return {"call_id": call_id, "resolution_status": "partial", "targets": [],
+            "reason_code": "slot_offset_unaligned",
             "reason": "slot byte offset is not aligned to the recorded pointer width"}
     rows = connection.execute(
         "SELECT s.candidate_id,s.slot_index,s.byte_offset,s.target_ea,s.target_name,s.entry_classification,"
@@ -1984,7 +2097,14 @@ def _resolve_vcall_targets(connection: sqlite3.Connection, call_id: str) -> dict
     status = "candidate_set" if targets else "unknown"
     reason = "matching indexed slots are candidates only; object identity and dynamic reachability are not resolved" if targets else "no current indexed table has this slot offset"
     return {"call_id": call_id, "resolution_status": status, "completeness": "partial",
-        "targets": targets, "reason": reason,
+        "targets": targets, "reason_code": "compatible_slots" if targets else "no_matching_indexed_slot",
+        "reason": reason,
+        "candidate_counts": {"compatible_table_slot_rows": len(targets),
+            "compatible_candidate_tables": len({item["candidate_id"] for item in targets}),
+            "compatible_distinct_target_eas": len({item["target_ea"] for item in targets if item["target_ea"] is not None}),
+            "prior_store_narrowed_table_slot_rows": 0, "prior_store_narrowed_candidate_tables": 0,
+            "prior_store_narrowed_distinct_target_eas": 0, "matching_prior_vptr_write_rows": 0,
+            "counts_are_probabilities": False},
         "unknown_frontier": ["receiver dynamic type", "receiver-to-address-point relation", "external or unindexed tables"]}
 
 
@@ -2017,6 +2137,21 @@ def analyze_vcall(connection: sqlite3.Connection, *, call_id: str | None = None,
                 if item["candidate_id"] == target["candidate_id"]]
         else:
             target["prior_vptr_write_ids"] = []
+    compatible_targets = resolution["targets"]
+    narrowed_targets = [target for target in compatible_targets
+        if target["matching_prior_vptr_write_candidate"]]
+    resolution["candidate_counts"] = {
+        "compatible_table_slot_rows": len(compatible_targets),
+        "compatible_candidate_tables": len({item["candidate_id"] for item in compatible_targets}),
+        "compatible_distinct_target_eas": len({item["target_ea"] for item in compatible_targets
+            if item["target_ea"] is not None}),
+        "prior_store_narrowed_table_slot_rows": len(narrowed_targets),
+        "prior_store_narrowed_candidate_tables": len({item["candidate_id"] for item in narrowed_targets}),
+        "prior_store_narrowed_distinct_target_eas": len({item["target_ea"] for item in narrowed_targets
+            if item["target_ea"] is not None}),
+        "matching_prior_vptr_write_rows": len(prior_writes.get("items", [])),
+        "counts_are_probabilities": False,
+    }
     with connection:
         connection.execute("DELETE FROM vcall_targets WHERE call_id=?", (call_id,))
         connection.execute("DELETE FROM receiver_flows WHERE call_id=?", (call_id,))

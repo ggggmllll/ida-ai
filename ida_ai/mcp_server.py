@@ -19,6 +19,7 @@ from .virtual_tables import (analyze_vcall as _analyze_vcall, build_vcall_index 
                              list_vtables as _list_vtables, search_vtables as _search_vtables,
                              list_vptr_writes as _list_vptr_writes,
                              build_vptr_write_index as _build_vptr_write_index,
+                             trace_vptr_object_flows as _trace_vptr_object_flows,
                              trace_vptr_write_callers as _trace_vptr_write_callers,
                              show_vcall as _show_vcall, show_vtable as _show_vtable)
 from .vtable_types import (class_relationships as _class_relationships,
@@ -194,10 +195,20 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
             return result
 
     @app.tool()
+    def trace_vptr_object_flows(write_id: str, max_hops: int = 12,
+                                max_nodes: int = 500, max_edges: int = 4000,
+                                max_paths: int = 2000, max_alternatives: int = 4) -> dict:
+        """Preview bounded object-flow paths from an LVARS vptr store through direct-call flow."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _trace_vptr_object_flows(connection, write_id=write_id,
+                max_hops=max_hops, max_nodes=max_nodes, max_edges=max_edges,
+                max_paths=max_paths, max_alternatives=max_alternatives)
+
+    @app.tool()
     def trace_vptr_write_callers(write_id: str, max_hops: int = 12,
                                  max_nodes: int = 500, max_edges: int = 4000,
                                  max_callers: int = 2000, max_alternatives: int = 4) -> dict:
-        """Preview bounded cross-function object paths from an LVARS vptr store through direct-call flow."""
+        """Deprecated compatibility alias; use trace_vptr_object_flows."""
         with ida_lock, closing(connect(database)) as connection:
             return _trace_vptr_write_callers(connection, write_id=write_id,
                 max_hops=max_hops, max_nodes=max_nodes, max_edges=max_edges,
@@ -250,7 +261,7 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
     @app.resource("ida://database/schema")
     def database_schema() -> str:
         """Describe the core analysis tables available to sql_query."""
-        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs, basic_blocks, cfg_edges, disassembly, instructions, pseudocode, microcode, micro_instructions, micro_blocks, micro_value_refs, micro_flow, micro_flow_instructions, data_pointer_slots, vtable_runs, vtable_candidates, vtable_slots, vtable_evidence, rtti_runs, rtti_typeinfos, vtable_class_relation_runs, vtable_class_relationships, vcall_runs, vcall_sites, vcall_targets, vptr_write_runs, vptr_writes, receiver_flows, propagation_runs, propagation_nodes, propagation_edges, propagation_constraints, symbols, comments, type_definitions, type_assignments, memory_bytes, pointers, search_matches, operations, jobs, job_revisions. microcode.relations_json contains relation coverage metadata; query micro_blocks for CFG predecessors/successors and micro_value_refs for direct register value-number definition/use locations. These are not complete SSA or an alias graph. vtable_candidates are heuristic data-sequence candidates, not confirmed C++ classes; RTTI base descriptors and vtable_class_relationships are structural candidates only, with heuristic address-point associations; vptr_writes are exact stores of known address points, not proof of object lifetime or constructor identity; vcall_sites are indirect-call/two-load pattern candidates and saved targets remain slot-compatible possibilities with receiver/object reachability unresolved. Prior same-function vptr stores require exact exported identity and CFG order, but aliases, calls, and memory writes can invalidate them. vptr-write-trace is a bounded path through exported LVARS propagation edges, not a reaching-store or dynamic-reachability proof. Rows carry source hashes and stale flags. Vtable type previews are caller-authored, revision-checked plans; applying one writes IDA types and synchronizes SQLite, but is not a cross-IDB/SQLite transaction and can partially apply. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation remains a bounded evidence graph."""
+        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs, basic_blocks, cfg_edges, disassembly, instructions, pseudocode, microcode, micro_instructions, micro_blocks, micro_value_refs, micro_flow, micro_flow_instructions, data_pointer_slots, vtable_runs, vtable_candidates, vtable_slots, vtable_evidence, rtti_runs, rtti_typeinfos, vtable_class_relation_runs, vtable_class_relationships, vcall_runs, vcall_sites, vcall_targets, vptr_write_runs, vptr_writes, receiver_flows, propagation_runs, propagation_nodes, propagation_edges, propagation_constraints, symbols, comments, type_definitions, type_assignments, memory_bytes, pointers, search_matches, operations, jobs, job_revisions. microcode.relations_json contains relation coverage metadata; query micro_blocks for CFG predecessors/successors and micro_value_refs for direct register value-number definition/use locations. These are not complete SSA or an alias graph. vtable_candidates are heuristic data-sequence candidates, not confirmed C++ classes; inspect table_address_status because an unresolved boundary has no rendered table_address; RTTI base descriptors and vtable_class_relationships are structural candidates only, with heuristic address-point associations; vptr_writes are exact stores of known address points, not proof of object lifetime or constructor identity; vcall_sites are indirect-call/two-load pattern candidates and saved targets remain slot-compatible possibilities with receiver/object reachability unresolved. analyze_virtual_call also returns candidate_counts, which are row/EA counts rather than probabilities. Prior same-function vptr stores require exact exported identity and CFG order, but aliases, calls, and memory writes can invalidate them. trace_vptr_object_flows is a bounded object-flow path through exported LVARS propagation edges, not a caller or reaching-store proof; trace_vptr_write_callers is retained only as a deprecated compatibility alias. Rows carry source hashes and stale flags. Vtable type previews are caller-authored, revision-checked plans; applying one writes IDA types and synchronizes SQLite, but is not a cross-IDB/SQLite transaction and can partially apply. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation remains a bounded evidence graph."""
 
     if unsafe:
         def mutate(kind: str, values: dict) -> dict:
