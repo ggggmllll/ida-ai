@@ -278,6 +278,9 @@ def preview_vtable_type_plan(connection: sqlite3.Connection, spec: dict[str, Any
     evidence = json.loads(candidate["evidence_json"] or "{}")
     table_address_status = evidence.get("table_address_status")
     table_start = ida_ea(candidate["table_address"])
+    if table_address_status not in {"candidate_from_prefix", "candidate_from_ztv_symbol", "unresolved"}:
+        if table_address_status is not None:
+            table_address_status = "unresolved"
     if table_address_status is None:
         if evidence.get("address_point_prefix"):
             table_address_status = "candidate_from_prefix"

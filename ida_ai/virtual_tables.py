@@ -179,7 +179,7 @@ def _present_vtable_candidate(connection: sqlite3.Connection, row: sqlite3.Row |
             else:
                 symbol_ea = address_point - 2 * int(item["pointer_size"])
                 symbol = _symbol_name_at(connection, symbol_ea)
-                if symbol and symbol.startswith("_ZTV"):
+                if not item.get("stale") and symbol and symbol.startswith("_ZTV"):
                     status, basis = "candidate_from_ztv_symbol", "ztv_symbol_at_two_word_prefix"
                     raw_candidate_start = symbol_ea
                 else:

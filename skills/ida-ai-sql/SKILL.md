@@ -15,6 +15,8 @@ The result is JSON with `columns`, `rows`, `count`, and `truncated`; `--limit 0`
 
 `microcode` stores per-function microcode status/version/hash and relation coverage; `micro_instructions` stores structured `l_json`/`r_json`/`d_json` operand trees. `micro_blocks` stores microcode CFG predecessor/successor lists, and `micro_value_refs` stores direct register value-number definition/use locations. These observations do not form complete SSA or an alias graph. Export them through the microcode CLI before querying, and inspect errors and relation completeness before treating absent instructions or edges as absent behavior.
 
+For `vtable_candidates`, inspect `evidence_json.table_address_status` before treating `table_address` as a table start. In raw historical databases, unresolved candidates may still store the first code-pointer address in the non-null `table_address` column for compatibility; the vtable CLI renders this as `table_address: null` and retains the raw start as `candidate_start_address`. Use the CLI rendering or filter to boundary-supported rows in SQL.
+
 Use `--write` only for an intentional maintenance statement. Prefer parameter-free literal SQL in the CLI and keep analysis mutations in the dedicated commands. Query schema names and function rows instead of guessing addresses or identifiers.
 
 IDA addresses above `0x7FFFFFFFFFFFFFFF` are stored as signed 64-bit integers. Use `printf('%016X', target_ea)` in SQL to view the original unsigned address; CLI address arguments still use the normal unsigned form.
