@@ -238,7 +238,9 @@ class MemoryQuery:
                 return False
             if ins["opcode"] not in safe or any(_operand_truncated(ins.get(k)) for k in ("l", "r", "d")):
                 return False
-            if any(x.get("kind") == "nested" and (x.get("instruction") or {}).get("opcode") not in safe
+            if any(x.get("kind") == "nested" and (
+                       (x.get("instruction") or {}).get("opcode") not in safe
+                       or (x.get("instruction") or {}).get("d", {}).get("kind") in ("global", "stack"))
                    for k in ("l", "r", "d") for x in _walk(ins.get(k, {}))):
                 return False
             if ins.get("d", {}).get("kind") in ("global", "stack"):
@@ -285,6 +287,10 @@ class MemoryQuery:
                 return self.issue("intervening_expression_truncated", ea, loc, path)
             nested_ops = {(x.get("instruction") or {}).get("opcode")
                           for k in ("l", "r", "d") for x in _walk(ins.get(k, {})) if x.get("kind") == "nested"}
+            if any(x.get("kind") == "nested" and
+                   (x.get("instruction") or {}).get("d", {}).get("kind") in ("global", "stack")
+                   for k in ("l", "r", "d") for x in _walk(ins.get(k, {}))):
+                return self.issue("nested_memory_destination_unresolved", ea, loc, path)
             if query[0][:4] == ("definition", ea, block, ins["ordinal"]) and ins["opcode"] in ("call", "icall"):
                 return self.returned_source(ea, ins, query[1], depth, context, path, visited)
             if nested_ops - self.PURE_OPS:

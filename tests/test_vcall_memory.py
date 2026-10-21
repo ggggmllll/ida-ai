@@ -72,6 +72,18 @@ class MemoryTests(unittest.TestCase):
         leaves = q.scan(ea, operand or local(0), 0, (0, before))
         return q, leaves
 
+    def test_nested_memory_destination_is_not_readonly(self):
+        expr = nested("mov", num(1))
+        expr["instruction"]["d"] = {"kind": "global", "address": 0x8000, "size": 8}
+        self.put(0x2000, [ins("mov", expr, dest=local(1))])
+        self.put(0x1000, [store(0x5000), call(0x2000)])
+        query, leaves = self.query()
+        self.assertFalse(query._readonly(0x2000))
+        self.assertTrue(any(x["status"] == "unknown" for x in leaves))
+        self.put(0x1000, [store(0x5000), ins("mov", expr, dest=local(1))])
+        query, leaves = self.query()
+        self.assertIn("nested_memory_destination_unresolved", [x["code"] for x in query.frontier])
+
     def test_nearest_overwrite_wins(self):
         self.put(0x1000, [store(0x5000), store(0x5100)])
         _, leaves = self.query()
