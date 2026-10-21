@@ -7,6 +7,7 @@ process only needs to read the resulting SQLite file.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from contextlib import closing
 import tempfile
@@ -34,6 +35,11 @@ try:  # imported only inside IDA
     import idc
 except ImportError as exc:  # pragma: no cover - exercised by IDA
     raise RuntimeError("ida_export.py must run inside IDA or idalib") from exc
+
+try:
+    import ida_fixup
+except ImportError:
+    ida_fixup = None
 
 try:
     import ida_hexrays
@@ -791,6 +797,7 @@ def scan_data_pointer_slots(
     scoped_end = int(end) if end is not None else None
     if scoped_start is None and scoped_end is None:
         connection.execute("DELETE FROM data_pointer_slots")
+        connection.execute("DELETE FROM data_fixups")
     else:
         clauses, values = [], []
         if scoped_start is not None:
@@ -798,7 +805,9 @@ def scan_data_pointer_slots(
         if scoped_end is not None:
             clauses.append("source_ea<?"); values.append(sqlite_ea(scoped_end))
         connection.execute("DELETE FROM data_pointer_slots WHERE " + " AND ".join(clauses), values)
+        connection.execute("DELETE FROM data_fixups WHERE " + " AND ".join(clauses), values)
 
+    observed_ranges = []
     scanned_bytes = 0
     bytes_requested = 0
     rows = []
@@ -829,6 +838,7 @@ def scan_data_pointer_slots(
                 cursor = primary_end
                 continue
             data = bytes(raw)
+            observed_ranges.append((cursor, cursor + len(data)))
             scanned_bytes += len(data)
             position = first_aligned - cursor if first_aligned >= cursor else 0
             if position % pointer_size:
@@ -922,6 +932,7 @@ def scan_data_pointer_slots(
             if prefix_raw is None:
                 prefix_failures += 1
                 continue
+            observed_ranges.append((prefix_ea, prefix_ea + len(prefix_raw)))
             prefix_words.add(prefix_ea)
             raw_value = int.from_bytes(bytes(prefix_raw), byteorder, signed=False)
             if raw_value != 0 and ida_segment.getseg(raw_value) is not None:
@@ -941,6 +952,12 @@ def scan_data_pointer_slots(
             scalar_prefix_words += int(inserted > 0)
         if prefix_budget_exhausted:
             break
+    from .fixup_observations import collect_fixups
+    fixups, fixup_coverage = collect_fixups(ida_fixup, ida_bytes.get_bytes, observed_ranges, ida_idaapi.BADADDR)
+    connection.executemany(
+        "INSERT OR REPLACE INTO data_fixups(source_ea,observation_json,generated_at) VALUES(?,?,?)",
+        [(sqlite_ea(item["source_ea"]), json.dumps(item, sort_keys=True), now) for item in fixups],
+    )
     if prefix_budget_skipped:
         skipped.append({"reason": "max_bytes_prefix_probe", "candidate_reads_skipped": prefix_budget_skipped})
     connection.commit()
@@ -948,6 +965,7 @@ def scan_data_pointer_slots(
         "pointer_size": pointer_size, "byteorder": byteorder,
         "segments_considered": len(eligible), "scanned_bytes": scanned_bytes,
         "bytes_requested": bytes_requested, "max_bytes": max_bytes,
+        "fixups": fixup_coverage,
         "pointer_entries": total_entries, "scalar_prefix_words": scalar_prefix_words,
         "prefix_bytes_read": prefix_bytes_read, "prefix_read_failures": prefix_failures,
         "prefix_budget_skipped": prefix_budget_skipped,

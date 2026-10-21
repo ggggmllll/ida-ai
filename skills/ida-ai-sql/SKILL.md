@@ -22,3 +22,5 @@ Use `--write` only for an intentional maintenance statement. Prefer parameter-fr
 IDA addresses above `0x7FFFFFFFFFFFFFFF` are stored as signed 64-bit integers. Use `printf('%016X', target_ea)` in SQL to view the original unsigned address; CLI address arguments still use the normal unsigned form.
 
 `vcall_trace_runs` stores immutable receiver-memory trace JSON with source snapshot, scope/budgets, rule version and current/stale status. Use `vcall-trace-show` to validate the source snapshot before relying on a row; raw SQL status alone does not detect out-of-band edits. This is a durable analysis artifact, not the search acceleration cache.
+
+`data_fixups(source_ea,observation_json,generated_at)` stores loader metadata and loaded image bytes within successfully read pointer-scan ranges. Inspect `metadata` key `data_pointer_scan` for `fixups` coverage, errors and bounds. No observation implies neither absence of relocations outside that scope nor a decoded runtime pointer.

@@ -275,6 +275,21 @@ class VirtualTableTests(unittest.TestCase):
         rerun = build_vtable_index(self.connection, abi="itanium")
         self.assertTrue(rerun["cached"])
 
+    def test_search_follows_multihop_thunks_and_fixups_change_revision(self):
+        self.connection.execute("UPDATE functions SET is_thunk=1,thunk_target_ea=4096 WHERE start_ea=4864")
+        build_vtable_index(self.connection, abi="itanium")
+        result = search_vtables(self.connection, target_eas=[0x1200, 0x1000], slot_index=1)
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["items"][0]["matching_slots"][0]["thunk_chain"], [0x1200, 0x1300, 0x1000])
+        before = _source_hash(self.connection, "vtable")
+        self.connection.execute("INSERT INTO data_fixups VALUES(?,?,?)", (0x5000, '{"type":7}', 'now'))
+        self.assertNotEqual(before, _source_hash(self.connection, "vtable"))
+        before = _source_hash(self.connection, "vtable")
+        self.connection.execute("UPDATE data_fixups SET generated_at='later'")
+        self.assertEqual(before, _source_hash(self.connection, "vtable"))
+        reset_analysis(self.connection)
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM data_fixups").fetchone()[0], 0)
+
     def test_vtable_uses_ztv_symbol_for_boundary_when_prefix_was_not_exported(self):
         self.connection.execute("INSERT INTO symbols(address,name,type) VALUES(?,?,NULL)",
             (0x4FF0, "_ZTV3Foo"))

@@ -18,7 +18,7 @@ from typing import Any
 from .db import get_metadata, ida_ea, set_metadata, sqlite_ea, utc_now
 
 
-VTABLE_PARSER_VERSION = "7"
+VTABLE_PARSER_VERSION = "8"
 VCALL_DETECTOR_VERSION = "5"
 VPTR_WRITE_DETECTOR_VERSION = "1"
 SUPPORTED_ABIS = ("itanium",)
@@ -114,6 +114,7 @@ def _source_hash(connection: sqlite3.Connection, kind: str, function_eas: Iterab
             "segments": _rows(connection, "SELECT start_ea,end_ea,name,class_name,permissions,bitness FROM segments ORDER BY start_ea"),
             "functions": functions,
             "symbols": _rows(connection, "SELECT address,name,type FROM symbols ORDER BY address"),
+            "data_fixups": _rows(connection, "SELECT source_ea,observation_json FROM data_fixups ORDER BY source_ea"),
             "data_pointer_slots": _rows(connection, "SELECT source_ea,raw_value,target_ea,pointer_size,source_segment,target_segment,target_function_ea,target_name,target_kind FROM data_pointer_slots ORDER BY source_ea"),
             "data_pointer_scan": scan_coverage,
         }
@@ -678,6 +679,7 @@ def build_vtable_index(
                 is_nullstub = bool(target_func and target_func["is_nullstub"])
                 is_thunk = bool(target_func and target_func["is_thunk"])
                 is_library = bool(target_func and target_func["is_library"])
+                thunk = trace_thunk_chain(functions, target)
                 normalized_slots.append({
                     "candidate_id": candidate_id, "slot_index": index,
                     "byte_offset": index * pointer_size,
@@ -691,10 +693,10 @@ def build_vtable_index(
                     "is_nullstub": int(is_nullstub), "is_library": int(is_library),
                     "is_thunk": int(is_thunk),
                     "thunk_target_ea": ida_ea(target_func["thunk_target_ea"]) if target_func and target_func["thunk_target_ea"] is not None else None,
-                    "thunk_chain_json": _json([ida_ea(target), ida_ea(target_func["thunk_target_ea"])])
-                        if target_func and target_func["is_thunk"] and target_func["thunk_target_ea"] is not None else "[]",
-                    "adjustment_json": "{}",
-                    "evidence_json": _json({"source": "data_pointer_slots", "entry_address": f"0x{ida_ea(item['source_ea']):X}"}),
+                    "thunk_chain_json": _json(thunk["chain"]),
+                    "adjustment_json": _json({key: value for key, value in thunk.items() if key != "chain"}),
+                    "evidence_json": _json({"source": "data_pointer_slots", "entry_address": f"0x{ida_ea(item['source_ea']):X}",
+                        "thunk_status": thunk["status"]}),
                     "source_snapshot_hash": source_snapshot_hash,
                 })
             slots_by_candidate.append((candidate_id, normalized_slots))
@@ -870,6 +872,42 @@ def show_vtable(
     return {"count": len(items), "items": items, "include_stale": include_stale}
 
 
+def trace_thunk_chain(functions, target, *, max_hops=32):
+    """Follow exported IDA thunk edges without inventing ABI adjustments."""
+    if max_hops < 1:
+        raise ValueError("max_hops must be positive")
+    chain = []
+    current = ida_ea(target) if target is not None else None
+    seen = set()
+    status = "missing_target"
+    final = None
+    for _ in range(max_hops + 1):
+        if current is None:
+            break
+        chain.append(current)
+        if current in seen:
+            status = "cycle"
+            break
+        seen.add(current)
+        function = functions.get(current)
+        if function is None:
+            status = "external_or_unexported"
+            break
+        if not function["is_thunk"]:
+            status = "terminal" if len(chain) > 1 else "not_a_thunk"
+            final = current
+            break
+        if len(chain) > max_hops:
+            status = "max_hops"
+            break
+        target_ea = function["thunk_target_ea"]
+        current = ida_ea(target_ea) if target_ea is not None else None
+    return {"chain": chain if len(chain) > 1 or status not in ("not_a_thunk", "external_or_unexported") else [],
+            "status": status, "final_implementation_ea": final,
+            "this_adjustment": "unknown", "return_adjustment": "unknown",
+            "max_hops": max_hops, "source": "exported_ida_thunk_edges"}
+
+
 def search_vtables(
     connection: sqlite3.Connection, *, target_eas: list[int] | None = None,
     slot_index: int | None = None, abi: str | None = None,
@@ -893,7 +931,7 @@ def search_vtables(
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     rows = connection.execute(
         "SELECT c.candidate_id,c.address_point,c.abi,c.status,s.slot_index,s.byte_offset,s.target_ea,s.target_name,"
-        "s.entry_classification,s.is_nullstub,s.is_library,s.is_thunk,s.thunk_target_ea "
+        "s.entry_classification,s.is_nullstub,s.is_library,s.is_thunk,s.thunk_target_ea,s.thunk_chain_json "
         "FROM vtable_candidates c JOIN vtable_slots s USING(candidate_id)" + where +
         " ORDER BY c.address_point,s.slot_index", parameters,
     ).fetchall()
@@ -902,7 +940,9 @@ def search_vtables(
     wanted = set(targets)
     for row in rows:
         target = ida_ea(row["target_ea"]) if row["target_ea"] is not None else None
-        if wanted and target not in wanted:
+        chain = set(json.loads(row["thunk_chain_json"]))
+        matched = wanted.intersection(chain | ({target} if target is not None else set()))
+        if wanted and not matched:
             continue
         key = row["candidate_id"]
         item = grouped.setdefault(key, {"candidate_id": key, "address_point": ida_ea(row["address_point"]),
@@ -911,10 +951,9 @@ def search_vtables(
             "target_ea": target, "target_ea_hex": f"0x{target:X}" if target is not None else None,
             "target_name": row["target_name"], "entry_classification": row["entry_classification"],
             "is_nullstub": bool(row["is_nullstub"]), "is_library": bool(row["is_library"]),
-            "is_thunk": bool(row["is_thunk"]),
+            "is_thunk": bool(row["is_thunk"]), "thunk_chain": json.loads(row["thunk_chain_json"]),
             "thunk_target_ea": ida_ea(row["thunk_target_ea"]) if row["thunk_target_ea"] is not None else None})
-        if target in wanted:
-            target_slots[key].add(target)
+        target_slots[key].update(matched)
     items = [item for key, item in grouped.items() if wanted.issubset(target_slots[key])]
     items = items[:limit] if limit else items
     return {"count": len(items), "truncated": bool(limit and len(grouped) > limit),

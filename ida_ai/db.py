@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def sqlite_ea(address: int) -> int:
@@ -579,6 +579,12 @@ CREATE INDEX IF NOT EXISTS idx_pointers_source_function ON pointers(source_funct
 
 -- Exhaustive aligned pointer observations from loaded non-executable segments.
 -- Kept separate from user-triggered pointer-search results and their cache.
+CREATE TABLE IF NOT EXISTS data_fixups (
+    source_ea INTEGER PRIMARY KEY,
+    observation_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS data_pointer_slots (
     source_ea INTEGER PRIMARY KEY,
     raw_value INTEGER NOT NULL,
@@ -783,6 +789,7 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
         "memory_bytes",
         "pointers",
         "data_pointer_slots",
+        "data_fixups",
         "search_matches",
     )
     for table in tables:
