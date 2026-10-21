@@ -54,10 +54,14 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     names = {item.name for item in tools.tools}
                     self.assertTrue({"database_summary", "sql_query", "search_code", "export_functions",
                                      "vtable_list", "vtable_show", "vtable_search", "vcall_list",
-                                     "analyze_virtual_call", "vcall_show", "vptr_write_list",
+                                     "analyze_virtual_call", "vcall_show", "vptr_write_list", "trace_virtual_call", "vcall_trace_show",
                                      "index_vptr_writes", "trace_vptr_object_flows", "trace_vptr_write_callers", "index_virtual_calls",
                                      "vtable_class_relationships", "vtable_type_preview"} <= names)
                     self.assertNotIn("set_assembly_comment", names)
+                    trace_error = await session.call_tool("trace_virtual_call", {"call_id": "absent", "max_hops": 0})
+                    self.assertTrue(trace_error.isError)
+                    show_error = await session.call_tool("vcall_trace_show", {"run_id": "absent"})
+                    self.assertTrue(show_error.isError)
                     results = await session.call_tool(
                         "search_code",
                         {"terms": ["target_func", "return"], "operator": "any", "view": "both"},

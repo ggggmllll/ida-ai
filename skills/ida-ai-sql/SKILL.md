@@ -20,3 +20,5 @@ For `vtable_candidates`, inspect `evidence_json.table_address_status` before tre
 Use `--write` only for an intentional maintenance statement. Prefer parameter-free literal SQL in the CLI and keep analysis mutations in the dedicated commands. Query schema names and function rows instead of guessing addresses or identifiers.
 
 IDA addresses above `0x7FFFFFFFFFFFFFFF` are stored as signed 64-bit integers. Use `printf('%016X', target_ea)` in SQL to view the original unsigned address; CLI address arguments still use the normal unsigned form.
+
+`vcall_trace_runs` stores immutable receiver-memory trace JSON with source snapshot, scope/budgets, rule version and current/stale status. Use `vcall-trace-show` to validate the source snapshot before relying on a row; raw SQL status alone does not detect out-of-band edits. This is a durable analysis artifact, not the search acceleration cache.

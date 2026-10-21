@@ -22,6 +22,7 @@ from .virtual_tables import (analyze_vcall, build_vcall_index, build_vtable_inde
                              list_vcalls, list_vtables, search_vtables,
                              show_vcall, show_vtable, trace_vptr_object_flows)
 from .vtable_types import class_relationships, preview_vtable_type_plan
+from .vcall_trace import trace_virtual_call, show_trace
 from .runner import run_ida
 from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
 
@@ -385,6 +386,19 @@ def _parser() -> argparse.ArgumentParser:
     vcall_selector.add_argument("--call-id")
     vcall_selector.add_argument("--address")
 
+    vcall_trace = commands.add_parser("vcall-trace", help="bounded receiver memory query at the vptr load, optionally across LVARS direct calls")
+    _add_db(vcall_trace)
+    trace_selector = vcall_trace.add_mutually_exclusive_group(required=True)
+    trace_selector.add_argument("--call-id")
+    trace_selector.add_argument("--address")
+    for budget, default in (("hops", 6), ("nodes", 500), ("edges", 4000), ("alternatives", 16), ("context", 4)):
+        vcall_trace.add_argument(f"--max-{budget}", type=int, default=default)
+
+    trace_show = commands.add_parser("vcall-trace-show", help="read an immutable virtual-call memory trace")
+    _add_db(trace_show)
+    trace_show.add_argument("--run-id", required=True)
+    trace_show.add_argument("--include-stale", action="store_true")
+
     vcall_show_parser = commands.add_parser("vcall-show", help="show an indexed call candidate and its saved resolution")
     _add_db(vcall_show_parser)
     vcall_show_selector = vcall_show_parser.add_mutually_exclusive_group(required=True)
@@ -696,6 +710,15 @@ def _run(args: argparse.Namespace) -> dict:
         with closing(connect(args.db)) as connection:
             return analyze_vcall(connection, call_id=args.call_id,
                                  address=parse_int(args.address) if args.address is not None else None)
+    if args.command == "vcall-trace":
+        with closing(connect(args.db)) as connection:
+            return trace_virtual_call(connection, call_id=args.call_id,
+                address=parse_int(args.address) if args.address is not None else None,
+                max_hops=args.max_hops, max_nodes=args.max_nodes, max_edges=args.max_edges,
+                max_alternatives=args.max_alternatives, max_context=args.max_context)
+    if args.command == "vcall-trace-show":
+        with closing(connect(args.db)) as connection:
+            return show_trace(connection, args.run_id, include_stale=args.include_stale)
     if args.command == "vcall-show":
         with closing(connect(args.db)) as connection:
             return show_vcall(connection, call_id=args.call_id,

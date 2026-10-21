@@ -138,7 +138,18 @@ def _source_hash(connection: sqlite3.Connection, kind: str, function_eas: Iterab
         if selected is not None:
             microcode = [row for row in microcode if row["function_ea"] in selected]
             functions = [row for row in functions if row["start_ea"] in selected]
-        payload = {"identity": identity, "functions": functions, "microcode": microcode}
+        instructions = []
+        blocks = []
+        selected_functions = [row["function_ea"] for row in microcode]
+        # Hash actual durable rows too: a summary hash is not a substitute for
+        # observing edits/deletions in normalized instructions and CFG.
+        for function in selected_functions:
+            instructions.extend(_rows(connection,
+                "SELECT * FROM micro_instructions WHERE function_ea=? ORDER BY block_serial,ordinal", (function,)))
+            blocks.extend(_rows(connection,
+                "SELECT * FROM micro_blocks WHERE view_name='microcode' AND function_ea=? ORDER BY block_serial", (function,)))
+        payload = {"identity": identity, "functions": functions, "microcode": microcode,
+                   "instructions": instructions, "blocks": blocks}
     else:
         raise ValueError(f"unknown virtual-analysis input kind: {kind}")
     return _digest(payload)
@@ -750,6 +761,7 @@ def build_vtable_index(
     }
     with connection:
         _stale_class_relationships(connection)
+        connection.execute("UPDATE vcall_trace_runs SET status='stale'")
         connection.execute("UPDATE vtable_candidates SET stale=1 WHERE stale=0")
         connection.execute("UPDATE vtable_slots SET stale=1 WHERE stale=0")
         connection.execute("UPDATE vtable_evidence SET stale=1 WHERE stale=0")
@@ -1939,6 +1951,8 @@ def invalidate_function_virtual_artifacts(
     if not selected:
         return {"vcall_sites": 0, "vptr_writes": 0}
     with connection:
+        # Traces may cross any exported function; precise dependency minimization is deferred.
+        connection.execute("UPDATE vcall_trace_runs SET status='stale'")
         call_runs = (_runs_intersecting_functions(connection, "vcall_runs", [ida_ea(ea) for ea in selected])
             if view_name == "microcode" else [])
         call_ids = []
@@ -2127,7 +2141,7 @@ def _resolve_vcall_targets(connection: sqlite3.Connection, call_id: str) -> dict
             "reason": "slot byte offset is not aligned to the recorded pointer width"}
     rows = connection.execute(
         "SELECT s.candidate_id,s.slot_index,s.byte_offset,s.target_ea,s.target_name,s.entry_classification,"
-        "s.is_nullstub,s.is_library,s.is_thunk,s.thunk_target_ea,c.address_point,c.abi "
+        "s.is_nullstub,s.is_library,s.is_thunk,s.thunk_target_ea,s.thunk_chain_json,s.adjustment_json,c.address_point,c.abi "
         "FROM vtable_slots s JOIN vtable_candidates c USING(candidate_id) "
         "WHERE s.stale=0 AND c.stale=0 AND s.target_ea IS NOT NULL AND s.target_kind IN ('function','code') "
         "AND s.byte_offset=? AND c.pointer_size=? ORDER BY c.address_point,s.slot_index",
@@ -2143,6 +2157,8 @@ def _resolve_vcall_targets(connection: sqlite3.Connection, call_id: str) -> dict
             "target_name": row["target_name"], "entry_classification": row["entry_classification"],
             "is_nullstub": bool(row["is_nullstub"]), "is_library": bool(row["is_library"]),
             "is_thunk": bool(row["is_thunk"]),
+            "thunk_chain": json.loads(row["thunk_chain_json"]),
+            "adjustment": json.loads(row["adjustment_json"]),
             "thunk_target_ea": ida_ea(row["thunk_target_ea"]) if row["thunk_target_ea"] is not None else None,
             "status": "candidate", "reason": "slot offset matches an indexed table; receiver-to-table reachability is unproven"})
     status = "candidate_set" if targets else "unknown"
@@ -2178,10 +2194,16 @@ def analyze_vcall(connection: sqlite3.Connection, *, call_id: str | None = None,
     site["callee"] = json.loads(site.pop("callee_json"))
     site["evidence"] = json.loads(site.pop("evidence_json"))
     resolution = _resolve_vcall_targets(connection, call_id)
+    from .vcall_memory import MemoryQuery
+    memory = (MemoryQuery(connection).result(site["function_ea"], site["callee"])
+              if site["callee"].get("pattern_status") == "candidate"
+              else {"memory_status": "unknown", "address_points": [], "reason": "call_pattern_incomplete"})
+    resolution["local_memory"] = memory
     prior_writes = _prior_vptr_write_candidates(connection, row, site["callee"])
     resolution["prior_vptr_writes"] = prior_writes
     candidate_ids = {item["candidate_id"] for item in prior_writes.get("items", [])}
     for target in resolution["targets"]:
+        target["matching_reaching_store_candidate"] = target["address_point"] in memory["address_points"]
         target["matching_prior_vptr_write_candidate"] = target["candidate_id"] in candidate_ids
         if target["matching_prior_vptr_write_candidate"]:
             target["prior_vptr_write_ids"] = [item["write_id"] for item in prior_writes["items"]
@@ -2201,6 +2223,8 @@ def analyze_vcall(connection: sqlite3.Connection, *, call_id: str | None = None,
         "prior_store_narrowed_distinct_target_eas": len({item["target_ea"] for item in narrowed_targets
             if item["target_ea"] is not None}),
         "matching_prior_vptr_write_rows": len(prior_writes.get("items", [])),
+        "memory_supported_table_slot_rows": sum(t["matching_reaching_store_candidate"] for t in compatible_targets),
+        "prior_store_counts_are_historical_only": True,
         "counts_are_probabilities": False,
     }
     with connection:

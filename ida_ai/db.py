@@ -481,6 +481,18 @@ CREATE INDEX IF NOT EXISTS idx_vcall_sites_ea ON vcall_sites(call_ea,stale);
 CREATE INDEX IF NOT EXISTS idx_vcall_sites_function ON vcall_sites(function_ea,stale);
 CREATE INDEX IF NOT EXISTS idx_vcall_sites_status ON vcall_sites(status,stale);
 
+CREATE TABLE IF NOT EXISTS vcall_trace_runs (
+    run_id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL REFERENCES vcall_sites(call_id),
+    source_snapshot_hash TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcall_trace_call ON vcall_trace_runs(call_id,created_at DESC);
+
 CREATE TABLE IF NOT EXISTS vptr_write_runs (
     run_id TEXT PRIMARY KEY,
     source_snapshot_hash TEXT NOT NULL,
@@ -740,6 +752,7 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
     # Virtual-table/call rows are derived from the observations below.  Keep
     # their immutable historical runs, but never leave them looking current
     # while functions, xrefs, or microcode are being rebuilt.
+    connection.execute("UPDATE vcall_trace_runs SET status='stale'")
     for table in ("vtable_candidates", "vtable_slots", "vtable_evidence", "vcall_sites", "vcall_targets", "receiver_flows"):
         connection.execute(f"UPDATE {table} SET stale=1")
     connection.execute("UPDATE vtable_runs SET status='stale' WHERE status NOT IN ('stale','error')")

@@ -21,3 +21,5 @@ The candidate still does not prove receiver object identity, ABI address point, 
 Use `vcall-show` or `vcall-analyze` next. A fresh type/name change requires a new microcode export and a new run; old sites become stale after full synchronization.
 
 Both loads may be expanded inside the callee expression, split into instructions, or moved into a callee register. Expanded loads do not require invented intermediate value numbers; a zero slot offset is supported. More than two embedded loads and unsupported address expressions remain unknown. Receiver binding is still required. `unknown_reason.scope` distinguishes this call, its value chain, and function-wide coverage. Function-wide truncation does not prove that this call was truncated. Definition failures may include bounded definition/use locations; multiple definitions are reported only when actually observed, not inferred from exporter capability flags.
+
+Call-index source identity includes normalized instruction/CFG rows as well as summary hashes. Rebuild old indexes before `vcall-trace`; a summary hash left unchanged after a raw-row edit cannot authorize reusing the old call pattern.

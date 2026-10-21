@@ -14,6 +14,7 @@ from .db import connect
 from .runner import run_ida
 from .selection import parse_int, select_function_addresses
 from .text_search import search_code as _search_code
+from .vcall_trace import trace_virtual_call as _trace_virtual_call, show_trace as _show_trace
 from .virtual_tables import (analyze_vcall as _analyze_vcall, build_vcall_index as _build_vcall_index,
                              list_vcalls as _list_vcalls,
                              list_vtables as _list_vtables, search_vtables as _search_vtables,
@@ -47,7 +48,7 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
                           "micro_blocks", "micro_value_refs", "micro_flow", "micro_flow_instructions", "propagation_runs", "propagation_nodes",
                           "propagation_edges", "propagation_constraints", "data_pointer_slots", "vtable_runs",
                           "vtable_candidates", "vtable_slots", "rtti_runs", "rtti_typeinfos",
-                          "vcall_runs", "vcall_sites", "vcall_targets", "vptr_write_runs", "vptr_writes",
+                          "vcall_runs", "vcall_sites", "vcall_targets", "vcall_trace_runs", "vptr_write_runs", "vptr_writes",
                           "receiver_flows", "symbols", "comments", "jobs", "job_revisions")
                 counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
             return {"metadata": metadata, "counts": counts}
@@ -140,6 +141,23 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
         with ida_lock, closing(connect(database)) as connection:
             return _analyze_vcall(connection, call_id=call_id,
                 address=parse_int(address) if address is not None else None)
+
+    @app.tool()
+    def trace_virtual_call(call_id: str | None = None, address: str | None = None,
+                           max_hops: int = 6, max_nodes: int = 500, max_edges: int = 4000,
+                           max_alternatives: int = 16, max_context: int = 4) -> dict:
+        """Query reaching vptr stores at load time, with bounded LVARS caller/return/effect paths and explicit alias frontiers."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _trace_virtual_call(connection, call_id=call_id,
+                address=parse_int(address) if address is not None else None,
+                max_hops=max_hops, max_nodes=max_nodes, max_edges=max_edges,
+                max_alternatives=max_alternatives, max_context=max_context)
+
+    @app.tool()
+    def vcall_trace_show(run_id: str, include_stale: bool = False) -> dict:
+        """Read an immutable trace; stale historical results require explicit opt-in."""
+        with ida_lock, closing(connect(database)) as connection:
+            return _show_trace(connection, run_id, include_stale=include_stale)
 
     @app.tool()
     def vcall_show(call_id: str | None = None, address: str | None = None,
@@ -261,7 +279,7 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
     @app.resource("ida://database/schema")
     def database_schema() -> str:
         """Describe the core analysis tables available to sql_query."""
-        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs, basic_blocks, cfg_edges, disassembly, instructions, pseudocode, microcode, micro_instructions, micro_blocks, micro_value_refs, micro_flow, micro_flow_instructions, data_pointer_slots, vtable_runs, vtable_candidates, vtable_slots, vtable_evidence, rtti_runs, rtti_typeinfos, vtable_class_relation_runs, vtable_class_relationships, vcall_runs, vcall_sites, vcall_targets, vptr_write_runs, vptr_writes, receiver_flows, propagation_runs, propagation_nodes, propagation_edges, propagation_constraints, symbols, comments, type_definitions, type_assignments, memory_bytes, pointers, search_matches, operations, jobs, job_revisions. microcode.relations_json contains relation coverage metadata; query micro_blocks for CFG predecessors/successors and micro_value_refs for direct register value-number definition/use locations. These are not complete SSA or an alias graph. vtable_candidates are heuristic data-sequence candidates, not confirmed C++ classes; inspect table_address_status because an unresolved boundary has no rendered table_address; RTTI base descriptors and vtable_class_relationships are structural candidates only, with heuristic address-point associations; vptr_writes are exact stores of known address points, not proof of object lifetime or constructor identity; vcall_sites are indirect-call/two-load pattern candidates and saved targets remain slot-compatible possibilities with receiver/object reachability unresolved. analyze_virtual_call also returns candidate_counts, which are row/EA counts rather than probabilities. Prior same-function vptr stores require exact exported identity and CFG order, but aliases, calls, and memory writes can invalidate them. trace_vptr_object_flows is a bounded object-flow path through exported LVARS propagation edges, not a caller or reaching-store proof; trace_vptr_write_callers is retained only as a deprecated compatibility alias. Rows carry source hashes and stale flags. Vtable type previews are caller-authored, revision-checked plans; applying one writes IDA types and synchronizes SQLite, but is not a cross-IDB/SQLite transaction and can partially apply. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation remains a bounded evidence graph."""
+        return """Core tables: metadata(key,value), segments, functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment), xrefs, basic_blocks, cfg_edges, disassembly, instructions, pseudocode, microcode, micro_instructions, micro_blocks, micro_value_refs, micro_flow, micro_flow_instructions, data_pointer_slots, vtable_runs, vtable_candidates, vtable_slots, vtable_evidence, rtti_runs, rtti_typeinfos, vtable_class_relation_runs, vtable_class_relationships, vcall_runs, vcall_sites, vcall_targets, vcall_trace_runs, vptr_write_runs, vptr_writes, receiver_flows, propagation_runs, propagation_nodes, propagation_edges, propagation_constraints, symbols, comments, type_definitions, type_assignments, memory_bytes, pointers, search_matches, operations, jobs, job_revisions. microcode.relations_json contains relation coverage metadata; query micro_blocks for CFG predecessors/successors and micro_value_refs for direct register value-number definition/use locations. These are not complete SSA or an alias graph. vtable_candidates are heuristic data-sequence candidates, not confirmed C++ classes; inspect table_address_status because an unresolved boundary has no rendered table_address; RTTI base descriptors and vtable_class_relationships are structural candidates only, with heuristic address-point associations; vptr_writes are exact stores of known address points, not proof of object lifetime or constructor identity; vcall_sites are indirect-call/two-load pattern candidates and saved targets remain slot-compatible possibilities with receiver/object reachability unresolved. analyze_virtual_call also returns candidate_counts, which are row/EA counts rather than probabilities. Prior same-function vptr stores require exact exported identity and CFG order, but aliases, calls, and memory writes can invalidate them. trace_virtual_call queries memory at the vptr load, stops on alias/partial-store/call frontiers, and can follow bounded LVARS direct-call/caller/return paths after a unique structural maturity bridge. vcall_trace_runs preserves immutable results; vcall_trace_show validates staleness. unique_under_assumptions never proves runtime reachability or lifetime. trace_vptr_object_flows is a bounded object-flow path through exported LVARS propagation edges, not a caller or reaching-store proof; trace_vptr_write_callers is retained only as a deprecated compatibility alias. Rows carry source hashes and stale flags. Vtable type previews are caller-authored, revision-checked plans; applying one writes IDA types and synchronizes SQLite, but is not a cross-IDB/SQLite transaction and can partially apply. is_nullstub conservatively identifies functions containing only harmless entry instructions and a return. Address integers use signed SQLite representations of unsigned ea_t values. Propagation remains a bounded evidence graph."""
 
     if unsafe:
         def mutate(kind: str, values: dict) -> dict:

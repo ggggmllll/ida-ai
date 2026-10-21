@@ -36,7 +36,7 @@ def analysis_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
         "disassembly", "instructions", "pseudocode", "microcode", "micro_instructions",
         "micro_blocks", "micro_value_refs", "micro_flow", "micro_flow_instructions",
         "vtable_candidates", "vtable_slots", "vcall_sites", "vcall_targets", "vptr_writes",
-        "vtable_runs", "vcall_runs", "vptr_write_runs", "rtti_runs", "rtti_typeinfos",
+        "vtable_runs", "vcall_runs", "vcall_trace_runs", "vptr_write_runs", "rtti_runs", "rtti_typeinfos",
     ):
         counts[table] = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     view_epochs = {
@@ -62,6 +62,13 @@ def analysis_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
 def _artifact_fingerprint(connection: sqlite3.Connection, source_ref: str) -> str | None:
     """Content identity for explicitly addressed artifacts; timestamps are excluded."""
     table, separator, address = source_ref.partition(":")
+    if separator and table == "vtrace":
+        from .vcall_trace import show_trace
+        try:
+            data = show_trace(connection, address)
+        except ValueError:
+            return hashlib.sha256(b"missing").hexdigest()
+        return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
     keys = {"pseudocode": "function_ea", "disassembly": "function_ea", "microcode": "function_ea",
             "micro_flow": "function_ea",
             "functions": "start_ea", "instructions": "ea"}

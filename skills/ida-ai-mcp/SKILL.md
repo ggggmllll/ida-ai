@@ -14,3 +14,5 @@ The IDB is authoritative and SQLite is a snapshot. After external IDA edits, use
 Ordinary byte-pattern and pointer searches remain CLI operations. search_code targets exported assembly/pseudocode text and supports literal/regex multi-term queries.
 
 After successful publication, the result includes `job_review`: changed evidence and its dependent claims are marked for review in append-only job revisions. Use `job-resume` before continuing affected research.
+
+Virtual-dispatch tools include `trace_virtual_call` and `vcall_trace_show`, which reuse the offline bounded memory-query service. They persist analysis runs without editing IDA. Load `ida-ai-vcall-trace` or `ida-ai-vcall-trace-show` for selectors, budgets and interpretation. A unique candidate remains conditional, and stale historical output requires explicit opt-in.
