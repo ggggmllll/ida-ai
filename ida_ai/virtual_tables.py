@@ -19,7 +19,7 @@ from .db import get_metadata, ida_ea, set_metadata, sqlite_ea, utc_now
 
 
 VTABLE_PARSER_VERSION = "7"
-VCALL_DETECTOR_VERSION = "4"
+VCALL_DETECTOR_VERSION = "5"
 VPTR_WRITE_DETECTOR_VERSION = "1"
 SUPPORTED_ABIS = ("itanium",)
 MAX_RTTI_BASES = 128
@@ -1060,7 +1060,8 @@ def _instructions_for_function(connection: sqlite3.Connection, function_ea: int,
 
 
 def _unknown_vcall_reason(instruction: dict[str, Any], pattern: dict[str, Any] | None,
-                          relations: dict[str, Any]) -> dict[str, str]:
+                          relations: dict[str, Any], diagnostics: list[dict[str, Any]] | None = None
+                          ) -> dict[str, Any]:
     """Classify why a GLBOPT3 indirect call did not become a pattern candidate.
 
     These are triage labels for selecting the next export; they are not a
@@ -1068,22 +1069,55 @@ def _unknown_vcall_reason(instruction: dict[str, Any], pattern: dict[str, Any] |
     """
     operands = (instruction.get("l"), instruction.get("r"), instruction.get("d"))
     if any(_operand_truncated(item) for item in operands):
-        return {"code": "operand_tree_truncated", "detail": "an operand tree was truncated by the exporter"}
-    if relations.get("truncated"):
-        return {"code": "operand_tree_truncated", "detail": "microcode relation coverage is truncated"}
-    cfg = relations.get("cfg") or {}
-    if cfg.get("complete") is False:
-        return {"code": "cfg_incomplete", "detail": "the exported CFG is incomplete"}
-    def_use = relations.get("def_use") or {}
-    if def_use.get("cross_block_reaching_definitions"):
-        return {"code": "cross_block_multiple_definitions", "detail": "cross-block value definitions are unresolved"}
+        return {"code": "call_operand_tree_truncated",
+                "scope": "call", "detail": "an operand tree on this indirect call was truncated"}
     if pattern is not None:
         binding = pattern.get("receiver_binding") or {}
-        return {"code": "receiver_binding_failed", "detail": binding.get("reason", binding.get("status", "receiver argument binding failed"))}
+        return {"code": "receiver_binding_failed", "scope": "call",
+                "detail": binding.get("reason", binding.get("status", "receiver argument binding failed"))}
+
+    diagnostic_codes = {item.get("code") for item in (diagnostics or [])}
+    if "multiple_cross_block_definitions" in diagnostic_codes:
+        matching = [item for item in (diagnostics or [])
+                    if item.get("code") == "multiple_cross_block_definitions"]
+        return {"code": "multiple_cross_block_definitions", "scope": "value_chain",
+                "detail": "multiple exported definitions exist outside the use block; reaching definition is unresolved",
+                "evidence": matching[:4]}
+
+    cfg = relations.get("cfg") or {}
+    if cfg.get("complete") is False:
+        return {"code": "cfg_incomplete", "scope": "function",
+                "detail": "the exported microcode CFG is incomplete, so cross-block order cannot be checked"}
+
     callee = instruction.get("r") or instruction.get("l") or {}
-    if callee.get("kind") == "nested" and (callee.get("instruction") or {}).get("opcode") == "ldx":
-        return {"code": "two_load_chain_unresolved", "detail": "a dependent load chain could not be resolved"}
-    return {"code": "indirect_call_shape_unresolved", "detail": "no complete two-load vtable-shaped chain was observed"}
+    nested_load_count = sum(1 for operand in _walk(callee)
+                            if operand.get("kind") == "nested"
+                            and (operand.get("instruction") or {}).get("opcode") == "ldx")
+    if nested_load_count > 2:
+        return {"code": "extra_load_chain", "scope": "call_chain",
+                "detail": "the expanded callee expression contains more than two indirect loads",
+                "evidence": {"nested_indirect_loads": nested_load_count}}
+    if nested_load_count == 2:
+        return {"code": "nested_load_chain_unresolved", "scope": "call_chain",
+                "detail": "the callee contains two expanded loads, but their address expressions do not form a supported receiver/constant-slot chain",
+                "evidence": {"nested_indirect_loads": nested_load_count}}
+    if "cross_block_definition_unresolved" in diagnostic_codes:
+        matching = [item for item in (diagnostics or [])
+                    if item.get("code") == "cross_block_definition_unresolved"]
+        return {"code": "cross_block_definition_unresolved", "scope": "value_chain",
+                "detail": "a required value has no uniquely established dominating definition",
+                "evidence": matching[:4]}
+    if "value_definition_missing" in diagnostic_codes:
+        return {"code": "value_definition_missing", "scope": "value_chain",
+                "detail": "a required register value has no usable exported definition"}
+    if relations.get("truncated"):
+        return {"code": "function_operand_tree_truncated", "scope": "function",
+                "detail": "at least one operand tree in this function was truncated; it may be unrelated to this call chain"}
+    if nested_load_count == 1:
+        return {"code": "single_indirect_load", "scope": "call_chain",
+                "detail": "the expanded callee expression contains only one indirect load"}
+    return {"code": "indirect_call_shape_unresolved", "scope": "call_chain",
+            "detail": "no complete two-load vtable-shaped chain was observed"}
 
 
 def _microcode_relations_for_function(connection: sqlite3.Connection, function_ea: int,
@@ -1169,7 +1203,8 @@ def _microcode_dominators(relations: dict[str, Any] | None) -> dict[int, set[int
 
 
 def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any],
-                        relations: dict[str, Any] | None = None) -> dict[str, Any] | None:
+                        relations: dict[str, Any] | None = None, *,
+                        diagnostics: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     definitions: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for instruction in instructions:
         key = _key(instruction.get("d", {}))
@@ -1181,6 +1216,14 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
 
     def resolve_load(value: dict[str, Any], visited: set[tuple[str, int]],
                      use_location: tuple[int, int]) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+        # Expanded expressions carry their own dependency ordering. Do not
+        # require a separate register definition for an embedded load.
+        if value.get("kind") == "nested":
+            nested = value.get("instruction") or {}
+            if nested.get("opcode") == "ldx":
+                load = {**nested, "block_serial": use_location[0], "ordinal": use_location[1],
+                        "text": nested.get("text", value.get("text", "embedded load"))}
+                return load, [load]
         key = _key(value)
         if key is None or key in visited:
             return None
@@ -1201,6 +1244,16 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
             if (len(cross_block) != 1 or dominators is None
                     or cross_block[0]["block_serial"] == use_location[0]
                     or cross_block[0]["block_serial"] not in dominators.get(use_location[0], set())):
+                if diagnostics is not None:
+                    code = ("value_definition_missing" if not cross_block else
+                            "multiple_cross_block_definitions" if len(cross_block) > 1 else
+                            "cross_block_definition_unresolved")
+                    diagnostics.append({"code": code, "value_identity": list(key),
+                        "use": {"block_serial": use_location[0], "ordinal": use_location[1]},
+                        "definition_count": len(cross_block),
+                        "definitions": [{"block_serial": item["block_serial"],
+                            "ordinal": item["ordinal"], "ea": item.get("ea")}
+                            for item in cross_block[:8]]})
                 return None
             definition = cross_block[0]
             relationship = "unique_definition_in_dominating_block_candidate"
@@ -1212,8 +1265,6 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
             return definition, [definition]
         if definition["opcode"] == "mov":
             source = definition.get("l", {})
-            if _key(source) is None:
-                return None
             result = resolve_load(source, visited,
                 (int(definition["block_serial"]), int(definition["ordinal"])))
             if result is None:
@@ -1222,24 +1273,22 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
             return load, [definition, *chain]
         return None
 
+    if any(_operand_truncated(call.get(root)) for root in ("l", "r", "d")):
+        return None
+
     # In IDA microcode icall stores the indirect callee in r on supported
     # architectures. Nested callee expressions are handled without text parsing.
     callee = call.get("r", {}) if call.get("r", {}).get("kind") != "empty" else call.get("l", {})
     call_location = (int(call["block_serial"]), int(call["ordinal"]))
     slot_result = resolve_load(callee, set(), call_location)
-    slot_chain: list[dict[str, Any]] = []
-    if slot_result is None:
-        if callee.get("kind") == "nested" and isinstance(callee.get("instruction"), dict):
-            nested = callee["instruction"]
-            if nested.get("opcode") == "ldx":
-                slot_load = {**nested, "opcode": "ldx", "ea": nested.get("ea"), "l": nested.get("l", {}),
-                             "r": nested.get("r", {}), "d": nested.get("d", {}),
-                             "block_serial": call["block_serial"], "ordinal": call["ordinal"]}
-                slot_result = (slot_load, [slot_load])
     if slot_result is None:
         return None
     slot_load, slot_chain = slot_result
-    slot_address = _address_expression(slot_load.get("r", {}))
+    slot_operand = slot_load.get("r", {})
+    slot_address = _address_expression(slot_operand)
+    if (slot_address is None and slot_operand.get("kind") == "nested"
+            and (slot_operand.get("instruction") or {}).get("opcode") == "ldx"):
+        slot_address = {"base": slot_operand, "offset": 0}
     if slot_address is None or slot_address["offset"] < 0:
         return None
     vptr_value = slot_address["base"]
@@ -1959,7 +2008,8 @@ def build_vcall_index(
             if len(sites) >= max_calls:
                 truncated = True
                 break
-            pattern = _trace_vcall_pattern(instructions, instruction, relations)
+            diagnostics: list[dict[str, Any]] = []
+            pattern = _trace_vcall_pattern(instructions, instruction, relations, diagnostics=diagnostics)
             pattern_candidate = bool(pattern and pattern.get("pattern_status") == "candidate")
             call_id = _id("VCALL", {"run": run_id, "function": function_ea,
                 "block": instruction["block_serial"], "ordinal": instruction["ordinal"]})
@@ -1982,7 +2032,8 @@ def build_vcall_index(
                 "source_snapshot_hash": snapshot,
             }
             if not pattern_candidate:
-                site["evidence"]["unknown_reason"] = _unknown_vcall_reason(instruction, pattern, relations)
+                site["evidence"]["unknown_reason"] = _unknown_vcall_reason(
+                    instruction, pattern, relations, diagnostics)
             sites.append(site)
         if truncated:
             break
@@ -2240,4 +2291,3 @@ def show_vcall(connection: sqlite3.Connection, *, call_id: str | None = None, ad
     site["targets"] = targets
     site["receiver_flows"] = flows
     return site
-

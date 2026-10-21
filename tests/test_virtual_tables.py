@@ -14,6 +14,7 @@ from ida_ai.vtable_types import (assert_type_application_revision, class_relatio
                                  preview_vtable_type_plan, type_application_revision)
 from ida_ai.virtual_tables import (
     _trace_vcall_pattern,
+    _unknown_vcall_reason,
     _source_hash,
     analyze_vcall,
     build_vcall_index,
@@ -171,6 +172,89 @@ class VirtualTableTests(unittest.TestCase):
             {"serial": 2, "predecessors": [0, 1], "successors": []},
         ]}}
         self.assertIsNone(_trace_vcall_pattern(instructions, instructions[-1], relations))
+
+    def _nested_vcall(self, slot_offset=8):
+        call = self._vcall_instructions(vptr_block=0, use_block=0)[-1]
+        receiver = _reg(99)
+        vptr = _nested("ldx", _reg(50), receiver, 0x2000)
+        slot_address = (_nested("add", vptr, _number(slot_offset), 0x2008)
+                        if slot_offset else vptr)
+        call["r"] = _nested("ldx", _reg(51), slot_address, 0x2008)
+        call["d"]["arguments"] = [receiver]
+        return call
+
+    def test_vcall_expanded_loads_need_no_intermediate_value_numbers(self):
+        for offset in (0, 8, 32):
+            with self.subTest(offset=offset):
+                call = self._nested_vcall(offset)
+                pattern = _trace_vcall_pattern([call], call, {})
+                self.assertEqual(pattern["pattern_status"], "candidate")
+                self.assertEqual(pattern["slot_offset"], offset)
+                self.assertEqual(len(pattern["definition_chain"]), 2)
+                self.assertFalse(pattern["cxx_virtual_call_confirmed"])
+
+    def test_nested_vcall_is_persisted_and_cache_preserves_candidate(self):
+        function = self._add_vcall_fixture()
+        call = self._nested_vcall(0)
+        self.connection.execute("UPDATE micro_instructions SET r_json=?,d_json=? "
+            "WHERE function_ea=? AND opcode='icall'",
+            (json.dumps(call["r"]), json.dumps(call["d"]), function))
+        self.connection.commit()
+        result = build_vcall_index(self.connection, function_eas=[function])
+        self.assertEqual(result["pattern_candidate_count"], 1)
+        site = list_vcalls(self.connection)["items"][0]
+        self.assertEqual(site["slot_offset"], 0)
+        self.assertEqual(site["callee"]["receiver_binding"]["status"], "exact_identity_match")
+        cached = build_vcall_index(self.connection, function_eas=[function])
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["run_id"], result["run_id"])
+
+    def test_nested_vcall_receiver_binding_remains_required(self):
+        for arguments, status in (([], "mismatch"), ([_reg(77)], "mismatch"),
+                                  ([_reg(99), _reg(99)], "ambiguous")):
+            with self.subTest(status=status, arguments=arguments):
+                call = self._nested_vcall()
+                call["d"]["arguments"] = arguments
+                pattern = _trace_vcall_pattern([call], call, {})
+                self.assertEqual(pattern["pattern_status"], "receiver_unbound")
+                self.assertEqual(pattern["receiver_binding"]["status"], status)
+
+    def test_nested_vcall_truncated_callee_or_arguments_are_unknown(self):
+        for root in ("r", "d"):
+            call = self._nested_vcall()
+            call[root]["truncated"] = True
+            self.assertIsNone(_trace_vcall_pattern([call], call, {}))
+            self.assertEqual(_unknown_vcall_reason(call, None, {})["code"],
+                             "call_operand_tree_truncated")
+
+    def test_nested_vcall_does_not_promote_extra_object_load(self):
+        call = self._nested_vcall(0)
+        call["r"]["instruction"]["r"]["instruction"]["r"] = _nested(
+            "ldx", _reg(50), _reg(99), 0x2000)
+        self.assertIsNone(_trace_vcall_pattern([call], call, {}))
+        self.assertEqual(_unknown_vcall_reason(call, None, {})["code"], "extra_load_chain")
+
+    def test_nested_load_can_be_moved_into_callee_register(self):
+        call = self._nested_vcall()
+        move = dict(call, opcode="mov", ordinal=0, l=call["r"], r=_operand("empty"), d=_reg(2))
+        call["r"] = _reg(2)
+        pattern = _trace_vcall_pattern([move, call], call, {})
+        self.assertEqual(pattern["pattern_status"], "candidate")
+
+    def test_vcall_diagnostics_describe_actual_definition_failure(self):
+        instructions = self._vcall_instructions(vptr_block=0, use_block=2)
+        instructions.insert(1, dict(instructions[0], block_serial=1))
+        diagnostics = []
+        pattern = _trace_vcall_pattern(instructions, instructions[-1], {}, diagnostics=diagnostics)
+        reason = _unknown_vcall_reason(instructions[-1], pattern, {}, diagnostics)
+        self.assertEqual(reason["code"], "multiple_cross_block_definitions")
+        self.assertEqual(reason["evidence"][0]["definition_count"], 2)
+        self.assertEqual(reason["evidence"][0]["use"]["block_serial"], 2)
+        # An exporter capability flag is not evidence of multiple definitions.
+        reason = _unknown_vcall_reason(dict(instructions[-1], r=_reg(88)), None,
+            {"def_use": {"cross_block_reaching_definitions": True}, "truncated": True})
+        self.assertEqual(reason["code"], "function_operand_tree_truncated")
+        self.assertEqual(reason["scope"], "function")
 
     def test_vtable_candidate_slots_and_thunk_chain(self):
         result = build_vtable_index(self.connection, abi="itanium")
@@ -476,9 +560,9 @@ class VirtualTableTests(unittest.TestCase):
         build_vtable_index(self.connection, abi="itanium")
         result = build_vcall_index(self.connection, function_eas=[function])
         self.assertEqual(result["pattern_candidate_count"], 0)
-        self.assertEqual(result["unknown_reason_counts"], {"operand_tree_truncated": 1})
+        self.assertEqual(result["unknown_reason_counts"], {"call_operand_tree_truncated": 1})
         site = list_vcalls(self.connection, function_ea=function)["items"][0]
-        self.assertEqual(site["evidence"]["unknown_reason"]["code"], "operand_tree_truncated")
+        self.assertEqual(site["evidence"]["unknown_reason"]["code"], "call_operand_tree_truncated")
 
     def test_rebuilding_vtable_index_stales_saved_vcall_targets(self):
         function = self._add_vcall_fixture()
