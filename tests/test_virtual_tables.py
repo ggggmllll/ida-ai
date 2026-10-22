@@ -183,6 +183,56 @@ class VirtualTableTests(unittest.TestCase):
         call["d"]["arguments"] = [receiver]
         return call
 
+    def _loaded_pointer_receiver_vcall(self, *, slot_offset=0x10, argument_matches=True):
+        call = self._vcall_instructions(vptr_block=0, use_block=0)[-1]
+        object_pointer = _nested("ldx", _reg(238),
+            _nested("add", _reg(240), _number(0x4588), 0x2000), 0x2000)
+        object_pointer["value_number"] = 238
+        vptr = _nested("ldx", _reg(239), object_pointer, 0x2008)
+        vptr["value_number"] = 239
+        slot_address = _nested("add", vptr, _number(slot_offset), 0x2010)
+        call["r"] = _nested("ldx", _reg(241), slot_address, 0x2010)
+        call["d"]["arguments"] = [object_pointer if argument_matches else _reg(77)]
+        return call
+
+    def test_loaded_pointer_receiver_needs_exact_call_argument_binding(self):
+        call = self._loaded_pointer_receiver_vcall(argument_matches=True)
+        pattern = _trace_vcall_pattern([call], call, {})
+        self.assertIsNotNone(pattern)
+        self.assertEqual(pattern["pattern_status"], "candidate")
+        self.assertEqual(pattern["receiver_binding"]["status"], "exact_identity_match")
+        self.assertEqual(pattern["basis"], "loaded_pointer_receiver_then_vptr_and_constant_slot")
+        self.assertEqual(pattern["vptr_offset"], 0)
+        self.assertEqual(pattern["slot_offset"], 0x10)
+        self.assertEqual(pattern["receiver_derivation"]["pointer_field_offset"], 0x4588)
+        self.assertEqual(len(pattern["definition_chain"]), 3)
+
+        # A different exported value identity must not bind as the receiver.
+        call = self._loaded_pointer_receiver_vcall(argument_matches=False)
+        self.assertIsNone(_trace_vcall_pattern([call], call, {}))
+        self.assertEqual(_unknown_vcall_reason(call, None, {})["code"], "extra_load_chain")
+
+    def test_loaded_pointer_receiver_rejects_nonconstant_pointer_field(self):
+        call = self._loaded_pointer_receiver_vcall()
+        pointer_load = call["r"]["instruction"]["r"]["instruction"]["l"]["instruction"]["r"]["instruction"]
+        pointer_load["r"] = _nested("add", _reg(240), _reg(88), 0x2000)
+        self.assertIsNone(_trace_vcall_pattern([call], call, {}))
+        self.assertEqual(_unknown_vcall_reason(call, None, {})["code"], "extra_load_chain")
+
+    def test_loaded_pointer_receiver_is_indexed_and_persisted(self):
+        function = self._add_vcall_fixture()
+        call = self._loaded_pointer_receiver_vcall()
+        self.connection.execute("UPDATE micro_instructions SET r_json=?,d_json=? "
+            "WHERE function_ea=? AND opcode='icall'",
+            (json.dumps(call["r"]), json.dumps(call["d"]), function))
+        self.connection.commit()
+        result = build_vcall_index(self.connection, function_eas=[function])
+        self.assertEqual(result["pattern_candidate_count"], 1)
+        site = list_vcalls(self.connection, function_ea=function)["items"][0]
+        self.assertEqual(site["status"], "vtable_pattern_candidate")
+        self.assertEqual(site["callee"]["receiver_derivation"]["kind"], "loaded_pointer_argument")
+        self.assertEqual(site["slot_offset"], 0x10)
+
     def test_vcall_expanded_loads_need_no_intermediate_value_numbers(self):
         for offset in (0, 8, 32):
             with self.subTest(offset=offset):

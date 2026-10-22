@@ -19,7 +19,7 @@ from .db import get_metadata, ida_ea, set_metadata, sqlite_ea, utc_now
 
 
 VTABLE_PARSER_VERSION = "8"
-VCALL_DETECTOR_VERSION = "5"
+VCALL_DETECTOR_VERSION = "6"
 VPTR_WRITE_DETECTOR_VERSION = "1"
 SUPPORTED_ABIS = ("itanium",)
 MAX_RTTI_BASES = 128
@@ -1040,6 +1040,11 @@ def _offset_constant(operand: dict[str, Any]) -> int | None:
 def _operand_identity(operand: dict[str, Any]) -> tuple[Any, int] | None:
     expression = _address_expression(operand)
     if expression is None:
+        # Expanded loads can be passed as call arguments without first being
+        # materialized in a named register operand. Their microcode value
+        # number still gives them the same identity as a register use.
+        if operand.get("kind") == "nested" and operand.get("value_number") is not None:
+            return ("register", int(operand["value_number"])), 0
         return None
     base = expression["base"]
     key = _key(base)
@@ -1350,16 +1355,55 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
         return None
     vptr_load, vptr_chain = vptr_result
     object_address = _address_expression(vptr_load.get("r", {}))
+    receiver_pointer_load = None
+    receiver_derivation = None
+    requires_bound_loaded_receiver = False
     if object_address is None:
-        return None
+        # Some optimized callers load a pointer-valued object field, pass that
+        # pointer as an argument, then load its vptr and a constant slot. This
+        # is a supported structural shape only when the pointer load comes
+        # from a base-plus-constant address and the exact loaded value is an
+        # exported call argument.
+        pointer_value = vptr_load.get("r", {})
+        pointer_instruction = (pointer_value.get("instruction", {})
+                               if pointer_value.get("kind") == "nested" else {})
+        pointer_field = _address_expression(pointer_instruction.get("r", {})) \
+            if pointer_instruction.get("opcode") == "ldx" else None
+        pointer_base = (pointer_field or {}).get("base", {})
+        if (pointer_field is None
+                or pointer_base.get("kind") not in ("register", "local", "stack", "global")
+                or _operand_identity(pointer_value) is None):
+            return None
+        receiver = pointer_value
+        receiver_offset = 0
+        receiver_pointer_load = {**pointer_instruction,
+            "block_serial": vptr_load.get("block_serial", call_location[0]),
+            "ordinal": vptr_load.get("ordinal", call_location[1]),
+            "text": pointer_instruction.get("text", "loaded pointer field")}
+        receiver_derivation = {
+            "kind": "loaded_pointer_argument",
+            "pointer_load_ea": pointer_instruction.get("ea"),
+            "pointer_field_base": pointer_base,
+            "pointer_field_offset": pointer_field["offset"],
+            "pointer_value_number": pointer_value.get("value_number"),
+        }
+        requires_bound_loaded_receiver = True
+        vptr_offset = 0
+    else:
+        receiver = object_address["base"]
+        receiver_offset = object_address["offset"]
+        vptr_offset = object_address["offset"]
     if (_operand_truncated(callee)
             or any(_operand_truncated(item.get(root)) for item in [*vptr_chain, *slot_chain]
                    for root in ("l", "r", "d"))):
         return None
-    receiver = object_address["base"]
     if receiver.get("kind") not in ("register", "local", "stack", "global"):
+        if not (requires_bound_loaded_receiver and receiver.get("kind") == "nested"):
+            return None
+    receiver_binding = _receiver_binding(call, receiver, receiver_offset)
+    if (requires_bound_loaded_receiver and receiver_binding["status"] not in (
+            "exact_identity_match", "subobject_offset_match")):
         return None
-    receiver_binding = _receiver_binding(call, receiver, object_address["offset"])
     chain_blocks = {call_location[0]} | {edge["definition"]["block_serial"]
         for edge in def_use_chain} | {edge["use"]["block_serial"] for edge in def_use_chain}
     dominance_verified = (dominators is not None
@@ -1369,16 +1413,20 @@ def _trace_vcall_pattern(instructions: list[dict[str, Any]], call: dict[str, Any
         "receiver_binding": receiver_binding,
         "pattern_status": ("candidate" if receiver_binding["status"] in (
             "exact_identity_match", "subobject_offset_match") else "receiver_unbound"),
-        "vptr_offset": object_address["offset"],
+        "vptr_offset": vptr_offset,
         "slot_offset": slot_address["offset"],
+        "receiver_derivation": receiver_derivation,
         "vptr_load_ea": vptr_load.get("ea"),
         "slot_load_ea": slot_load.get("ea"),
         "definition_chain": [{"block_serial": item["block_serial"], "ordinal": item["ordinal"],
             "ea": item.get("ea"), "opcode": item["opcode"], "text": item["text"]}
-            for item in [*vptr_chain, *slot_chain]],
+            for item in [*([receiver_pointer_load] if receiver_pointer_load else []),
+                         *vptr_chain, *slot_chain]],
         "definition_use_chain": def_use_chain,
         "callee_operand": callee,
-        "basis": "two_dependent_indirect_loads_in_exported_microcode",
+        "basis": ("loaded_pointer_receiver_then_vptr_and_constant_slot"
+                  if requires_bound_loaded_receiver else
+                  "two_dependent_indirect_loads_in_exported_microcode"),
         "same_block_order_checked": True,
         "cfg_complete": (relations or {}).get("cfg", {}).get("complete"),
         "operand_tree_truncated": (relations or {}).get("truncated"),
