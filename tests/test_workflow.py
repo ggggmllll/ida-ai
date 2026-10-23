@@ -12,6 +12,7 @@ from ida_ai.selection import selection_preview
 from ida_ai.vtable_match import match_vtable_signature, normalize_signature
 from ida_ai.discovery import import_callers
 from ida_ai.derived_calls import import_derived_calls, mark_derived_calls_stale
+from ida_ai.call_audit import audit_shared_calls
 
 
 class WorkflowTests(unittest.TestCase):
@@ -166,3 +167,34 @@ class WorkflowTests(unittest.TestCase):
         self.c.execute("INSERT INTO discovered_strings VALUES(1,0,'text','aa','now')")
         reset_analysis(self.c)
         self.assertEqual(self.c.execute("SELECT count(*) FROM discovered_strings").fetchone()[0],0)
+
+    def test_call_audit_flags_return_address_dispatcher_without_resolving(self):
+        self.c.execute(
+            "INSERT INTO functions(start_ea,end_ea,name,size) VALUES(?,?,?,?)",
+            (0x3000, 0x3040, "shared_dispatch", 0x40),
+        )
+        self.c.execute(
+            "INSERT INTO disassembly(function_ea,text,line_count,status,generated_at) "
+            "VALUES(?,?,?,?,?)",
+            (0x3000, "3000: ADD X9, X0, #1\n3004: SUB X0, X1, X30", 2, "ok", "now"),
+        )
+        self.c.executemany(
+            "INSERT INTO xrefs(source_ea,target_ea,xref_type,is_code,is_data,"
+            "source_function_ea,target_function_ea,type_name) VALUES(?,?,?,?,?,?,?,?)",
+            [
+                (0x1004, 0x3000, 1, 1, 0, 0x1000, 0x3000, "code_near_call"),
+                (0x2004, 0x3000, 1, 1, 0, 0x2000, 0x3000, "code_near_call"),
+            ],
+        )
+        self.c.commit()
+        result = audit_shared_calls(self.c, [0x1000, 0x2000], min_fan_in=2)
+        self.assertEqual(result["counts"]["ambiguous_call_sites"], 2)
+        self.assertEqual(result["targets"][0]["classification"],
+                         "ambiguous_callsite_dependent_dispatch")
+        self.assertFalse(result["call_sites"][0]["target_identity_resolved"])
+        args = _parser().parse_args([
+            "call-audit", "--db", str(self.db), "--all", "--min-fan-in", "2",
+        ])
+        cli_result = _run(args)
+        self.assertEqual(cli_result["counts"]["ambiguous_call_sites"], 2)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM derived_calls").fetchone()[0], 0)

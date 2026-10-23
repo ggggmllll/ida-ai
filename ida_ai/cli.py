@@ -12,6 +12,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .db import connect, get_metadata, record_operation, sqlite_ea
+from .call_audit import audit_shared_calls
 from .derived_calls import import_derived_calls
 from .jobs import JOB_STATUSES, check_jobs, create_job, history as job_history, list_jobs, resume_job, revise_job, show_job
 from .job_queries import diff_job, find_jobs, impact
@@ -242,6 +243,21 @@ def _parser() -> argparse.ArgumentParser:
 
     clear = commands.add_parser("clear-searches", help="clear persisted search records and local search cache")
     _add_db(clear)
+
+    call_audit = commands.add_parser(
+        "call-audit",
+        help="flag high-fan-in callsites whose targets use return-address-dependent dispatch",
+    )
+    _add_db(call_audit)
+    call_audit.add_argument("--min-fan-in", type=int, default=256)
+    call_audit.add_argument("--max-functions", type=int, default=1000)
+    call_audit.add_argument("--max-results", type=int, default=10000)
+    call_scope = call_audit.add_mutually_exclusive_group(required=True)
+    call_scope.add_argument("--all", action="store_true", dest="all_functions")
+    call_scope.add_argument("--address", help="address inside a function")
+    call_scope.add_argument("--addresses", nargs="+", help="union of functions containing these addresses")
+    call_scope.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"))
+    call_scope.add_argument("--name", help="exact function or demangled name")
 
     derived = commands.add_parser(
         "derived-call-import",
@@ -857,6 +873,23 @@ def _run(args: argparse.Namespace) -> dict:
             result = match_vtable_signature(connection,spec,start=start,end=end,limit=args.limit,max_anchors=args.max_anchors)
         result["refresh"] = refresh
         return result
+    if args.command == "call-audit":
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite database does not exist: {args.db}")
+        with closing(connect(args.db)) as connection:
+            addresses = select_function_addresses(
+                connection, all_functions=args.all_functions, address=args.address,
+                addresses=args.addresses, address_range=args.address_range, name=args.name,
+            )
+            if args.max_functions and len(addresses) > args.max_functions:
+                raise ValueError(
+                    f"selection contains {len(addresses)} functions; exceeds "
+                    f"--max-functions {args.max_functions}"
+                )
+            return audit_shared_calls(
+                connection, addresses, min_fan_in=args.min_fan_in,
+                max_results=args.max_results,
+            )
     options = {"idat": args.idat, "timeout": args.timeout}
     if args.command == "discover":
         start,end = parse_range(args.address_range) if args.address_range else (None,None)
