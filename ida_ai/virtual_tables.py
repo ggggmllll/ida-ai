@@ -16,10 +16,11 @@ from collections.abc import Iterable
 from typing import Any
 
 from .db import get_metadata, ida_ea, set_metadata, sqlite_ea, utc_now
+from .micro_calls import iter_calls
 
 
 VTABLE_PARSER_VERSION = "8"
-VCALL_DETECTOR_VERSION = "6"
+VCALL_DETECTOR_VERSION = "7"
 VPTR_WRITE_DETECTOR_VERSION = "1"
 SUPPORTED_ABIS = ("itanium",)
 MAX_RTTI_BASES = 128
@@ -2103,9 +2104,7 @@ def build_vcall_index(
             failures.append({"function_ea": function_ea, "status": summary["status"]}); continue
         instructions = _instructions_for_function(connection, function_ea)
         relations = _microcode_relations_for_function(connection, function_ea, summary)
-        for instruction in instructions:
-            if instruction["opcode"] != "icall":
-                continue
+        for instruction in iter_calls(instructions, indirect_only=True):
             if len(sites) >= max_calls:
                 truncated = True
                 break
@@ -2113,7 +2112,8 @@ def build_vcall_index(
             pattern = _trace_vcall_pattern(instructions, instruction, relations, diagnostics=diagnostics)
             pattern_candidate = bool(pattern and pattern.get("pattern_status") == "candidate")
             call_id = _id("VCALL", {"run": run_id, "function": function_ea,
-                "block": instruction["block_serial"], "ordinal": instruction["ordinal"]})
+                "block": instruction["block_serial"], "ordinal": instruction["ordinal"],
+                "operand_path": instruction["operand_path"]})
             site = {
                 "call_id": call_id, "run_id": run_id, "call_ea": instruction["ea"],
                 "function_ea": function_ea, "block_serial": instruction["block_serial"],
@@ -2123,7 +2123,9 @@ def build_vcall_index(
                 "callee": pattern or {"operand_l": instruction["l"], "operand_r": instruction["r"]},
                 "slot_offset": pattern.get("slot_offset") if pattern_candidate else None,
                 "pointer_size": 8 if get_metadata(connection, "bitness", 64) == 64 else 4,
-                "evidence": {"instruction": instruction["text"], "microcode_source": "micro_instructions",
+                "evidence": {"instruction": instruction.get("text", "icall"),
+                    "operand_path": instruction["operand_path"], "container_opcode": instruction["container_opcode"],
+                    "microcode_source": "micro_instructions",
                     "source_snapshot_hash": snapshot, "pattern": pattern,
                     "microcode_relations": {"version": relations.get("version"),
                         "cfg_complete": (relations.get("cfg") or {}).get("complete"),

@@ -243,6 +243,26 @@ class VirtualTableTests(unittest.TestCase):
                 self.assertEqual(len(pattern["definition_chain"]), 2)
                 self.assertFalse(pattern["cxx_virtual_call_confirmed"])
 
+    def test_call_nested_in_result_move_is_indexed_analyzed_and_traced(self):
+        from ida_ai.vcall_trace import trace_virtual_call
+        function = self._add_vcall_fixture()
+        call = self._nested_vcall(32)
+        call['opcode'] = 'icall'
+        call['ea'] = 0x200C
+        self.connection.execute("UPDATE micro_instructions SET opcode='mov',l_json=?,r_json='{}',d_json=? "
+            "WHERE function_ea=? AND opcode='icall'",
+            (json.dumps({'kind':'nested','instruction':call}), json.dumps(_reg(400)), function))
+        self.connection.commit()
+        result = build_vcall_index(self.connection, function_eas=[function])
+        self.assertEqual(result['site_count'], 1)
+        site = list_vcalls(self.connection)['items'][0]
+        self.assertEqual(site['evidence']['operand_path'], 'l.instruction')
+        self.assertEqual(site['slot_offset'], 32)
+        analyzed = analyze_vcall(self.connection, call_id=site['call_id'])
+        self.assertIsInstance(analyzed, dict)
+        traced = trace_virtual_call(self.connection, call_id=site['call_id'])
+        self.assertIsInstance(traced, dict)
+
     def test_nested_vcall_is_persisted_and_cache_preserves_candidate(self):
         function = self._add_vcall_fixture()
         call = self._nested_vcall(0)

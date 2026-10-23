@@ -14,7 +14,7 @@ Choose exactly one function selector. Unless `--no-refresh` is supplied, selecte
 
 The command also builds the function-local vptr-write index for the same selected functions after refreshing microcode. It indexes only stores resolving to exact current table address points; see `ida-ai-vptr-write-build` and `ida-ai-vptr-write-list` for coverage and row semantics.
 
-The detector indexes `icall` observations. It supports two bounded structural shapes:
+The detector indexes top-level and operand-nested `icall` observations, including `mov(icall(...))` and calls inside conversions. `evidence.operand_path` identifies the call within its containing block/ordinal; separate calls at the same EA are not merged. Cross-maturity trace bridges require a unique call EA and compatible shape, and leave ambiguous EAs unresolved. It supports two bounded structural shapes:
 
 - The direct receiver shape has a receiver-related load that yields a vptr, followed by a constant-offset slot load. The exported call arguments must contain exactly one argument with the same receiver base identity; any subobject adjustment is recorded separately.
 - The loaded-pointer receiver shape first loads a pointer from a register/local/stack/global base plus a constant field offset, then uses that exact loaded pointer as the receiver for a vptr load and a constant-offset slot load. The exact loaded pointer must appear as one unique exported call argument. Evidence records the pointer-field base/offset, pointer-load EA/value number, vptr-load EA, slot-load EA, slot byte offset, and the receiver binding. In this shape the vptr offset is relative to the loaded receiver and is reported as zero; the pointer-field offset is a separate coordinate.

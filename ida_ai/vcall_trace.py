@@ -7,12 +7,13 @@ import uuid
 
 from .db import ida_ea, sqlite_ea, utc_now
 from .vcall_memory import MemoryQuery
+from .micro_calls import iter_calls
 from .virtual_tables import (
     _current_vtable_candidates, _id, _instructions_for_function, _json,
     _microcode_relations_for_function, _source_hash, _trace_vcall_pattern,
 )
 
-TRACE_VERSION = "1"
+TRACE_VERSION = "2"
 
 
 def trace_snapshot(connection):
@@ -68,11 +69,12 @@ def _bridge(connection, row):
     if original.get("pattern_status") != "candidate":
         return {"status": "unknown", "reason": "original_pattern_incomplete"}, None
     instructions = _instructions_for_function(connection, function, "micro_flow")
-    originals = [i for i in _instructions_for_function(connection, function)
-                 if i["opcode"] == "icall" and i.get("ea") == ida_ea(row["call_ea"])] if row["call_ea"] is not None else []
+    originals = [i for i in iter_calls(_instructions_for_function(connection, function), indirect_only=True)
+                 if i.get("ea") == ida_ea(row["call_ea"])] if row["call_ea"] is not None else []
     if len(originals) != 1:
         return {"status": "unknown", "reason": "original_call_ea_missing_or_ambiguous"}, None
-    calls = [i for i in instructions if i["opcode"] == "icall" and i.get("ea") == ida_ea(row["call_ea"])] if row["call_ea"] is not None else []
+    calls = [i for i in iter_calls(instructions, indirect_only=True)
+             if i.get("ea") == ida_ea(row["call_ea"])] if row["call_ea"] is not None else []
     if len(calls) != 1:
         return {"status": "unknown", "reason": "flow_call_ea_missing_or_ambiguous", "matches": len(calls)}, None
     relations = _microcode_relations_for_function(connection, function, summary, "micro_flow")
