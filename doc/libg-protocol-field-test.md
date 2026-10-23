@@ -114,3 +114,20 @@ GAP-011 已增加独立的 `disasm-range` 只读命令。它按精确半开地�
 握手变换的关键全局也已恢复到来源层：`JNI_OnLoad` 调用 `0x17E54AC(vm)` 初始化 `qword_1A23D20`；后续代码通过它取得 JNI 环境，使用 `getClassLoader/loadClass` 加载 `com/sistr/safejni/NativeProxy`。因此 `0x17E5600` 的虚方法选择和 `0x17E57D0` 的 Java 反射路径属于 **JNI 边界**。静态库能确认握手安装了非复制的变换入口，具体算法实现可能在 Java/运行时对象中；没有证据时不得命名为 AES、RC4 或其他算法。
 
 新导出的 `crypto_error_*` 字符串位于 `0xAE3C5C` 的错误/遥测路径，只表示 inbound/outbound/loop 错误统计，不是算法常量的证据。
+
+## 原程序字段名线索
+
+部分解码函数保留了断言字符串 `Too many items in array decode, var:<name>`。这些名字可以作为字段语义线索，但仍不能单独证明字段顺序、元素类型或消息方向。当前高价值线索包括：
+
+| 消息 ID | 字符串中的原变量名 | 保守解释 |
+| --- | --- | --- |
+| `11943` | `m_selectedSpells` | 至少包含一个已选法术 ID 列表 |
+| `14318` | `m_friendsAlliances` | 包含好友公会列表相关字段 |
+| `20002` | `m_results` | 包含结果列表相关字段 |
+| `23702` | `m_unitAssetReflectionIDs` | 包含单位资源反射 ID 列表 |
+| `23820` | `m_battleIds`, `m_avatarIds`, `m_statuses` | 至少包含战斗、头像和状态三个对应列表 |
+| `25326`, `26022` | `m_avatarIdList`, `m_statusList` | 至少包含头像 ID 与状态两个对应列表 |
+| `20103` | `Content URL list too large` | 包含内容 URL 列表；没有原变量名 |
+| `20963` | `Chronos Content URL list too large`, `Content URL list too large` | 包含普通及 Chronos 内容 URL 列表；没有原变量名 |
+
+结构化提取保存在本地被忽略的 `message-semantic-hints-round3.json`；其中共关联 37 个消息，只有 `m_` 前缀名字作为业务线索，`tmpvar__N` 明确视为反编译临时名而非原语义。
