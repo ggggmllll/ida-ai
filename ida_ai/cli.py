@@ -160,6 +160,19 @@ def _parser() -> argparse.ArgumentParser:
     discover.add_argument("--max-items", type=int, default=100000)
     discover.add_argument("--max-bytes", type=int, default=32 << 20)
 
+    disasm_range = commands.add_parser(
+        "disasm-range",
+        help="read decoded code/data items in an arbitrary range without creating functions",
+    )
+    _add_db(disasm_range)
+    _add_ida(disasm_range)
+    disasm_range.add_argument("--start", required=True, help="inclusive start address")
+    disasm_range.add_argument("--end", required=True, help="exclusive end address")
+    disasm_range.add_argument("--max-items", type=int, default=10000,
+                              help="maximum decoded code entries to return")
+    disasm_range.add_argument("--max-bytes", type=int, default=1 << 20,
+                              help="maximum requested range size")
+
     match = commands.add_parser("vtable-match", help="match positional slot constraints against loaded pointer observations")
     _add_db(match)
     _add_ida(match)
@@ -848,6 +861,18 @@ def _run(args: argparse.Namespace) -> dict:
     if args.command == "discover":
         start,end = parse_range(args.address_range) if args.address_range else (None,None)
         return run_ida("discover",args.db,kind=args.kind,start=start,end=end,max_items=args.max_items,max_bytes=args.max_bytes,**options)
+    if args.command == "disasm-range":
+        start, end = parse_range([args.start, args.end])
+        if args.max_items < 1:
+            raise ValueError("max_items must be positive")
+        if args.max_bytes < 1 or end - start > args.max_bytes:
+            raise ValueError(
+                f"requested range has {end - start} bytes; exceeds --max-bytes {args.max_bytes}"
+            )
+        return run_ida(
+            "disasm_range", args.db, start=start, end=end,
+            max_items=args.max_items, **options,
+        )
     if args.command == "attach-idb":
         return attach_idb(args.db, args.source, destination=args.idb, reuse=args.reuse_idb, **options)
     if args.command == "sync":

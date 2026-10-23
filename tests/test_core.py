@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ida_ai.cli import _cache_file, _cached_search, _clear_searches, _query
+from ida_ai.cli import _cache_file, _cached_search, _clear_searches, _parser, _query, _run
 from ida_ai.db import SCHEMA_VERSION, connect, ida_ea, operation, record_operation, set_metadata, sqlite_ea
 from ida_ai.function_classification import is_nullstub_sequence
 from ida_ai.runner import run_ida
@@ -225,6 +225,54 @@ class DatabaseTests(unittest.TestCase):
             result = run_ida("init", self.db_path, binary=binary, idb_path=str(idb))
         self.assertEqual(result["functions"], 2)
         self.assertTrue(result["job_review"]["applied"])
+
+    def test_disasm_range_validates_and_dispatches_read_only_exact_interval(self):
+        args = _parser().parse_args([
+            "disasm-range", "--db", str(self.db_path),
+            "--start", "0x401000", "--end", "0x401040",
+        ])
+        self.assertEqual(args.max_bytes, 1 << 20)
+        with patch("ida_ai.cli.run_ida", return_value={"view": "code_range_disassembly"}) as run:
+            result = _run(args)
+        self.assertEqual(result["view"], "code_range_disassembly")
+        run.assert_called_once_with(
+            "disasm_range", self.db_path, start=0x401000, end=0x401040,
+            max_items=10000, idat=None, timeout=0,
+        )
+
+        too_large = _parser().parse_args([
+            "disasm-range", "--db", str(self.db_path),
+            "--start", "0x401000", "--end", "0x401004", "--max-bytes", "3",
+        ])
+        with self.assertRaisesRegex(ValueError, "exceeds --max-bytes"):
+            _run(too_large)
+
+    def test_disasm_range_runner_requests_no_save_exit(self):
+        idb = Path(self.temporary.name) / "range.i64"
+        idb.write_bytes(b"idb")
+        with closing(connect(self.db_path)) as connection:
+            set_metadata(connection, {"idb_path": str(idb)})
+            connection.commit()
+
+        def fake_run(command, **kwargs):
+            request = json.loads(
+                Path(kwargs["env"]["IDA_AI_REQUEST"]).read_text(encoding="utf-8")
+            )
+            self.assertTrue(request["exit_without_save"])
+            with closing(connect(self.db_path)) as connection:
+                record_operation(
+                    connection, request["request_id"], request["action"], "ok",
+                    {"view": "code_range_disassembly"},
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("ida_ai.runner.find_idat", return_value=idb), patch(
+            "ida_ai.runner.subprocess.run", side_effect=fake_run
+        ):
+            result = run_ida(
+                "disasm_range", self.db_path, start=0x1000, end=0x1010, max_items=10
+            )
+        self.assertEqual(result["view"], "code_range_disassembly")
 
 
 if __name__ == "__main__":

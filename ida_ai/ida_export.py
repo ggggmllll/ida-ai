@@ -325,6 +325,153 @@ def disassembly_lines(func_ea: int):
     return lines
 
 
+def disassemble_range(start: int, end: int, *, max_items: int = 10000) -> dict:
+    """Describe decoded items in a range without creating or changing functions.
+
+    This is deliberately a read-only view. It does not call ``add_func``,
+    patch bytes, save the IDB, or mirror the result into function-oriented
+    SQLite tables.
+    """
+    if start < 0 or end <= start or end > (1 << 64):
+        raise ValueError("range must be a non-empty unsigned 64-bit interval")
+    if max_items < 1:
+        raise ValueError("max_items must be positive")
+
+    code_items = data_items = unknown_items = gap_items = 0
+    code_bytes = data_bytes = unknown_bytes = gap_bytes = 0
+    entries = []
+    skipped = []
+    code_ranges = []
+    cursor = int(start)
+
+    def skip_item(address: int, size: int, kind: str, reason: str) -> None:
+        nonlocal code_bytes, data_bytes, unknown_bytes, gap_bytes
+        nonlocal code_items, data_items, unknown_items, gap_items
+        if kind == "gap":
+            gap_items += 1
+            gap_bytes += size
+        elif kind == "data":
+            data_items += 1
+            data_bytes += size
+        else:
+            unknown_items += 1
+            unknown_bytes += size
+        if len(skipped) < 1000:
+            skipped.append({
+                "address": address,
+                "address_hex": f"0x{address:X}",
+                "end": address + size,
+                "size": size,
+                "kind": kind,
+                "reason": reason,
+            })
+
+    for ea in idautils.Heads(start, end):
+        ea = int(ea)
+        if ea >= end:
+            break
+        if ea > cursor:
+            skip_item(cursor, ea - cursor, "gap", "no decoded item covers this range")
+            cursor = ea
+        if ea < cursor:
+            continue
+        flags = ida_bytes.get_flags(ea)
+        size = int(_safe(lambda: ida_bytes.get_item_size(ea), 0) or 0)
+        if size <= 0:
+            size = 1
+        clipped_size = min(size, int(end) - ea)
+        is_code = bool(_safe(lambda: ida_bytes.is_code(flags), False))
+        is_data = bool(_safe(lambda: ida_bytes.is_data(flags), False))
+        if is_code:
+            code_items += 1
+            code_bytes += clipped_size
+            if len(entries) < max_items:
+                text = _safe(
+                    lambda: ida_lines.generate_disasm_line(
+                        ea, ida_lines.GENDSM_FORCE_CODE | ida_lines.GENDSM_REMOVE_TAGS
+                    ),
+                    "",
+                ) or ""
+                text = ida_lines.tag_remove(text)
+                raw = _safe(lambda: ida_bytes.get_bytes(ea, clipped_size), b"") or b""
+                segment = find_segment(ea)
+                function = ida_funcs.get_func(ea)
+                chunk_function = _safe(lambda: ida_funcs.get_fchunk(ea))
+                chunk = None
+                if chunk_function is not None:
+                    chunk = {
+                        "start": int(chunk_function.start_ea),
+                        "end": int(chunk_function.end_ea),
+                        "is_tail": bool(_safe(
+                            lambda: ida_funcs.is_func_tail(chunk_function), False
+                        )),
+                    }
+                entries.append({
+                    "address": ea,
+                    "address_hex": f"0x{ea:X}",
+                    "end": ea + clipped_size,
+                    "size": clipped_size,
+                    "text": text,
+                    "mnemonic": text.split(None, 1)[0] if text else None,
+                    "operands": text.split(None, 1)[1] if " " in text else None,
+                    "bytes_hex": bytes(raw).hex(),
+                    "segment": ida_segment.get_segm_name(segment) if segment else None,
+                    "permissions": segment_permissions(int(segment.perm)) if segment else None,
+                    "function_ea": int(function.start_ea) if function else None,
+                    "function_name": function_name(function.start_ea) if function else None,
+                    "chunk": chunk,
+                })
+                if not code_ranges or code_ranges[-1][1] != ea:
+                    code_ranges.append([ea, ea + clipped_size])
+                else:
+                    code_ranges[-1][1] = ea + clipped_size
+        elif is_data:
+            skip_item(ea, clipped_size, "data", "item is classified as data")
+        else:
+            skip_item(ea, clipped_size, "unknown", "item is not classified as code or data")
+        cursor = max(cursor, ea + clipped_size)
+
+    if cursor < end:
+        skip_item(cursor, int(end) - cursor, "gap", "no decoded item covers this range")
+
+    classified_bytes = code_bytes + data_bytes + unknown_bytes + gap_bytes
+    return {
+        "view": "code_range_disassembly",
+        "requested": {
+            "start": start,
+            "start_hex": f"0x{start:X}",
+            "end": end,
+            "end_hex": f"0x{end:X}",
+            "bytes": int(end) - start,
+        },
+        "coverage": {
+            "classified_bytes": classified_bytes,
+            "code_bytes": code_bytes,
+            "data_bytes": data_bytes,
+            "unknown_bytes": unknown_bytes,
+            "gap_bytes": gap_bytes,
+            "code_items": code_items,
+            "data_items": data_items,
+            "unknown_items": unknown_items,
+            "gap_items": gap_items,
+            "emitted_items": len(entries),
+            "omitted_code_items": max(0, code_items - len(entries)),
+            "complete": classified_bytes == int(end) - start,
+            "truncated": code_items > len(entries),
+        },
+        "code_ranges": code_ranges,
+        "entries": entries,
+        "skip_samples": skipped,
+        "skip_samples_truncated": (data_items + unknown_items + gap_items) > len(skipped),
+        "semantics": {
+            "read_only": True,
+            "creates_functions": False,
+            "writes_idb": False,
+            "source": "IDA decoded item flags",
+        },
+    }
+
+
 def add_disassembly(connection, addresses: list[int]) -> None:
     now = utc_now()
     for ordinal, func_ea in enumerate(addresses, 1):

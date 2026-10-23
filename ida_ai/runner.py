@@ -143,7 +143,16 @@ def run_ida(
         input_path = stored_idb_path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     request_id = uuid.uuid4().hex
-    request = {"request_id": request_id, "action": action, "db_path": str(db_path), **payload}
+    request = {
+        "request_id": request_id,
+        "action": action,
+        "db_path": str(db_path),
+        # IDA's normal qexit path can re-save an otherwise read-only database.
+        # The range command terminates after publishing its SQLite operation so
+        # that the source IDB remains byte-for-byte unchanged.
+        "exit_without_save": action == "disasm_range",
+        **payload,
+    }
     script = Path(__file__).with_name("ida_entry.py").resolve()
     environment = os.environ.copy()
     project_root = str(script.parent.parent)

@@ -74,6 +74,10 @@ def dispatch(request: dict) -> dict:
             return result
         if action == "discover":
             return ida_export.discover(connection, **{k:request[k] for k in ("kind","start","end","max_items","max_bytes")})
+        if action == "disasm_range":
+            return ida_export.disassemble_range(
+                request["start"], request["end"], max_items=request["max_items"],
+            )
         if action == "export_batch":
             views = request["views"]
             if not views or any(v not in {"disassembly", "pseudocode", "microcode", "micro_flow"} for v in views):
@@ -139,6 +143,12 @@ def main() -> None:
             except Exception:
                 traceback.print_exc()
     finally:
+        if request is not None and request.get("exit_without_save"):
+            # qexit can cause IDA to re-save a database opened in batch mode.
+            # All durable output has already been committed to SQLite above.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(exit_code)
         ida_pro.qexit(exit_code)
 
 
