@@ -90,7 +90,12 @@ def dispatch(request: dict) -> dict:
                 return ida_export.file_offset_info(request["file_offset"])
             return ida_export.address_info(request["address"])
         if action == "read":
-            return ida_export.read_bytes(connection, request["address"], request["size"])
+            return ida_export.read_bytes(
+                connection, request["address"], request["size"],
+                output_format=request.get("output_format", "auto"),
+                max_inline_bytes=request.get("max_inline_bytes", 4096),
+                output_path=request.get("output_path"),
+            )
         if action == "write":
             written = ida_export.write_bytes(connection, request["address"], bytes.fromhex(request["data_hex"]), idb_path)
         elif action == "search":

@@ -63,3 +63,16 @@ libg 实测以 +0x30 等于 0x12282E8 为锚点，要求 +0,+8,+0x10,+0x18,+0x20
 - **GAP-010（实际遇到，输入边界）**：`0x1393278` 伪代码把接收分发逻辑和一段冷/备用控制流合在一个很大的入口范围内，出现未初始化局部变量与不自然分支；函数块探针确认 `0x1393594` 属于该函数范围，不能称为独立共享尾。工具仍应暴露 function chunk、冷块/备用块和反编译可靠性警告，不能把反编译文本当成完整可靠函数语义。
 
 这些问题均未通过修改目标 IDB 或伪造 xref 规避；报告与原始日志留在被忽略的实验目录。
+
+## 第二轮修复回测（2026-10-23）
+
+GAP-007 至 GAP-010 已进入实现，并用同一 libg 副本复测。原始失败日志保留，不用成功回测覆盖历史。
+
+| 问题 | 实现 | libg 回测 |
+| --- | --- | --- |
+| GAP-007 | 显式多地址选择先对全部点做索引化批量入口查询，只对非入口地址检查主函数、CFG 和 function chunk；CLI/MCP preview 复用已选结果，避免整库重复扫描 | 683 个消息 getter 的 CLI preview 从 `143.703` 秒失败降为 `0.438` 秒成功；旧内部 batch 绕行实测 `3.859` 秒，失败与成功 run 均保留 |
+| GAP-008 | `read` 默认 `--format auto`：不超过 4096 字节时内联 hex，更大范围只返回 size、SHA-256 和存储元数据；可显式选 hex/array/both/none，或用 `--output` 保存完整原始字节 | 读取同一 160,000 字节表数据返回约 300 字节 JSON 摘要，完整数据写入本地文件并保留 `memory_bytes`；不再输出约 485k token 的 hex+array 双份内容 |
+| GAP-009 | 新增 `derived_calls` / `derived_call_runs` 与独立 CLI `derived-call-import`。记录 resolver、method、confidence、source_ref、run_id；derived 刷新后标记 stale；反汇编刷新使对应派生调用失效 | 导入 97 个共享跳转器解析结果；同一 call/target 在原生 xref 表中不存在，derived 表中明确存在。幂等重导入成功，未修改 IDB 或伪造 xref |
+| GAP-010 | 全量同步、局部同步和 `info` 现在暴露 IDA function chunk，新增 `function_chunks` SQLite 表；地址选择也把 chunk 作为有效函数归属来源 | `0x1393594` 的 `info` 返回所属函数 `0x1393278..0x1393990` 及包含它的具体 chunk，`is_tail=false`；先前“独立共享尾”表述已更正 |
+
+验证结果为 144 项测试通过、3 项因未设置真实 IDA 集成样本而跳过。新增 `derived-call-import` 有独立 skill，memory-read 和 address-info skill 已同步新契约。目标 IDB、实验 SQLite、原始字节文件和反编译内容仍不提交。

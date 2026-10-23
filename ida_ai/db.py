@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 18
 
 
 def sqlite_ea(address: int) -> int:
@@ -121,6 +121,39 @@ CREATE INDEX IF NOT EXISTS idx_xrefs_target ON xrefs(target_ea);
 CREATE INDEX IF NOT EXISTS idx_xrefs_source_function ON xrefs(source_function_ea);
 CREATE INDEX IF NOT EXISTS idx_xrefs_target_function ON xrefs(target_function_ea);
 
+-- Results produced by an explicit resolver live separately from native IDA
+-- xrefs. They are queryable navigation evidence, not claims that IDA recorded
+-- the edge in its analysis database.
+CREATE TABLE IF NOT EXISTS derived_call_runs (
+    run_id TEXT PRIMARY KEY,
+    input_sha256 TEXT NOT NULL,
+    resolver TEXT NOT NULL,
+    method TEXT NOT NULL,
+    record_count INTEGER NOT NULL,
+    input_path TEXT NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS derived_calls (
+    resolver TEXT NOT NULL,
+    call_ea INTEGER NOT NULL,
+    function_ea INTEGER NOT NULL,
+    mnemonic TEXT NOT NULL,
+    target_ea INTEGER NOT NULL,
+    target_name TEXT,
+    confidence REAL CHECK(confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+    method TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES derived_call_runs(run_id),
+    notes TEXT,
+    stale INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT,
+    generated_at TEXT NOT NULL,
+    PRIMARY KEY (resolver, call_ea)
+);
+CREATE INDEX IF NOT EXISTS idx_derived_calls_function ON derived_calls(function_ea);
+CREATE INDEX IF NOT EXISTS idx_derived_calls_target ON derived_calls(target_ea);
+
 CREATE TABLE IF NOT EXISTS basic_blocks (
     function_ea INTEGER NOT NULL,
     block_index INTEGER NOT NULL,
@@ -129,6 +162,18 @@ CREATE TABLE IF NOT EXISTS basic_blocks (
     PRIMARY KEY (function_ea, block_index)
 );
 CREATE INDEX IF NOT EXISTS idx_basic_blocks_range ON basic_blocks(start_ea, end_ea);
+
+CREATE TABLE IF NOT EXISTS function_chunks (
+    function_ea INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    start_ea INTEGER NOT NULL,
+    end_ea INTEGER NOT NULL,
+    owner_ea INTEGER,
+    is_tail INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (function_ea, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_function_chunks_range ON function_chunks(start_ea, end_ea);
+CREATE INDEX IF NOT EXISTS idx_function_chunks_owner ON function_chunks(owner_ea);
 
 CREATE TABLE IF NOT EXISTS cfg_edges (
     function_ea INTEGER NOT NULL,
@@ -695,6 +740,14 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE functions ADD COLUMN thunk_target_ea INTEGER")
     if "is_nullstub" not in function_columns:
         connection.execute("ALTER TABLE functions ADD COLUMN is_nullstub INTEGER NOT NULL DEFAULT 0")
+    derived_call_columns = {row[1] for row in connection.execute("PRAGMA table_info(derived_calls)")}
+    if "stale" not in derived_call_columns:
+        connection.execute("ALTER TABLE derived_calls ADD COLUMN stale INTEGER NOT NULL DEFAULT 0")
+    if "stale_reason" not in derived_call_columns:
+        connection.execute("ALTER TABLE derived_calls ADD COLUMN stale_reason TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_derived_calls_stale ON derived_calls(stale,function_ea)"
+    )
     vtable_slot_columns = {row[1] for row in connection.execute("PRAGMA table_info(vtable_slots)")}
     vtable_slot_migration_needed = False
     if "entry_classification" not in vtable_slot_columns:
@@ -786,7 +839,9 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
         "segments",
         "functions",
         "xrefs",
+        "derived_calls",
         "basic_blocks",
+        "function_chunks",
         "cfg_edges",
         "disassembly",
         "instructions",

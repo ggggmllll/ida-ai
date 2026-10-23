@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Iterable
 
-from .db import ida_ea
+from .db import ida_ea, sqlite_ea
 
 
 def parse_int(value: str | int) -> int:
@@ -120,7 +120,64 @@ def select_function_addresses(
     if selectors != 1:
         raise ValueError("choose exactly one of --all, --address, --addresses, --range, or --name")
     if addresses is not None:
-        selected = sorted({ea for value in addresses for ea in select_function_addresses(connection, address=value)})
+        points = sorted({parse_int(value) for value in addresses})
+        if not points:
+            raise ValueError("function selector matched no functions")
+        # Most multi-address callers pass function entries. Resolve all such
+        # entries with indexed IN lookups, then query containment only for the
+        # uncommon points that were not exact entries. This keeps selection
+        # proportional to the requested points instead of rescanning the full
+        # function and CFG tables once per point.
+        selected: set[int] = set()
+        signed_limit = 1 << 63
+        if any(point < 0 or point >= (1 << 64) for point in points):
+            raise ValueError("address is outside unsigned 64-bit range")
+        if any(point >= signed_limit for point in points):
+            # SQLite stores ea_t as a signed integer. Preserve unsigned
+            # containment semantics at the sign boundary with one fallback
+            # scan, rather than applying misleading signed range predicates.
+            function_rows = connection.execute(
+                "SELECT start_ea,end_ea FROM functions"
+            ).fetchall()
+            functions = [(ida_ea(row[0]), ida_ea(row[1])) for row in function_rows]
+            block_rows = connection.execute(
+                "SELECT function_ea,start_ea,end_ea FROM basic_blocks"
+            ).fetchall()
+            chunk_rows = connection.execute(
+                "SELECT function_ea,start_ea,end_ea FROM function_chunks"
+            ).fetchall()
+            for point in points:
+                selected.update(start for start, end in functions if start <= point < end)
+                if not any(start <= point < end for start, end in functions):
+                    selected.update(ida_ea(row[0]) for row in block_rows
+                                    if ida_ea(row[1]) <= point < ida_ea(row[2]))
+                    selected.update(ida_ea(row[0]) for row in chunk_rows
+                                    if ida_ea(row[1]) <= point < ida_ea(row[2]))
+        else:
+            for offset in range(0, len(points), 500):
+                batch = points[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                selected.update(ida_ea(row[0]) for row in connection.execute(
+                    f"SELECT start_ea FROM functions WHERE start_ea IN ({placeholders})",
+                    [sqlite_ea(point) for point in batch],
+                ))
+            unresolved = [point for point in points if point not in selected]
+            for point in unresolved:
+                containing = [ida_ea(row[0]) for row in connection.execute(
+                    "SELECT start_ea FROM functions WHERE start_ea<=? AND end_ea>?",
+                    (point, point),
+                )]
+                selected.update(containing)
+                if not containing:
+                    selected.update(ida_ea(row[0]) for row in connection.execute(
+                        "SELECT function_ea FROM basic_blocks WHERE start_ea<=? AND end_ea>?",
+                        (point, point),
+                    ))
+                    selected.update(ida_ea(row[0]) for row in connection.execute(
+                        "SELECT function_ea FROM function_chunks WHERE start_ea<=? AND end_ea>?",
+                        (point, point),
+                    ))
+        selected = sorted(selected)
         if not selected:
             raise ValueError("function selector matched no functions")
         return selected
@@ -137,6 +194,9 @@ def select_function_addresses(
         if not addresses:
             block_rows = connection.execute("SELECT function_ea, start_ea, end_ea FROM basic_blocks").fetchall()
             addresses = [ida_ea(row["function_ea"]) for row in block_rows if ida_ea(row["start_ea"]) <= ea < ida_ea(row["end_ea"])]
+        if not addresses:
+            chunk_rows = connection.execute("SELECT function_ea, start_ea, end_ea FROM function_chunks").fetchall()
+            addresses = [ida_ea(row["function_ea"]) for row in chunk_rows if ida_ea(row["start_ea"]) <= ea < ida_ea(row["end_ea"])]
     elif address_range is not None:
         start, end = parse_range(address_range)
         addresses = [item["start"] for item in functions if item["start"] < end and item["end"] > start]
@@ -144,6 +204,12 @@ def select_function_addresses(
         addresses.extend(
             ida_ea(row["function_ea"])
             for row in block_rows
+            if ida_ea(row["start_ea"]) < end and ida_ea(row["end_ea"]) > start
+        )
+        chunk_rows = connection.execute("SELECT function_ea, start_ea, end_ea FROM function_chunks").fetchall()
+        addresses.extend(
+            ida_ea(row["function_ea"])
+            for row in chunk_rows
             if ida_ea(row["start_ea"]) < end and ida_ea(row["end_ea"]) > start
         )
     else:
@@ -156,7 +222,7 @@ def select_function_addresses(
     return addresses
 
 
-def selection_preview(connection, *, limit=100, max_functions=0, **selectors):
+def selection_preview(connection, *, limit=100, max_functions=0, include_selected=False, **selectors):
     """Explain scope without starting IDA; budget check happens before export."""
     if limit < 0 or max_functions < 0:
         raise ValueError('selection limits must be non-negative')
@@ -166,7 +232,33 @@ def selection_preview(connection, *, limit=100, max_functions=0, **selectors):
     points = [parse_int(v) for v in (selectors.get('addresses') or [])]
     if selectors.get('address') is not None:
         points.append(parse_int(selectors['address']))
-    rows = {ida_ea(r['start_ea']):r for r in connection.execute('SELECT start_ea,end_ea,name FROM functions')}
+    rows = {}
+    for offset in range(0, len(selected), 500):
+        batch = selected[offset:offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        rows.update({ida_ea(r['start_ea']): r for r in connection.execute(
+            f"SELECT start_ea,end_ea,name FROM functions WHERE start_ea IN ({placeholders})",
+            [sqlite_ea(ea) for ea in batch],
+        )})
+    chunk_points: set[tuple[int, int]] = set()
+    chunk_candidates = [
+        point for point in points
+        if not any(ea == point or ea <= point < ida_ea(row["end_ea"])
+                   for ea, row in rows.items())
+    ]
+    if chunk_candidates and connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='function_chunks'"
+    ).fetchone():
+        for point in chunk_candidates:
+            if point >= (1 << 63):
+                continue
+            for offset in range(0, len(selected), 500):
+                batch = selected[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                chunk_points.update((ida_ea(r[0]), point) for r in connection.execute(
+                    f"SELECT function_ea FROM function_chunks WHERE function_ea IN ({placeholders}) AND start_ea<=? AND end_ea>?",
+                    [sqlite_ea(ea) for ea in batch] + [point, point],
+                ))
     items = []
     for ea in selected[:limit] if limit else selected:
         row = rows[ea]
@@ -180,12 +272,20 @@ def selection_preview(connection, *, limit=100, max_functions=0, **selectors):
             else:
                 reasons.append('cfg_overlap_outside_entry_range')
         elif points:
-            reasons.append('entry_address' if ea in points else
-                           'body_contains_address' if any(ea <= p < end for p in points) else 'cfg_contains_address')
+            if ea in points:
+                reasons.append('entry_address')
+            elif any(ea <= p < end for p in points):
+                reasons.append('body_contains_address')
+            elif any((ea, point) in chunk_points for point in points):
+                reasons.append('function_chunk_contains_address')
+            else:
+                reasons.append('cfg_contains_address')
         else:
             reasons.append('all' if selectors.get('all_functions') else 'name')
         items.append(dict(address=ea,address_hex=f'0x{ea:X}',name=row['name'],reasons=reasons))
-    return dict(function_count=len(selected),max_functions=max_functions,
+    result = dict(function_count=len(selected),max_functions=max_functions,
                 budget_exceeded=bool(max_functions and len(selected)>max_functions),
                 truncated=bool(limit and len(selected)>limit),functions=items)
-
+    if include_selected:
+        result["_selected_addresses"] = selected
+    return result

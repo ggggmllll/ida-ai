@@ -12,6 +12,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .db import connect, get_metadata, record_operation, sqlite_ea
+from .derived_calls import import_derived_calls
 from .jobs import JOB_STATUSES, check_jobs, create_job, history as job_history, list_jobs, resume_job, revise_job, show_job
 from .job_queries import diff_job, find_jobs, impact
 from .type_features import normalize_spec, scan_type_features
@@ -198,6 +199,11 @@ def _parser() -> argparse.ArgumentParser:
     _add_ida(read)
     read.add_argument("--address", required=True)
     read.add_argument("--size", required=True, type=int)
+    read.add_argument("--format", dest="output_format", choices=("auto", "hex", "array", "both", "none"),
+                      default="auto", help="inline result shape; auto uses hex up to 4096 bytes")
+    read.add_argument("--max-inline-bytes", type=int, default=4096,
+                      help="auto-mode threshold; larger reads remain in SQLite without duplicating bytes inline")
+    read.add_argument("--output", type=Path, help="write the complete raw bytes to this file")
 
     write = commands.add_parser("write", help="patch bytes and refresh the analysis snapshot")
     _add_db(write)
@@ -223,6 +229,18 @@ def _parser() -> argparse.ArgumentParser:
 
     clear = commands.add_parser("clear-searches", help="clear persisted search records and local search cache")
     _add_db(clear)
+
+    derived = commands.add_parser(
+        "derived-call-import",
+        help="import explicitly resolved call targets as derived evidence, separate from IDA xrefs",
+    )
+    _add_db(derived)
+    derived.add_argument("--input", required=True, type=Path, help="resolver JSON list or object with calls list")
+    derived.add_argument("--resolver", required=True, help="stable resolver identity")
+    derived.add_argument("--method", required=True, help="resolver method or algorithm identifier")
+    derived.add_argument("--confidence", type=float, help="default confidence from 0 to 1")
+    derived.add_argument("--source-ref", help="provenance label; defaults to the input file path")
+    derived.add_argument("--notes", help="optional provenance notes")
     sync = commands.add_parser("sync", help="rebuild the SQLite snapshot from the saved IDB")
     _add_db(sync)
     _add_ida(sync)
@@ -565,6 +583,14 @@ def _run(args: argparse.Namespace) -> dict:
         return _query(args.db, args.query, args.limit, args.write)
     if args.command == "clear-searches":
         return _clear_searches(args.db)
+    if args.command == "derived-call-import":
+        if not args.db.is_file():
+            raise FileNotFoundError(f"SQLite analysis database does not exist: {args.db}")
+        with closing(connect(args.db)) as connection:
+            return import_derived_calls(
+                connection, args.input, resolver=args.resolver, method=args.method,
+                confidence=args.confidence, source_ref=args.source_ref, notes=args.notes,
+            )
     if args.command.startswith("job-"):
         if not args.db.is_file():
             raise FileNotFoundError(f"SQLite analysis database does not exist: {args.db}")
@@ -844,12 +870,15 @@ def _run(args: argparse.Namespace) -> dict:
         selectors = dict(all_functions=args.all_functions, address=args.address,
                          addresses=args.addresses, address_range=args.address_range, name=args.name)
         with closing(connect(args.db)) as connection:
-            preview = selection_preview(connection, max_functions=args.max_functions, **selectors)
+            preview = selection_preview(
+                connection, max_functions=args.max_functions,
+                include_selected=True, **selectors,
+            )
+            addresses = preview.pop("_selected_addresses")
             if args.preview:
                 return preview
             if preview["budget_exceeded"]:
                 raise ValueError(f"selection contains {preview['function_count']} functions; exceeds --max-functions {args.max_functions}; inspect --preview")
-            addresses = select_function_addresses(connection, **selectors)
         if args.view == "batch":
             views = list(dict.fromkeys("micro_flow" if v == "flow" else v for v in args.views))
             result = run_ida("export_batch", args.db, views=views, addresses=addresses, **options)
@@ -864,7 +893,23 @@ def _run(args: argparse.Namespace) -> dict:
     if args.command == "read":
         if args.size < 1 or args.size > (1 << 20):
             raise ValueError("read size must be between 1 and 1048576 bytes")
-        return run_ida("read", args.db, address=parse_int(args.address), size=args.size, **options)
+        if args.max_inline_bytes < 0:
+            raise ValueError("max inline bytes must be non-negative")
+        output_path = args.output.expanduser().resolve() if args.output is not None else None
+        if output_path is not None:
+            protected = {args.db.expanduser().resolve()}
+            with closing(connect(args.db)) as connection:
+                idb_path = get_metadata(connection, "idb_path")
+            if idb_path:
+                protected.add(Path(idb_path).expanduser().resolve())
+            if output_path in protected:
+                raise ValueError("read output file must not overwrite the SQLite database or IDB")
+        return run_ida(
+            "read", args.db, address=parse_int(args.address), size=args.size,
+            output_format=args.output_format, max_inline_bytes=args.max_inline_bytes,
+            output_path=str(output_path) if output_path is not None else None,
+            **options,
+        )
     if args.command == "write":
         raw = parse_hex_bytes(args.data)
         if len(raw) > (1 << 20):

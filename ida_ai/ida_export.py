@@ -7,6 +7,7 @@ process only needs to read the resulting SQLite file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from contextlib import closing
@@ -162,6 +163,38 @@ def add_functions(connection) -> list[int]:
         addresses.append(int(func.start_ea))
     connection.executemany("INSERT INTO functions(start_ea,end_ea,name,demangled_name,signature,flags,size,segment_name,is_library,is_thunk,thunk_target_ea,is_nullstub,comment,repeatable_comment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     return addresses
+
+
+def add_function_chunks(connection, addresses: Iterable[int] | None = None) -> None:
+    """Persist IDA's main and tail chunk ranges for selected functions."""
+    function_eas = [int(ea) for ea in (idautils.Functions() if addresses is None else addresses)]
+    if addresses is None:
+        connection.execute("DELETE FROM function_chunks")
+    elif function_eas:
+        placeholders = ",".join("?" for _ in function_eas)
+        connection.execute(
+            f"DELETE FROM function_chunks WHERE function_ea IN ({placeholders})",
+            [sqlite_ea(ea) for ea in function_eas],
+        )
+    rows = []
+    for function_ea in function_eas:
+        function = ida_funcs.get_func(function_ea)
+        if function is None:
+            continue
+        for chunk_index, chunk in enumerate(ida_funcs.func_tail_iterator_t(function)):
+            chunk_function = ida_funcs.get_fchunk(int(chunk.start_ea))
+            is_tail = bool(chunk_function and ida_funcs.is_func_tail(chunk_function))
+            owner = int(getattr(chunk_function, "owner", 0) or 0) if is_tail else None
+            rows.append((
+                sqlite_ea(function.start_ea), chunk_index,
+                sqlite_ea(chunk.start_ea), sqlite_ea(chunk.end_ea),
+                sqlite_ea(owner) if owner else None, int(is_tail),
+            ))
+    connection.executemany(
+        "INSERT INTO function_chunks(function_ea,chunk_index,start_ea,end_ea,owner_ea,is_tail) "
+        "VALUES(?,?,?,?,?,?)",
+        rows,
+    )
 
 
 def add_assembly_comments(connection, addresses: Iterable[int] | None = None) -> None:
@@ -336,6 +369,11 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
     emit("export_view", view=view, functions=len(selected))
     if view == "disassembly":
         add_disassembly(connection, selected)
+        from .derived_calls import mark_derived_calls_stale
+        mark_derived_calls_stale(
+            connection, selected,
+            reason="disassembly refreshed; reimport resolver output to refresh derived calls",
+        )
     elif view == "pseudocode":
         add_pseudocode(connection, selected)
         add_pseudocode_comments(connection, selected)
@@ -559,6 +597,7 @@ def address_info(ea: int) -> dict:
     seg = find_segment(ea)
     flags = int(_safe(lambda: ida_bytes.get_full_flags(ea), 0) or 0)
     func = function_at(ea)
+    chunk = ida_funcs.get_fchunk(ea) if func else None
     item_start = int(_safe(lambda: ida_bytes.get_item_head(ea), ea) or ea)
     item_size = int(_safe(lambda: ida_bytes.get_item_size(item_start), 0) or 0)
     file_offset = int(_safe(lambda: ida_loader.get_fileregion_offset(ea), -1))
@@ -577,6 +616,12 @@ def address_info(ea: int) -> dict:
             "start": int(func.start_ea),
             "end": int(func.end_ea),
             "name": function_name(func.start_ea),
+            "chunk": {
+                "start": int(chunk.start_ea),
+                "end": int(chunk.end_ea),
+                "is_tail": bool(ida_funcs.is_func_tail(chunk)),
+                "owner": int(chunk.owner) if ida_funcs.is_func_tail(chunk) else None,
+            } if chunk else None,
         } if func else None,
     }
 
@@ -608,17 +653,51 @@ def _record_memory(connection, address: int, raw: bytes) -> None:
         connection.executemany(statement, rows)
 
 
-def read_bytes(connection, address: int, size: int) -> dict:
+def read_bytes(
+    connection,
+    address: int,
+    size: int,
+    *,
+    output_format: str = "auto",
+    max_inline_bytes: int = 4096,
+    output_path: str | Path | None = None,
+) -> dict:
     address, size = int(address), int(size)
     if size < 0:
         raise ValueError("size must be non-negative")
+    if output_format not in {"auto", "hex", "array", "both", "none"}:
+        raise ValueError("output_format must be auto, hex, array, both, or none")
+    if max_inline_bytes < 0:
+        raise ValueError("max_inline_bytes must be non-negative")
     raw = b"" if size == 0 else ida_bytes.get_bytes(address, size)
     if raw is None:
         raise ValueError(f"unable to read {size} bytes at 0x{address:X}")
     raw = bytes(raw)
     _record_memory(connection, address, raw)
     connection.commit()
-    return {"address": address, "address_hex": f"0x{address:X}", "size": len(raw), "hex": raw.hex(" "), "bytes": list(raw)}
+    selected_format = output_format
+    if output_format == "auto":
+        selected_format = "hex" if len(raw) <= max_inline_bytes else "none"
+    result = {
+        "address": address,
+        "address_hex": f"0x{address:X}",
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "inline_format": selected_format,
+        "inline_omitted": selected_format == "none" and bool(raw),
+        "stored_rows": len(raw),
+        "max_inline_bytes": max_inline_bytes,
+    }
+    if selected_format in {"hex", "both"}:
+        result["hex"] = raw.hex(" ")
+    if selected_format in {"array", "both"}:
+        result["bytes"] = list(raw)
+    if output_path is not None:
+        path = Path(output_path).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        result["output_file"] = str(path)
+    return result
 
 
 def write_bytes(connection, address: int, raw: bytes, idb_path: str | Path) -> dict:
@@ -1177,6 +1256,7 @@ def synchronize_function(output: str | Path, idb_path: str | Path, address: int)
             with closing(connect(staging)) as target:
                 source.backup(target)
                 views = {}
+                add_function_chunks(target, [ea])
                 # Pseudocode is always regenerated, including its lvar user settings.
                 views["pseudocode"] = export_views(target, [ea], "pseudocode")
                 if target.execute("SELECT 1 FROM disassembly WHERE function_ea=?", (sqlite_ea(ea),)).fetchone():
@@ -1257,6 +1337,8 @@ def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: 
         add_segments(connection)
         emit("add_functions")
         addresses = add_functions(connection)
+        emit("add_function_chunks")
+        add_function_chunks(connection, addresses)
         emit("add_assembly_comments")
         add_assembly_comments(connection)
         emit("add_pseudocode_comments")

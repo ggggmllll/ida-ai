@@ -32,7 +32,8 @@ def analysis_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
     identity = {key: get_metadata(connection, key) for key in identity_keys}
     counts: dict[str, int] = {}
     for table in (
-        "functions", "xrefs", "basic_blocks", "cfg_edges", "symbols", "comments",
+        "functions", "xrefs", "derived_calls", "basic_blocks", "function_chunks",
+        "cfg_edges", "symbols", "comments",
         "disassembly", "instructions", "pseudocode", "microcode", "micro_instructions",
         "micro_blocks", "micro_value_refs", "micro_flow", "micro_flow_instructions",
         "vtable_candidates", "vtable_slots", "vcall_sites", "vcall_targets", "vptr_writes",

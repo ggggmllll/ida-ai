@@ -11,6 +11,7 @@ from ida_ai.runner import attach_idb, _ProgressMonitor
 from ida_ai.selection import selection_preview
 from ida_ai.vtable_match import match_vtable_signature, normalize_signature
 from ida_ai.discovery import import_callers
+from ida_ai.derived_calls import import_derived_calls, mark_derived_calls_stale
 
 
 class WorkflowTests(unittest.TestCase):
@@ -36,6 +37,73 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["addresses"],[0x1000,0x2000])
             self.assertEqual(run.call_args.args[0],"export_batch")
         args.max_functions=1
+        with patch("ida_ai.cli.run_ida") as run:
+            with self.assertRaises(ValueError):
+                _run(args)
+            run.assert_not_called()
+
+    def test_preview_explains_function_chunk_and_multi_address_entry(self):
+        self.c.execute(
+            "INSERT INTO function_chunks VALUES(?,?,?,?,?,?)",
+            (0x2000, 0, 0x2000, 0x2020, None, 0),
+        )
+        self.c.execute(
+            "INSERT INTO function_chunks VALUES(?,?,?,?,?,?)",
+            (0x2000, 1, 0x3000, 0x3020, 0x2000, 1),
+        )
+        self.c.commit()
+        r = selection_preview(self.c, addresses=["0x3000"])
+        self.assertEqual(r["functions"][0]["reasons"], ["function_chunk_contains_address"])
+
+    def test_derived_call_import_is_separate_and_idempotent(self):
+        self.c.execute(
+            "INSERT INTO instructions(ea,function_ea,offset,size,text,mnemonic,operands,bytes_hex) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (0x1004, 0x1000, 4, 4, "BL target", "BL", "target", "00000094"),
+        )
+        self.c.commit()
+        source = self.root / "resolved.json"
+        source.write_text(json.dumps([
+            {"call_ea": "0x1004", "caller": "0x1000", "tail_target": "0x2000"}
+        ]), encoding="utf-8")
+        first = import_derived_calls(
+            self.c, source, resolver="fixture", method="static_replay",
+            confidence=0.75, source_ref="file:fixture",
+        )
+        second = import_derived_calls(
+            self.c, source, resolver="fixture", method="static_replay",
+            confidence=0.75, source_ref="file:fixture",
+        )
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(self.c.execute("SELECT count(*) FROM derived_calls").fetchone()[0], 1)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM xrefs").fetchone()[0], 0)
+        row = self.c.execute(
+            "SELECT target_ea,confidence,method FROM derived_calls"
+        ).fetchone()
+        self.assertEqual(tuple(row), (0x2000, 0.75, "static_replay"))
+        self.assertEqual(mark_derived_calls_stale(
+            self.c, [0x1000], reason="disassembly refreshed"
+        ), 1)
+        self.assertEqual(self.c.execute(
+            "SELECT stale,stale_reason FROM derived_calls"
+        ).fetchone()[0], 1)
+        reset_analysis(self.c)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM derived_calls").fetchone()[0], 0)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM derived_call_runs").fetchone()[0], 1)
+
+    def test_read_cli_forwards_inline_format_and_output(self):
+        output = self.root / "read.bin"
+        args = _parser().parse_args([
+            "read", "--db", str(self.db), "--address", "0x1000", "--size", "8192",
+            "--format", "none", "--max-inline-bytes", "16", "--output", str(output),
+        ])
+        with patch("ida_ai.cli.run_ida", return_value={}) as run:
+            _run(args)
+        self.assertEqual(run.call_args.kwargs["output_format"], "none")
+        self.assertEqual(run.call_args.kwargs["max_inline_bytes"], 16)
+        self.assertEqual(run.call_args.kwargs["output_path"], str(output.resolve()))
+        args.output = self.db
         with patch("ida_ai.cli.run_ida") as run:
             with self.assertRaises(ValueError):
                 _run(args)
