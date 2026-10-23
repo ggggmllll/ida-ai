@@ -60,6 +60,25 @@ def dispatch(request: dict) -> dict:
             if request.get("address") is not None:
                 return ida_export.synchronize_function(db_path, idb_path, request["address"])
             return ida_export.synchronize_database(db_path, idb_path, request.get("all_views", False))
+        if action == "pointer_scan":
+            native_size = 8 if ida_export.ida_ida.inf_is_64bit() else 4
+            if request["pointer_size"] != native_size:
+                raise ValueError("signature pointer size must match IDB bitness")
+            result = ida_export.scan_data_pointer_slots(connection, pointer_size=native_size,
+                start=request.get("start"), end=request.get("end"), max_bytes=request["max_bytes"])
+            for table in ("vtable_candidates","vtable_slots","vtable_evidence","vcall_sites","vcall_targets","receiver_flows","vptr_writes","vtable_class_relationships"):
+                connection.execute(f"UPDATE {table} SET stale=1")
+            for table in ("vtable_runs","vcall_runs","vptr_write_runs","vtable_class_relation_runs","rtti_runs","vcall_trace_runs"):
+                connection.execute(f"UPDATE {table} SET status='stale'")
+            connection.commit()
+            return result
+        if action == "discover":
+            return ida_export.discover(connection, **{k:request[k] for k in ("kind","start","end","max_items","max_bytes")})
+        if action == "export_batch":
+            views = request["views"]
+            if not views or any(v not in {"disassembly", "pseudocode", "microcode", "micro_flow"} for v in views):
+                raise ValueError("invalid export views")
+            return {"views": [ida_export.export_views(connection, request["addresses"], v) for v in dict.fromkeys(views)], "ida_launches": 1}
         if action == "export_view":
             return ida_export.export_views(connection, request["addresses"], request["view"])
         if action == "vtable_build":

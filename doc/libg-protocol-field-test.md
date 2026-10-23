@@ -22,3 +22,23 @@
 复现日志：`01-sync.json`、`08-string-xrefs.json`、`12-send-text.json`、`20-small-vcall-build.json`、`22-microcode-text.json`、`25-slot-and-asm.json`、`27-base-message.json`、`32-range-diagnostics.json`、`34-shared-tail-scope.json`。完整命令及输出保留于忽略的实验目录；不提交游戏反编译代码。
 
 本轮检查：SQLite `quick_check=ok`；job 1/2 均追加 revision 和 handoff，`job-check` 无待复核项。原始 IDB SHA-256 复核保持 `0B9E824B0C739340D292239E3CCA7A43D52FDDC3C24457FEC82D388178205212`。job 保持 active，明确下一步及停止条件，不把尚未完成的协议任务标成 done。本轮只新增文档和本地实验产物，没有改动工具实现。
+
+
+## 工具修复回测（2026-10-23）
+
+本次按用户要求修复工具，并验证共享消息虚表槽位的批量定位办法。保留原始问题与旧 run；本轮未扩大协议语义结论。
+
+| 问题 | 修复 | 回测和边界 |
+| --- | --- | --- |
+| GAP-001 | attach-idb 默认复制已有 IDB，缺少原始 binary 也可同步；显式 reuse 才复用源 | 测试覆盖复制、冲突与拒绝覆盖；未额外重跑全量 libg 接入 |
+| GAP-002 | discover 将字符串正文和导入写入 SQLite；import-callers 有界追踪已导出反向引用并报告缺失链接 | 实测 30,519 字符串、473 导入，找到聊天表情错误全文。四个网络导入仍没有 IDA 直接 xref，工具明确返回 frontier，底层 IDB 缺失链接的原因仍未解决 |
+| GAP-003 | stderr JSON 阶段/计数进度和 15 秒心跳，stdout 保留最终 JSON | 批量导出和发现实测观察到进度；测试覆盖半行和去重；未另做一次 214 秒 sync |
+| GAP-004 | 嵌套调用递归枚举，保存 operand path；trace bridge 同步支持 | 提交 69727b9；相同微码离线重建从 0 站点变为 1 站点、1 结构候选 |
+| GAP-005 | export 增加 preview、max-functions、addresses；MCP 同样提供预算与预览 | 原 80 字节范围预览返回 100 函数，区分入口、主范围和 CFG 重叠；超预算在启动 IDA 前拒绝 |
+| GAP-006 | export batch 多地址、多视图一次启动 IDA，保留每视图状态 | 两函数的汇编和伪代码共四份视图全部 ok，一次启动 4.750 秒 |
+
+新增 vtable-match：JSON 中按字节偏移定义 exact/function/null 槽位，未声明偏移为通配。至少一个非零 exact 锚点；先用加载后原始指针索引定位，再逐槽位 AND 核验。不依赖 RTTI 或已有虚表边界。扫描、结果与锚点均有预算；返回覆盖信息；刷新使旧指针输入的虚表/调用派生数据 stale。MCP match_vtable_structure 提供同一 matcher 的离线入口。
+
+libg 实测以 +0x30 等于 0x12282E8 为锚点，要求 +0,+8,+0x10,+0x18,+0x20,+0x28,+0x38 均为 IDA 函数入口指针：得到 **348 个结构候选**，包含已知 0x18B3230；核验 348 个锚点，结果未截断。扫描可读、非执行、非 BSS 段中加载字节 2,284,420。辅助 fixup 枚举达到 100,000 条预算，已显式标记 truncated；本次 raw-pointer 匹配不依赖 fixup 重定位推理。348 个候选不等于 348 种已确认消息，也不证明运行时可达性。
+
+验证：141 项测试，3 项按环境条件跳过；最后新增 MCP 接口后单独复跑 MCP 两项测试通过。新增命令各有独立 skill。完整命令、stdout/stderr 与耗时保留在忽略目录日志 fix01-nested-index 至 fix06-import-callers。实验 IDB/SQLite/脚本及反编译内容不提交。

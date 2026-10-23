@@ -17,3 +17,5 @@ Results are stored in `pseudocode` with `status`, `error`, `backend`, and `gener
 Run initialization first, and query `functions` when a selector does not match. Do not infer addresses from formatted pseudocode.
 
 After successful publication, the result includes `job_review`: changed evidence and its dependent claims are marked for review in append-only job revisions. Use `job-resume` before continuing affected research.
+
+Supports --addresses EA EA (union), --preview (no IDA), and --max-functions N (default 1000; 0 unlimited). Range selection includes overlapping CFG owners; inspect preview reasons before export. Use export batch for multiple views in one IDA launch. JSON progress goes to stderr; final JSON stays on stdout.

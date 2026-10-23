@@ -12,7 +12,7 @@ from typing import Literal
 from .cli import _query
 from .db import connect
 from .runner import run_ida
-from .selection import parse_int, select_function_addresses
+from .selection import parse_int, select_function_addresses, selection_preview
 from .text_search import search_code as _search_code
 from .vcall_trace import trace_virtual_call as _trace_virtual_call, show_trace as _show_trace
 from .virtual_tables import (analyze_vcall as _analyze_vcall, build_vcall_index as _build_vcall_index,
@@ -84,9 +84,12 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
         name: str | None = None,
         start_address: str | None = None,
         end_address: str | None = None,
+        addresses: list[str] | None = None,
+        preview: bool = False,
+        max_functions: int = 1000,
     ) -> dict:
         """Generate selected function views before inspecting or text-searching them."""
-        selectors = int(all_functions) + int(address is not None) + int(name is not None) + int(start_address is not None or end_address is not None)
+        selectors = int(addresses is not None) + int(all_functions) + int(address is not None) + int(name is not None) + int(start_address is not None or end_address is not None)
         if selectors != 1:
             raise ValueError("choose exactly one of all_functions, address, name, or start/end range")
         address_range = None
@@ -96,10 +99,29 @@ def create_server(db_path: str | Path, *, idat: str | None = None, timeout: int 
             address_range = [start_address, end_address]
         with ida_lock:
             with closing(connect(database)) as connection:
-                addresses = select_function_addresses(connection, all_functions=all_functions, address=address,
-                                                      address_range=address_range, name=name)
-            result = run_ida("export_view", database, idat=idat, timeout=timeout, addresses=addresses, view=view)
+                selectors = dict(all_functions=all_functions, address=address, addresses=addresses,
+                                 address_range=address_range, name=name)
+                scope = selection_preview(connection, max_functions=max_functions, **selectors)
+                if preview:
+                    return scope
+                if scope["budget_exceeded"]:
+                    raise ValueError("selection exceeds max_functions; use preview to inspect scope")
+                selected = select_function_addresses(connection, **selectors)
+            result = run_ida("export_view", database, idat=idat, timeout=timeout, addresses=selected, view=view)
+            result["selection"] = scope
             return result
+
+    @app.tool()
+    def match_vtable_structure(spec: dict, start_address: str | None = None,
+                               end_address: str | None = None, limit: int = 1000,
+                               max_anchors: int = 100000) -> dict:
+        """Match fixed shared slots against existing loaded pointer observations; structural candidates only."""
+        from .vtable_match import match_vtable_signature
+        with ida_lock, closing(connect(database)) as connection:
+            return match_vtable_signature(connection, spec,
+                start=parse_int(start_address) if start_address is not None else None,
+                end=parse_int(end_address) if end_address is not None else None,
+                limit=limit,max_anchors=max_anchors)
 
     @app.tool()
     def vtable_list(abi: str | None = None, limit: int = 100, offset: int = 0,

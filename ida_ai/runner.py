@@ -8,10 +8,90 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import sys
+import threading
+import time
 from contextlib import closing
 from pathlib import Path
 
 from .db import connect, get_metadata, operation
+
+
+def attach_idb(db_path, source, *, destination=None, reuse=False, **options):
+    """Attach a supplied IDB without needing the original input binary."""
+    from .db import set_metadata
+    db_path = Path(db_path).expanduser().resolve()
+    source = Path(source).expanduser().resolve()
+    target = Path(destination or db_path.with_suffix(source.suffix)).expanduser().resolve()
+    if not source.is_file() or source.suffix.lower() not in {'.i64','.idb'}:
+        raise ValueError('source must be an existing .i64 or .idb file')
+    if db_path.exists():
+        raise FileExistsError('analysis database already exists; use sync for an attached database')
+    if reuse:
+        if destination is not None:
+            raise ValueError('--reuse-idb cannot be combined with --idb')
+        target = source
+    elif target == source:
+        raise ValueError('copy destination must differ from source; use --reuse-idb explicitly')
+    if db_path in (source,target):
+        raise ValueError('SQLite database must differ from IDB paths')
+    # Resolve the executable before creating any output.
+    find_idat(options.get('idat'))
+    target.parent.mkdir(parents=True,exist_ok=True)
+    if not reuse:
+        with source.open('rb') as src, target.open('xb') as dst:
+            shutil.copyfileobj(src,dst,1 << 20)
+    with closing(connect(db_path)) as connection:
+        set_metadata(connection,{'idb_path':str(target),'attached_source':str(source)})
+        connection.commit()
+    result = run_ida('sync',db_path,**options)
+    return dict(result,db_path=str(db_path),idb_path=str(target),copied=not reuse,
+                original_binary_required=False)
+
+
+class _ProgressMonitor:
+    def __init__(self, path, action):
+        self.path,self.action = path,action
+        self.stop = threading.Event()
+        self.offset = 0
+        self.started = time.monotonic()
+        self.last = self.started
+        self.thread = threading.Thread(target=self.watch,daemon=True)
+
+    def drain(self):
+        if self.path.exists():
+            with self.path.open(encoding='utf-8') as stream:
+                stream.seek(self.offset)
+                while True:
+                    position = stream.tell()
+                    line = stream.readline()
+                    if not line or not line.endswith("\n"):
+                        stream.seek(position)
+                        break
+                    try:
+                        item=json.loads(line)
+                    except json.JSONDecodeError:
+                        break
+                    print(json.dumps(dict(event='ida_progress',action=self.action,**item)),file=sys.stderr,flush=True)
+                self.offset=stream.tell()
+
+    def watch(self):
+        while not self.stop.wait(.25):
+            self.drain()
+            now=time.monotonic()
+            if now-self.last>=15:
+                print(json.dumps(dict(event='ida_wait',action=self.action,elapsed_seconds=round(now-self.started))),file=sys.stderr,flush=True)
+                self.last=now
+
+    def __enter__(self):
+        print(json.dumps(dict(event='ida_start',action=self.action)),file=sys.stderr,flush=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self,*args):
+        self.stop.set()
+        self.thread.join()
+        self.drain()
 
 
 IDA_NAMES = ("idat64.exe", "idat.exe", "idat64", "idat")
@@ -72,15 +152,17 @@ def run_ida(
         request_file = Path(temporary) / "request.json"
         request_file.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
         environment["IDA_AI_REQUEST"] = str(request_file)
+        environment['IDA_AI_PROGRESS'] = str(Path(temporary)/'progress.jsonl')
         command = [str(find_idat(idat)), "-A"]
         if action == "init":
             command.append(f"-o{request['idb_path']}")
         command.extend((f"-S{script}", str(input_path)))
         try:
-            completed = subprocess.run(
-                command, env=environment, cwd=str(db_path.parent), capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=timeout or None, check=False,
-            )
+            with _ProgressMonitor(Path(environment['IDA_AI_PROGRESS']), action):
+                completed = subprocess.run(
+                    command, env=environment, cwd=str(db_path.parent), capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=timeout or None, check=False,
+                )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(f"IDA batch operation exceeded {timeout} seconds") from exc
 
@@ -90,7 +172,7 @@ def run_ida(
         if result is not None:
             if result["status"] == "ok" and completed.returncode == 0:
                 value = result["result"]
-                if action in {"init", "sync", "export_view", "mutate", "write", "vtable_build"}:
+                if action in {"init", "sync", "export_view", "export_batch", "mutate", "write", "vtable_build", "pointer_scan", "discover"}:
                     # The IDA entrypoint publishes a complete DB snapshot before
                     # recording success. Review evidence only after that commit,
                     # regardless of whether the caller is CLI, MCP, or Python.

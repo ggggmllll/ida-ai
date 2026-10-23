@@ -114,10 +114,16 @@ def select_function_addresses(
     address: str | None = None,
     address_range: Iterable[str] | None = None,
     name: str | None = None,
+    addresses: Iterable[str] | None = None,
 ) -> list[int]:
-    selectors = sum(value is not None for value in (address, address_range, name)) + int(all_functions)
+    selectors = sum(value is not None for value in (address, address_range, name, addresses)) + int(all_functions)
     if selectors != 1:
-        raise ValueError("choose exactly one of --all, --address, --range, or --name")
+        raise ValueError("choose exactly one of --all, --address, --addresses, --range, or --name")
+    if addresses is not None:
+        selected = sorted({ea for value in addresses for ea in select_function_addresses(connection, address=value)})
+        if not selected:
+            raise ValueError("function selector matched no functions")
+        return selected
     function_rows = connection.execute("SELECT start_ea, end_ea, name, demangled_name FROM functions").fetchall()
     functions = [
         {"start": ida_ea(row["start_ea"]), "end": ida_ea(row["end_ea"]), "name": row["name"], "demangled": row["demangled_name"]}
@@ -148,4 +154,38 @@ def select_function_addresses(
     if not addresses:
         raise ValueError("function selector matched no functions")
     return addresses
+
+
+def selection_preview(connection, *, limit=100, max_functions=0, **selectors):
+    """Explain scope without starting IDA; budget check happens before export."""
+    if limit < 0 or max_functions < 0:
+        raise ValueError('selection limits must be non-negative')
+    selected = select_function_addresses(connection, **selectors)
+    address_range = selectors.get('address_range')
+    bounds = parse_range(address_range) if address_range else None
+    points = [parse_int(v) for v in (selectors.get('addresses') or [])]
+    if selectors.get('address') is not None:
+        points.append(parse_int(selectors['address']))
+    rows = {ida_ea(r['start_ea']):r for r in connection.execute('SELECT start_ea,end_ea,name FROM functions')}
+    items = []
+    for ea in selected[:limit] if limit else selected:
+        row = rows[ea]
+        end = ida_ea(row['end_ea'])
+        reasons = []
+        if bounds:
+            if bounds[0] <= ea < bounds[1]:
+                reasons.append('entry_in_range')
+            elif ea < bounds[1] and end > bounds[0]:
+                reasons.append('body_range_overlap')
+            else:
+                reasons.append('cfg_overlap_outside_entry_range')
+        elif points:
+            reasons.append('entry_address' if ea in points else
+                           'body_contains_address' if any(ea <= p < end for p in points) else 'cfg_contains_address')
+        else:
+            reasons.append('all' if selectors.get('all_functions') else 'name')
+        items.append(dict(address=ea,address_hex=f'0x{ea:X}',name=row['name'],reasons=reasons))
+    return dict(function_count=len(selected),max_functions=max_functions,
+                budget_exceeded=bool(max_functions and len(selected)>max_functions),
+                truncated=bool(limit and len(selected)>limit),functions=items)
 

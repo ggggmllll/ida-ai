@@ -27,3 +27,5 @@ Value-number definitions and uses are observations, not complete SSA or alias ed
 Full `sync` restores previously exported microcode, and `sync --all-views` exports all three views. Local `sync --address` refreshes previously exported microcode only for that function. Job evidence can cite `microcode:0xFUNCTION_EA` with origin `ida_type_dependent`.
 
 For utilization-form matching, load `../ida-ai-type-scan/SKILL.md`.
+
+Supports --addresses EA EA (union), --preview (no IDA), and --max-functions N (default 1000; 0 unlimited). Range selection includes overlapping CFG owners; inspect preview reasons before export. Use export batch for multiple views in one IDA launch. JSON progress goes to stderr; final JSON stays on stdout.

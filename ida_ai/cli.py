@@ -23,8 +23,8 @@ from .virtual_tables import (analyze_vcall, build_vcall_index, build_vtable_inde
                              show_vcall, show_vtable, trace_vptr_object_flows)
 from .vtable_types import class_relationships, preview_vtable_type_plan
 from .vcall_trace import trace_virtual_call, show_trace
-from .runner import run_ida
-from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses
+from .runner import run_ida, attach_idb
+from .selection import parse_hex_bytes, parse_int, parse_pattern, parse_range, select_function_addresses, selection_preview
 
 
 def _add_db(parser: argparse.ArgumentParser) -> None:
@@ -137,15 +137,52 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--binary", required=True, type=Path)
     init.add_argument("--idb", type=Path, help="saved IDA database path; defaults to DB basename with .i64")
 
+    attach = commands.add_parser("attach-idb", help="copy and index an existing IDB without its input binary")
+    _add_db(attach)
+    _add_ida(attach)
+    attach.add_argument("--source", required=True, type=Path)
+    attach.add_argument("--idb", type=Path)
+    attach.add_argument("--reuse-idb", action="store_true")
+
+    callers = commands.add_parser("import-callers", help="follow exported import/GOT/PLT incoming xrefs with explicit frontiers")
+    _add_db(callers)
+    callers.add_argument("--address", required=True)
+    callers.add_argument("--max-hops", type=int, default=4)
+    callers.add_argument("--max-nodes", type=int, default=1000)
+    callers.add_argument("--max-edges", type=int, default=5000)
+
+    discover = commands.add_parser("discover", help="snapshot decoded IDA strings and imports into SQLite")
+    _add_db(discover)
+    _add_ida(discover)
+    _add_range(discover)
+    discover.add_argument("--kind", choices=("all", "strings", "imports"), default="all")
+    discover.add_argument("--max-items", type=int, default=100000)
+    discover.add_argument("--max-bytes", type=int, default=32 << 20)
+
+    match = commands.add_parser("vtable-match", help="match positional slot constraints against loaded pointer observations")
+    _add_db(match)
+    _add_ida(match)
+    _add_range(match)
+    match.add_argument("--spec", required=True, type=Path)
+    match.add_argument("--no-refresh", action="store_true")
+    match.add_argument("--limit", type=int, default=1000)
+    match.add_argument("--max-anchors", type=int, default=100000)
+    match.add_argument("--max-bytes", type=int, default=256 << 20)
+
     export = commands.add_parser("export", help="export a function view into SQLite")
     views = export.add_subparsers(dest="view", required=True)
-    for name in ("disassembly", "pseudocode", "microcode", "flow"):
+    for name in ("disassembly", "pseudocode", "microcode", "flow", "batch"):
         view = views.add_parser(name, help=f"export {name} for selected functions")
         _add_db(view)
         _add_ida(view)
+        view.add_argument("--preview", action="store_true", help="explain selection without starting IDA")
+        view.add_argument("--max-functions", type=int, default=1000, help="selection budget; 0 unlimited")
+        if name == "batch":
+            view.add_argument("--views", nargs="+", required=True, choices=("disassembly", "pseudocode", "microcode", "flow"))
         selection = view.add_mutually_exclusive_group(required=True)
         selection.add_argument("--all", action="store_true", dest="all_functions")
         selection.add_argument("--address", help="address inside a function")
+        selection.add_argument("--addresses", nargs="+", help="union of functions containing these addresses")
         selection.add_argument("--range", dest="address_range", nargs=2, metavar=("START", "END"))
         selection.add_argument("--name", help="exact function or demangled name")
 
@@ -763,7 +800,30 @@ def _run(args: argparse.Namespace) -> dict:
                 function_ea=function_ea,
                 address_point=parse_int(args.address_point) if args.address_point is not None else None,
                 limit=args.limit, offset=args.offset, include_stale=args.include_stale)
+    if args.command == "import-callers":
+        from .discovery import import_callers
+        with closing(connect(args.db)) as connection:
+            return import_callers(connection,parse_int(args.address),max_hops=args.max_hops,max_nodes=args.max_nodes,max_edges=args.max_edges)
+    if args.command == "vtable-match":
+        from .vtable_match import normalize_signature, match_vtable_signature
+        spec = normalize_signature(json.loads(args.spec.read_text(encoding="utf-8-sig")))
+        start,end = parse_range(args.address_range) if args.address_range else (None,None)
+        if args.limit < 1 or args.max_anchors < 1 or args.max_bytes < spec["pointer_size"]:
+            raise ValueError("positive match and scan budgets required")
+        refresh = None
+        if not args.no_refresh:
+            refresh = run_ida("pointer_scan",args.db,pointer_size=spec["pointer_size"],start=start,end=end,
+                              max_bytes=args.max_bytes,idat=args.idat,timeout=args.timeout)
+        with closing(connect(args.db)) as connection:
+            result = match_vtable_signature(connection,spec,start=start,end=end,limit=args.limit,max_anchors=args.max_anchors)
+        result["refresh"] = refresh
+        return result
     options = {"idat": args.idat, "timeout": args.timeout}
+    if args.command == "discover":
+        start,end = parse_range(args.address_range) if args.address_range else (None,None)
+        return run_ida("discover",args.db,kind=args.kind,start=start,end=end,max_items=args.max_items,max_bytes=args.max_bytes,**options)
+    if args.command == "attach-idb":
+        return attach_idb(args.db, args.source, destination=args.idb, reuse=args.reuse_idb, **options)
     if args.command == "sync":
         result = run_ida("sync", args.db, all_views=args.all_views,
                          address=parse_int(args.address) if args.address is not None else None, **options)
@@ -781,16 +841,22 @@ def _run(args: argparse.Namespace) -> dict:
     if args.command == "export":
         if not args.db.is_file():
             raise FileNotFoundError(f"SQLite database does not exist: {args.db}")
+        selectors = dict(all_functions=args.all_functions, address=args.address,
+                         addresses=args.addresses, address_range=args.address_range, name=args.name)
         with closing(connect(args.db)) as connection:
-            addresses = select_function_addresses(
-                connection, all_functions=args.all_functions, address=args.address,
-                address_range=args.address_range, name=args.name,
-            )
-        # ``flow`` is the short CLI spelling for the LVARS flow export.  Keep
-        # the persisted/exporter name explicit so callers cannot confuse it
-        # with the ordinary GLBOPT3 microcode artifact.
-        view = "micro_flow" if args.view == "flow" else args.view
-        result = run_ida("export_view", args.db, view=view, addresses=addresses, **options)
+            preview = selection_preview(connection, max_functions=args.max_functions, **selectors)
+            if args.preview:
+                return preview
+            if preview["budget_exceeded"]:
+                raise ValueError(f"selection contains {preview['function_count']} functions; exceeds --max-functions {args.max_functions}; inspect --preview")
+            addresses = select_function_addresses(connection, **selectors)
+        if args.view == "batch":
+            views = list(dict.fromkeys("micro_flow" if v == "flow" else v for v in args.views))
+            result = run_ida("export_batch", args.db, views=views, addresses=addresses, **options)
+        else:
+            view = "micro_flow" if args.view == "flow" else args.view
+            result = run_ida("export_view", args.db, view=view, addresses=addresses, **options)
+        result["selection"] = preview
         return result
     if args.command == "info":
         location = {"address": parse_int(args.address)} if args.address is not None else {"file_offset": parse_int(args.file_offset)}
@@ -833,7 +899,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         result = _run(args)
-    except (ValueError, FileNotFoundError, RuntimeError, TimeoutError, sqlite3.Error) as exc:
+    except (ValueError, OSError, RuntimeError, TimeoutError, sqlite3.Error) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))

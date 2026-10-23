@@ -122,7 +122,9 @@ def export_microcode(connection, addresses: list[int], *, flow: bool = False) ->
     view_name = "micro_flow" if flow else "microcode"
     version = _maybe(lambda: str(ida_hexrays.get_hexrays_version()))
     statuses: Counter[str] = Counter()
-    for function_ea in addresses:
+    for ordinal, function_ea in enumerate(addresses):
+        from .progress import emit
+        emit("microcode_function", completed=ordinal, total=len(addresses), function=function_ea, flow=flow)
         stored_ea = sqlite_ea(function_ea)
         connection.execute(f"DELETE FROM {rows_table} WHERE function_ea=?", (stored_ea,))
         connection.execute("DELETE FROM micro_blocks WHERE view_name=? AND function_ea=?", (view_name, stored_ea))

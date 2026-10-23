@@ -22,3 +22,5 @@ Search records, raw pointer scans, memory read snapshots and search operation re
 This is an explicit synchronization boundary, not a live GUI listener. Run sync after external edits and before using SQL to reason from the current IDB. Existing SQL reads do not automatically detect unsaved or external edits.
 
 After the complete SQLite snapshot is published, the runner checks saved job evidence and appends review revisions for affected claims and dependent jobs. The sync result includes `job_review`; inspect it before continuing long-running research. Do not use partial/staging output as current job evidence.
+
+Structured stage progress and 15-second waiting heartbeats are emitted on stderr; stdout is reserved for final JSON. For an existing IDB without the original binary, use attach-idb first.

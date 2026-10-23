@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 def sqlite_ea(address: int) -> int:
@@ -597,6 +597,15 @@ CREATE TABLE IF NOT EXISTS data_pointer_slots (
     target_kind TEXT NOT NULL,
     generated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_data_pointer_raw ON data_pointer_slots(raw_value,pointer_size);
+CREATE TABLE IF NOT EXISTS discovered_strings (
+    address INTEGER PRIMARY KEY, string_type INTEGER NOT NULL, text TEXT NOT NULL,
+    bytes_hex TEXT NOT NULL, generated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS discovered_imports (
+    address INTEGER PRIMARY KEY, module TEXT, name TEXT, ordinal INTEGER,
+    direct_xrefs INTEGER NOT NULL, quality TEXT NOT NULL, generated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_data_pointer_target ON data_pointer_slots(target_ea);
 CREATE INDEX IF NOT EXISTS idx_data_pointer_segment ON data_pointer_slots(source_segment,source_ea);
 
@@ -770,6 +779,8 @@ def reset_analysis(connection: sqlite3.Connection, *, clear_operations: bool = F
     connection.execute("UPDATE vptr_writes SET stale=1")
 
     tables = (
+        "discovered_strings",
+        "discovered_imports",
         "symbols",
         "comments",
         "segments",

@@ -224,13 +224,18 @@ def add_pseudocode_comments(connection, addresses: Iterable[int]) -> None:
             ida_hexrays.user_cmts_free(user_comments)
 
 
+from .progress import emit
+
+
 def add_xrefs(connection) -> None:
     rows = []
+    exported = 0
     statement = "INSERT OR IGNORE INTO xrefs(source_ea,target_ea,xref_type,is_code,is_data,source_function_ea,target_function_ea,type_name) VALUES(?,?,?,?,?,?,?,?)"
     for index in range(ida_segment.get_segm_qty()):
         seg = ida_segment.getnseg(index)
         if seg is None:
             continue
+        emit("xrefs_segment", segment=ida_segment.get_segm_name(seg), start=seg.start_ea, end=seg.end_ea)
         for item_ea in idautils.Heads(seg.start_ea, seg.end_ea):
             for ref in idautils.XrefsFrom(item_ea, 0):
                 ref_target = int(ref.to)
@@ -243,13 +248,17 @@ def add_xrefs(connection) -> None:
                              XREF_TYPE_NAMES.get(int(ref.type), f"type_{int(ref.type)}")))
                 if len(rows) >= 10000:
                     connection.executemany(statement, rows)
+                    exported += len(rows)
+                    emit("xrefs", exported=exported)
                     rows.clear()
     if rows:
         connection.executemany(statement, rows)
 
 
 def add_cfg(connection, addresses: list[int]) -> None:
-    for func_ea in addresses:
+    for ordinal, func_ea in enumerate(addresses):
+        if ordinal % 1000 == 0:
+            emit("cfg", completed=ordinal, total=len(addresses))
         func = ida_funcs.get_func(func_ea)
         if func is None:
             continue
@@ -286,6 +295,8 @@ def disassembly_lines(func_ea: int):
 def add_disassembly(connection, addresses: list[int]) -> None:
     now = utc_now()
     for ordinal, func_ea in enumerate(addresses, 1):
+        if ordinal == 1 or ordinal % 10 == 0:
+            emit("function_view", function=func_ea, completed=ordinal-1, total=len(addresses))
         try:
             connection.execute("DELETE FROM instructions WHERE function_ea = ?", (sqlite_ea(func_ea),))
             lines = disassembly_lines(func_ea)
@@ -302,6 +313,8 @@ def add_pseudocode(connection, addresses: list[int]) -> None:
     now = utc_now()
     decompiler_ready = ida_hexrays is not None and bool(_safe(ida_hexrays.init_hexrays_plugin, False))
     for ordinal, func_ea in enumerate(addresses, 1):
+        if ordinal == 1 or ordinal % 10 == 0:
+            emit("function_view", function=func_ea, completed=ordinal-1, total=len(addresses))
         try:
             if not decompiler_ready:
                 raise RuntimeError("Hex-Rays decompiler unavailable")
@@ -320,6 +333,7 @@ def export_views(connection, addresses: Iterable[int], view: str) -> dict:
     """Export one view for the requested functions into an existing database."""
 
     selected = [int(ea) for ea in addresses]
+    emit("export_view", view=view, functions=len(selected))
     if view == "disassembly":
         add_disassembly(connection, selected)
     elif view == "pseudocode":
@@ -1235,14 +1249,21 @@ def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: 
             "idb_path": str(Path(idb_path).resolve()),
             "generated_at": utc_now(),
         }
+        emit("snapshot_metadata")
         set_metadata(connection, metadata)
         connection.executemany("INSERT INTO symbols VALUES(?,?,?)",
             ((sqlite_ea(ea), name, idc.get_type(ea)) for ea, name in idautils.Names()))
+        emit("add_segments")
         add_segments(connection)
+        emit("add_functions")
         addresses = add_functions(connection)
+        emit("add_assembly_comments")
         add_assembly_comments(connection)
+        emit("add_pseudocode_comments")
         add_pseudocode_comments(connection, addresses)
+        emit("add_xrefs")
         add_xrefs(connection)
+        emit("add_cfg")
         add_cfg(connection, addresses)
         connection.commit()
         return {"functions": len(addresses),
@@ -1255,3 +1276,65 @@ def export_database(output: str | Path, *, idb_path: str | Path, skip_analysis: 
         raise
     finally:
         connection.close()
+
+
+def discover(connection, *, kind="all", start=None, end=None, max_items=100000, max_bytes=32 << 20):
+    if kind not in {"all", "strings", "imports"} or max_items < 1 or max_bytes < 1:
+        raise ValueError("invalid discovery kind or budgets")
+    if start is not None and end is not None and end <= start:
+        raise ValueError("end must exceed start")
+    now = utc_now()
+    result = dict(kind=kind, start=start, end=end, max_items=max_items, max_bytes=max_bytes,
+                  strings=0, imports=0, bytes=0, truncated=False, provenance="IDA-defined items and import enumeration")
+    def inside(ea):
+        return (start is None or ea >= start) and (end is None or ea < end)
+    if kind in {"all", "strings"}:
+        connection.execute("DELETE FROM discovered_strings")
+        for index in range(ida_segment.get_segm_qty()):
+            seg = ida_segment.getnseg(index)
+            lo, hi = max(seg.start_ea, start or seg.start_ea), min(seg.end_ea, end if end is not None else seg.end_ea)
+            if hi <= lo:
+                continue
+            emit("discovery_strings", segment=ida_segment.get_segm_name(seg))
+            for ea in idautils.Heads(lo, hi):
+                if not ida_bytes.is_strlit(ida_bytes.get_full_flags(ea)):
+                    continue
+                size = min(int(ida_bytes.get_item_size(ea)), hi-ea)
+                if result["strings"] >= max_items or result["bytes"] + size > max_bytes:
+                    result["truncated"] = True
+                    break
+                typ = int(ida_nalt.get_str_type(ea))
+                raw = ida_bytes.get_strlit_contents(ea, size, typ)
+                if raw is None:
+                    continue
+                raw = bytes(raw)
+                # IDA returns UTF-8 text for supported string literal types.
+                connection.execute("INSERT INTO discovered_strings VALUES(?,?,?,?,?)",
+                    (sqlite_ea(ea),typ,raw.decode("utf-8",errors="replace"),raw.hex(),now))
+                result["strings"] += 1
+                result["bytes"] += size
+            if result["truncated"]:
+                break
+    if kind in {"all", "imports"}:
+        connection.execute("DELETE FROM discovered_imports")
+        for module_index in range(ida_nalt.get_import_module_qty()):
+            module = ida_nalt.get_import_module_name(module_index)
+            def callback(ea,name,ordinal):
+                if not inside(ea):
+                    return True
+                if result["imports"] >= max_items:
+                    result["truncated"] = True
+                    return False
+                refs = sum(1 for _ in idautils.XrefsTo(ea,0))
+                connection.execute("INSERT OR REPLACE INTO discovered_imports VALUES(?,?,?,?,?,?,?)",
+                    (sqlite_ea(ea),module,name,ordinal,refs,"has_direct_xrefs" if refs else "no_direct_xrefs_not_proof_unused",now))
+                result["imports"] += 1
+                return True
+            ida_nalt.enum_import_names(module_index, callback)
+            if result["imports"] >= max_items:
+                result["truncated"] = True
+                break
+    set_metadata(connection,{"discovery_" + table_kind:dict(result,generated_at=now)
+                             for table_kind in (("strings","imports") if kind == "all" else (kind,))})
+    connection.commit()
+    return result
